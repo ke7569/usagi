@@ -260,7 +260,7 @@ void ZStrategy::on_order_reject(int request_id, const RT_Order& order) {
     }
 }
 
-int ZStrategy::insertOrder(RT_Order order) {
+int ZStrategy::insertOrder(RT_Order order, int cancel_delay_ms) {
     if (!routing_enabled_) {
         KF_LOG_ERROR(logger, "[SZEOrderBlocked] InstrumentID=" << mTradeInstrument
             << ", reason=routing_disabled");
@@ -324,7 +324,11 @@ int ZStrategy::insertOrder(RT_Order order) {
         //             << ", vl_pos: " << context.vl_pos
         //             << ", vs_pos: " << context.vs_pos);
         if (request_id >= 0) {
-            delay_cancel_order(request_id,1001);
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                cancel_pending_request_ids_.insert(request_id);
+            }
+            delay_cancel_order(request_id, std::max(0, cancel_delay_ms));
         } else {
             on_order_reject(request_id, order);
         }
@@ -359,15 +363,12 @@ void ZStrategy::maybe_send_test_order() {
     order.Volume = volume;
     order.Direction = test_order_.direction;
     order.Type = FAK;
-    const int request_id = insertOrder(order);
+    const int request_id = insertOrder(order, test_order_.cancel_delay_ms);
     KF_LOG_INFO(logger, "[SZTestOrder] submitted instrument=" << mTradeInstrument
         << " side=" << (order.Direction == BUY ? "buy" : "sell")
         << " price=" << order.Price << " volume=" << order.Volume
         << " request_id=" << request_id
         << " cancel_delay_ms=" << test_order_.cancel_delay_ms);
-    if (request_id >= 0 && test_order_.cancel_delay_ms > 0) {
-        delay_cancel_order(request_id, test_order_.cancel_delay_ms);
-    }
 }
 
 
@@ -409,6 +410,19 @@ void ZStrategy::setOffset() {
 void ZStrategy::cancel_order(int request_id) {
     if (request_id < 0) {
         return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        const auto pending = cancel_pending_request_ids_.find(request_id);
+        if (pending == cancel_pending_request_ids_.end()) {
+            KF_LOG_INFO(logger, "[CancelSkip] InstrumentID=" << mTradeInstrument
+                << ", request_id=" << request_id
+                << ", reason=already_terminal_or_cancelled");
+            return;
+        }
+        // Consume the one-shot timer before calling the gateway. This also
+        // prevents duplicate callbacks from issuing duplicate cancellations.
+        cancel_pending_request_ids_.erase(pending);
     }
     if (!routing_enabled_ || virtual_routing_) {
         KF_LOG_INFO(logger, "[SZEVirtualCancelIntent] InstrumentID=" << mTradeInstrument
@@ -719,6 +733,10 @@ void ZStrategy::on_rtn_order(const LFRtnOrderField *data, int request_id, short 
     if (terminal_status) {
         terminal_order_state_keys_.insert(order_state_key);
         order_ref_last_leaves_.erase(order_state_key);
+        if (request_id >= 0) {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            cancel_pending_request_ids_.erase(request_id);
+        }
     }
 
     if (pending_release > 0 || traded_delta > 0 || terminal_status) {

@@ -149,7 +149,7 @@ private:
     double global_bias_factor_base_line_ = 0.0;
 
     double getCurPosition();
-    int insertOrder(RT_Order order);
+    int insertOrder(RT_Order order, int cancel_delay_ms = 1001);
     void maybe_send_test_order();
     void calcTheo(double prediction);
     void handleT0();
@@ -174,6 +174,10 @@ private:
     std::unordered_map<long, bool> order_fill_from_order_seen_;
     std::unordered_set<long> terminal_order_state_keys_;
     std::unordered_set<std::string> seen_trade_keys_;
+    // Requests with a live remainder are eligible for the deferred FAK cancel.
+    // The timer may run after a terminal order callback, so this set is the
+    // authoritative guard against cancel-after-fill requests.
+    std::unordered_set<int> cancel_pending_request_ids_;
     mutable std::mutex state_mutex_;
 
 
