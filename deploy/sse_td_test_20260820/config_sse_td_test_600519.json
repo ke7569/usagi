@@ -1,0 +1,76 @@
+{
+  "instrument_id": [
+    "600519.SH"
+  ],
+  "sse_test_order": {
+    "cancel_delay_ms": 1000,
+    "price": 0.0,
+    "enabled": false,
+    "volume": 100,
+    "instrument": "600519.SH",
+    "trigger_after_signals": 1,
+    "side": "buy"
+  },
+  "runtime_mode": "live",
+  "md_source_index": [
+    89
+  ],
+  "production_approval": false,
+  "snapshot_auction59_scaler_path": "/home/zane/sse-t0-integration-20260818/artifacts/snapshot/auction59.json",
+  "feed_health": {
+    "resume_after_explicit_resync": true,
+    "require_sequence_healthy": true,
+    "sample_on_gap": false
+  },
+  "deployment_note": "Set production_approval=true and sse_test_order.enabled=true only after explicit order authorization.",
+  "sse_inference_backend": "native-cpp",
+  "market": "SH",
+  "model_routing": {
+    "tick_selected_window": "[09:35:00,24:00:00)",
+    "snapshot_selected_window": "[09:30:00,09:35:00)",
+    "clock": "exchange-time-of-day-micros",
+    "tick_warm_before_switch": true,
+    "silent_fallback": false
+  },
+  "sse_order_routing": {
+    "td_source": 190,
+    "position_query_cutoff_hhmmss": 93100,
+    "enabled": true,
+    "mode": "live",
+    "position_query_retry_ms": 5000
+  },
+  "prediction_only": false,
+  "instrument_universe_mode": "single-instrument",
+  "strategy_name": "sse_td_test_600519",
+  "snapshot_baseline_scaler_path": "/home/zane/sse-t0-integration-20260818/artifacts/snapshot/baseline.json",
+  "sse_live_sampling": {
+    "threshold_ns": 100000,
+    "comparison": "strict-greater-than",
+    "activity_scope": "normalized-sse-book-update",
+    "clock": "CLOCK_MONOTONIC",
+    "shutdown_flush": false,
+    "sequence_gap_policy": "fail-closed",
+    "mode": "trailing-edge-one-shot",
+    "candidate_event": "CompleteOrderBookSH Level2",
+    "periodic_md": false
+  },
+  "snapshot_baseline_model_path": "/home/zane/sse-t0-integration-20260818/artifacts/snapshot/baseline.ssegru",
+  "sse_hybrid_routing_path": "/home/zane/sse-t0-integration-20260818/config/sse_hybrid_routing.json",
+  "trading_enabled": true,
+  "name": "HStrategy",
+  "td_source_index": [
+    190
+  ],
+  "snapshot_auction59_model_path": "/home/zane/sse-t0-integration-20260818/artifacts/snapshot/auction59.ssegru",
+  "sse_factor_contract": "v0.4-sse-cob-batch-end-100us",
+  "model_path": "/home/zane/sse-t0-integration-20260818/artifacts/snapshot/baseline.ssegru",
+  "global_params": {
+    "bias_factor": 1,
+    "position_base_line": 100000,
+    "position_limit": 0.3,
+    "quote_offset": 5,
+    "offset": 1.2
+  },
+  "model_type": "sse_hybrid_native",
+  "sh_orderbook_mode": "complete-orderbook-sh"
+}

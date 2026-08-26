@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(SZE_MARCH_NATIVE "Compile for the build machine CPU" OFF)
 option(SZE_BUILD_TD "Build the Shenzhen ATP TD plugin" OFF)
+option(SSE_BUILD_TD "Build the Shanghai ATP TD plugin" OFF)
 option(SZE_BUILD_DIRECT_SHARDED_RING
   "Build the experimental direct sharded-ring tests/benchmark" OFF)
 set(SZE_TD_API_DIR "${CMAKE_CURRENT_SOURCE_DIR}/modules/deepwin_guoxin/api" CACHE PATH
@@ -147,6 +148,48 @@ if(SZE_BUILD_TD)
     ${BOOST_LIB}/libboost_atomic.so.1.62.0 pthread dl rt)
   set_target_properties(sze_td PROPERTIES
     OUTPUT_NAME sze_td
+    BUILD_WITH_INSTALL_RPATH TRUE
+    INSTALL_RPATH "\$ORIGIN;/home/zane/lib;/opt/deepwin/master/lib/wingchun;/opt/deepwin/master/lib/yijinjing;/opt/deepwin/toolchain/boost-1.62.0/lib")
+endif()
+
+if(SSE_BUILD_TD)
+  if(NOT EXISTS "${SZE_TD_API_DIR}/include/atp_quant_api.h")
+    message(FATAL_ERROR "SSE_BUILD_TD requires ${SZE_TD_API_DIR}/include/atp_quant_api.h")
+  endif()
+  if(NOT EXISTS "${SZE_TD_API_DIR}/lib/libatpquantapi.so")
+    message(FATAL_ERROR "SSE_BUILD_TD requires vendor ${SZE_TD_API_DIR}/lib/libatpquantapi.so")
+  endif()
+  add_library(sse_td SHARED
+    ${SZE_TD}/TDEngineGXSSE.cpp)
+  target_compile_definitions(sse_td PRIVATE
+    GXBSE_TD_BUILD_VERSION="sse-dev"
+    T0_TD_PLUGIN_LABEL="sse_td"
+    T0_TD_SOURCE_ID=190
+    T0_TD_ENGINE_KEY="sse_td"
+    T0_TD_DEFAULT_MARKET_ID=101)
+  target_include_directories(sse_td PRIVATE
+    ${SZE_TD} ${SZE_TD_API_DIR}/include
+    ${DEEPWIN_INCLUDE} ${DEEPWIN_INCLUDE}/longfist
+    ${BOOST_INCLUDE} ${PYTHON_INCLUDE})
+  target_link_libraries(sse_td PRIVATE
+    ${YJJ_LIB}/libjournal.so.1.1
+    ${YJJ_LIB}/libkflog.so
+    ${WC_LIB}/libwingchuntd.so
+    ${SZE_TD_API_DIR}/lib/libatpquantapi.so
+    ${BOOST_LIB}/libboost_locale.so.1.62.0
+    ${BOOST_LIB}/libboost_date_time.so.1.62.0
+    ${BOOST_LIB}/libboost_filesystem.so.1.62.0
+    ${BOOST_LIB}/libboost_system.so.1.62.0
+    ${BOOST_LIB}/libboost_thread.so.1.62.0
+    ${BOOST_LIB}/libboost_serialization.so.1.62.0
+    ${BOOST_LIB}/libboost_math_tr1.so.1.62.0
+    ${BOOST_LIB}/libboost_python.so.1.62.0
+    ${BOOST_LIB}/libboost_chrono.so.1.62.0
+    ${BOOST_LIB}/libboost_regex.so.1.62.0
+    ${BOOST_LIB}/libboost_program_options.so.1.62.0
+    ${BOOST_LIB}/libboost_atomic.so.1.62.0 pthread dl rt)
+  set_target_properties(sse_td PROPERTIES
+    OUTPUT_NAME sse_td
     BUILD_WITH_INSTALL_RPATH TRUE
     INSTALL_RPATH "\$ORIGIN;/home/zane/lib;/opt/deepwin/master/lib/wingchun;/opt/deepwin/master/lib/yijinjing;/opt/deepwin/toolchain/boost-1.62.0/lib")
 endif()

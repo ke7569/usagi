@@ -18,6 +18,7 @@ include_directories(${DEEPWIN_INCLUDE_DIR} ${DEEPWIN_BOOST_INCLUDE_DIR} ${DEEPWI
 link_directories(${DEEPWIN_WC_LIB_DIR} ${DEEPWIN_YJJ_LIB_DIR} ${DEEPWIN_BOOST_LIB_DIR} ${GUOXIN_API_DIR}/lib)
 
 SET(GUOXIN_TD_SOURCE_FILES TDEngineGXBSE.cpp TDEngineGXBSE.h)
+SET(GUOXIN_SSE_TD_SOURCE_FILES TDEngineGXSSE.cpp TDEngineGXSSE.h GxsseDirectApi.h)
 
 function(add_guoxin_td_engine target output_name source_id engine_key default_market_id)
     ADD_LIBRARY(${target} SHARED ${GUOXIN_TD_SOURCE_FILES})
@@ -35,3 +36,23 @@ function(add_guoxin_td_engine target output_name source_id engine_key default_ma
 endfunction()
 
 add_guoxin_td_engine(sze_td sze_td 180 sze_td 102)
+
+function(add_guoxin_sse_td_engine target output_name)
+    ADD_LIBRARY(${target} SHARED ${GUOXIN_SSE_TD_SOURCE_FILES})
+    set_target_properties(${target} PROPERTIES OUTPUT_NAME "${output_name}")
+    target_compile_definitions(${target} PRIVATE
+        GXBSE_TD_BUILD_VERSION="${GXBSE_TD_BUILD_VERSION}"
+        T0_TD_SOURCE_ID=190
+        T0_TD_ENGINE_KEY="sse_td"
+        T0_TD_DEFAULT_MARKET_ID=101
+        T0_TD_PLUGIN_LABEL="sse_td")
+    TARGET_LINK_LIBRARIES(${target} ${DEEPWIN_LIB} ${Boost_LIBRARIES} atpquantapi pthread rt)
+    set_target_properties(${target} PROPERTIES
+        BUILD_RPATH "${DEEPWIN_WC_LIB_DIR};${DEEPWIN_YJJ_LIB_DIR};${DEEPWIN_BOOST_LIB_DIR};${GUOXIN_API_DIR}/lib"
+        INSTALL_RPATH "${DEEPWIN_WC_LIB_DIR};${DEEPWIN_YJJ_LIB_DIR};${DEEPWIN_BOOST_LIB_DIR};${GUOXIN_API_DIR}/lib")
+    INSTALL(TARGETS ${target} DESTINATION "lib/wingchun")
+endfunction()
+
+# SSE uses the same ATP Quant API state machine with an independent plugin
+# entry point and source id.
+add_guoxin_sse_td_engine(sse_td sse_td)

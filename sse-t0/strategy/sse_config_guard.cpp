@@ -33,11 +33,33 @@ bool require_false(const nlohmann::json& object, const char* key,
 }
 
 bool require_true(const nlohmann::json& object, const char* key,
-                  std::string* error) {
+                   std::string* error) {
     nlohmann::json::const_iterator item = object.find(key);
     if (item == object.end() || !item->is_boolean() || !item->get<bool>()) {
         return reject(std::string("SSE config requires ") + key + "=true", error);
     }
+    return true;
+}
+
+bool has_live_td(const nlohmann::json& config) {
+    nlohmann::json::const_iterator td = config.find("td_source_index");
+    return td != config.end() && td->is_array() && !td->empty();
+}
+
+bool validate_td_routing(const nlohmann::json& config, std::string* error) {
+    const bool live_td = has_live_td(config);
+    nlohmann::json::const_iterator routing = config.find("sse_order_routing");
+    if (!live_td) return true;
+    if (routing == config.end() || !routing->is_object())
+        return reject("SSE live TD config requires sse_order_routing object", error);
+    if (!require_true(*routing, "enabled", error) ||
+        !require_string(*routing, "mode", "live", error)) return false;
+    nlohmann::json::const_iterator source = routing->find("td_source");
+    if (source == routing->end() || !source->is_number_integer() || source->get<int>() != 190)
+        return reject("SSE live TD config requires sse_order_routing.td_source=190", error);
+    nlohmann::json::const_iterator test = config.find("sse_test_order");
+    if (test != config.end() && (!test->is_object()))
+        return reject("sse_test_order must be an object", error);
     return true;
 }
 
@@ -81,16 +103,31 @@ bool validate_config(const nlohmann::json& config, std::string* error) {
         threshold->get<long long>() != 100000LL)
         return reject("SSE config requires sse_live_sampling.threshold_ns=100000", error);
 
+    const bool live_td = has_live_td(config);
     nlohmann::json::const_iterator prediction_only = config.find("prediction_only");
-    if (prediction_only == config.end() || !prediction_only->is_boolean() ||
-        !prediction_only->get<bool>())
-        return reject("SSE live candidate requires prediction_only=true", error);
-    if (!require_string(config, "runtime_mode", "prediction-only", error) ||
-        !require_false(config, "trading_enabled", error) ||
-        !require_false(config, "production_approval", error)) return false;
-    nlohmann::json::const_iterator td_sources = config.find("td_source_index");
-    if (td_sources == config.end() || !td_sources->is_array() || !td_sources->empty())
+    if (prediction_only == config.end() || !prediction_only->is_boolean())
+        return reject("SSE config requires boolean prediction_only", error);
+    if (live_td && prediction_only->get<bool>())
         return reject("SSE prediction-only config requires empty td_source_index", error);
+    if (live_td) {
+        if (!require_string(config, "runtime_mode", "live", error) ||
+            !require_true(config, "trading_enabled", error) ||
+            !require_false(config, "production_approval", error)) return false;
+    } else {
+        if (!prediction_only->get<bool>())
+            return reject("SSE prediction-only config requires prediction_only=true", error);
+        if (!require_string(config, "runtime_mode", "prediction-only", error) ||
+            !require_false(config, "trading_enabled", error) ||
+            !require_false(config, "production_approval", error)) return false;
+    }
+    nlohmann::json::const_iterator td_sources = config.find("td_source_index");
+    if (td_sources == config.end() || !td_sources->is_array())
+        return reject("SSE config requires td_source_index array", error);
+    if (live_td && (td_sources->size() != 1U || td_sources->at(0).get<int>() != 190))
+        return reject("SSE live TD config requires td_source_index=[190]", error);
+    if (!live_td && !td_sources->empty())
+        return reject("SSE prediction-only config requires empty td_source_index", error);
+    if (!validate_td_routing(config, error)) return false;
 
     nlohmann::json::const_iterator routing = config.find("model_routing");
     if (routing == config.end() || !routing->is_object())

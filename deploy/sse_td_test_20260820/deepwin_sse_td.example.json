@@ -1,0 +1,36 @@
+{
+  "td": {
+    "sse_td": {
+      "BrokerId": "1700",
+      "UserId": "REPLACE_IN_ROOT_ONLY_SECRET",
+      "InvestorId": "REPLACE_IN_ROOT_ONLY_SECRET",
+      "Password": "REPLACE_IN_ROOT_ONLY_SECRET",
+      "cust_id": "REPLACE_IN_ROOT_ONLY_SECRET",
+      "fund_account_id": "REPLACE_IN_ROOT_ONLY_SECRET",
+      "branch_id": "1700",
+      "account_id": "REPLACE_IN_ROOT_ONLY_SECRET",
+      "trade_password": "REPLACE_IN_ROOT_ONLY_SECRET",
+      "agw_user": "REPLACE_IN_ROOT_ONLY_SECRET",
+      "agw_password": "REPLACE_IN_ROOT_ONLY_SECRET",
+      "order_way": "N",
+      "client_feature_code": "REPLACE_WITH_MACHINE_FEATURE_CODE",
+      "bind_ip_address": "",
+      "locations": [
+        "REPLACE_PRIMARY_SSE_IX_ENDPOINT:32002",
+        "REPLACE_BACKUP_SSE_IX_ENDPOINT:32002"
+      ],
+      "market_id": 101,
+      "business_type": 1,
+      "return_num": 100,
+      "receive_thread_cpu": 16,
+      "send_thread_cpu": 17,
+      "is_tcp_direct": false,
+      "enable_latency": true,
+      "enable_position_sync": true,
+      "startup_cancel_all_orders": true,
+      "position_sync_interval_sec": 5,
+      "log_level": 4,
+      "api_log_dir": "/home/zane/log"
+    }
+  }
+}
