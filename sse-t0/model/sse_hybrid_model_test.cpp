@@ -153,9 +153,13 @@ int main(int argc, char** argv) {
            output.selected_source == sse_hybrid_model::kTickSource &&
            output.selected_pred == 1.5f && state.tick.accepted_rows == 2U);
     const std::uint64_t snapshot_rows = state.snapshot.baseline.accepted_rows;
-    assert(!model.on_snapshot(snapshot, enhanced, "sse", 34500000000ULL,
+    assert(model.on_snapshot(snapshot, enhanced, "sse", 34500000000ULL,
+                             &state, &output, &error));
+    assert(output.snapshot_generated && !output.selected &&
+           state.snapshot.baseline.accepted_rows == snapshot_rows + 1U);
+    assert(!model.on_snapshot(snapshot, enhanced, "sse", 34860000000ULL,
                               &state, &output, &error));
-    assert(state.snapshot.baseline.accepted_rows == snapshot_rows);
+    assert(state.snapshot.baseline.accepted_rows == snapshot_rows + 1U);
     tick_factors[0] = std::numeric_limits<float>::infinity();
     assert(!model.on_tick(tick_factors, "sse", 34500000001ULL,
                           &state, &output, &error));

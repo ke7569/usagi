@@ -12,6 +12,8 @@
 #include <iomanip>
 #include <algorithm>
 #include <sstream>
+#include <cstdlib>
+#include <cstring>
 #include "../util.h"
 
 namespace {
@@ -74,9 +76,11 @@ ZStrategy::ZStrategy(const std::string &InstrumentID,
         !config["td_source_index"].empty()) {
         td_source_ = static_cast<short>(config["td_source_index"][0].get<int>());
     }
-    if (config.find("sze_order_routing") != config.end() &&
-        config["sze_order_routing"].is_object()) {
-        const json& routing = config["sze_order_routing"];
+    const char* routing_key = (ExchangeID == "SSE")
+        ? "sse_order_routing" : "sze_order_routing";
+    if (config.find(routing_key) != config.end() &&
+        config[routing_key].is_object()) {
+        const json& routing = config[routing_key];
         if (routing.find("enabled") != routing.end() && routing["enabled"].is_boolean()) {
             routing_enabled_ = routing["enabled"].get<bool>();
         }
@@ -86,6 +90,17 @@ ZStrategy::ZStrategy(const std::string &InstrumentID,
         recovery_routing_ = routing.value("input_mode", std::string()) == "recovery_handoff";
         max_order_volume_ = routing.value("max_order_volume", 0);
         max_position_ = routing.value("max_position", 0);
+        // SSE live routing is deliberately two-keyed: the account can log in
+        // and synchronize risk while every order remains blocked until the
+        // operator explicitly approves production.  Virtual routing remains
+        // useful for offline order-intent tests.
+        if (ExchangeID == "SSE" && !virtual_routing_ &&
+            (!config.value("trading_enabled", false) ||
+             !config.value("production_approval", false) ||
+             std::getenv("SSE_ENABLE_LIVE_ORDER") == 0 ||
+             std::strcmp(std::getenv("SSE_ENABLE_LIVE_ORDER"), "YES") != 0)) {
+            routing_enabled_ = false;
+        }
     }
     if (config.find("sze_startup_warmup_signals") != config.end() &&
         config["sze_startup_warmup_signals"].is_number_integer()) {
@@ -98,9 +113,11 @@ ZStrategy::ZStrategy(const std::string &InstrumentID,
     KF_LOG_INFO(logger, "[SZEWarmup] instrument=" << mTradeInstrument
         << " prediction_only_samples=" << startup_warmup_signal_count_);
 
-    if (config.find("sze_test_order") != config.end() &&
-        config["sze_test_order"].is_object()) {
-        const json& test = config["sze_test_order"];
+    const char* test_order_key = ExchangeID == "SSE"
+        ? "sse_test_order" : "sze_test_order";
+    if (config.find(test_order_key) != config.end() &&
+        config[test_order_key].is_object()) {
+        const json& test = config[test_order_key];
         if (test.find("enabled") != test.end() && test["enabled"].is_boolean()) {
             test_order_.enabled = test["enabled"].get<bool>();
         }
@@ -170,7 +187,8 @@ ZStrategy::ZStrategy(const std::string &InstrumentID,
     i_params.shortable = ins_params.static_position + ins_params.last_position;
     context.pi = ins_params.last_position;
     if (config.find("ins_params") != config.end() && config["ins_params"].is_object()) {
-        const std::string symbol_key = mTradeInstrument + ".SZ";
+        const std::string symbol_key = mTradeInstrument +
+            (ExchangeID == "SSE" ? ".SH" : ".SZ");
         json::const_iterator item = config["ins_params"].find(symbol_key);
         if (item == config["ins_params"].end()) {
             item = config["ins_params"].find(mTradeInstrument);
@@ -262,12 +280,12 @@ void ZStrategy::on_order_reject(int request_id, const RT_Order& order) {
 
 int ZStrategy::insertOrder(RT_Order order) {
     if (!routing_enabled_) {
-        KF_LOG_ERROR(logger, "[SZEOrderBlocked] InstrumentID=" << mTradeInstrument
+        KF_LOG_ERROR(logger, "[OrderBlocked] InstrumentID=" << mTradeInstrument
             << ", reason=routing_disabled");
         return -1;
     }
     if (virtual_routing_) {
-        KF_LOG_INFO(logger, "[SZEVirtualOrderIntent] InstrumentID=" << mTradeInstrument
+        KF_LOG_INFO(logger, "[VirtualOrderIntent] InstrumentID=" << mTradeInstrument
             << ", Side=" << (order.Direction == BUY ? "Buy" : "Sell")
             << ", Volume=" << order.Volume
             << ", Price=" << order.Price
@@ -280,7 +298,7 @@ int ZStrategy::insertOrder(RT_Order order) {
         // safety cap; net-position eligibility is checked before insertion.
         if (max_order_volume_ <= 0 || order.Volume > max_order_volume_ ||
             (max_position_ > 0 && order.Volume > max_position_)) {
-            KF_LOG_ERROR(logger, "[SZEOrderBlocked] InstrumentID=" << mTradeInstrument
+            KF_LOG_ERROR(logger, "[OrderBlocked] InstrumentID=" << mTradeInstrument
                 << ", reason=position_or_volume_limit"
                 << ", volume=" << order.Volume
                 << ", max_order_volume=" << max_order_volume_

@@ -186,6 +186,7 @@ AccountUnitGXBSE& AccountUnitGXBSE::operator=(AccountUnitGXBSE&& other) noexcept
         branch_id = std::move(other.branch_id);
         account_id = std::move(other.account_id);
         password = std::move(other.password);
+        login_password = std::move(other.login_password);
         market_id = other.market_id;
         business_type = other.business_type;
         return_num = other.return_num;
@@ -446,8 +447,9 @@ TradeAccount TDEngineGXBSE::load_account(int idx, const json& j_config)
     unit.fund_account_id = json_string_or(j_config, "fund_account_id", unit.cust_id);
     unit.branch_id = json_string_or(j_config, "branch_id", "");
     unit.account_id = json_string_or(j_config, "account_id", "");
-    unit.password = json_string_or(j_config, "trade_password",
+    unit.login_password = json_string_or(j_config, "Password",
         json_string_or(j_config, "password", json_string_or(j_config, WC_CONFIG_KEY_PASSWORD, "")));
+    unit.password = json_string_or(j_config, "trade_password", unit.login_password);
     unit.order_way = json_string_or(j_config, "order_way", unit.order_way);
     unit.client_feature_code = json_string_or(j_config, "client_feature_code", unit.client_feature_code);
     unit.bind_ip_address = json_string_or(j_config, "bind_ip_address",
@@ -474,7 +476,7 @@ TradeAccount TDEngineGXBSE::load_account(int idx, const json& j_config)
     copy_text(account.BrokerID, sizeof(account.BrokerID), json_string_or(j_config, WC_CONFIG_KEY_BROKER_ID, ""));
     copy_text(account.UserID, sizeof(account.UserID), json_string_or(j_config, WC_CONFIG_KEY_USER_ID, unit.cust_id));
     copy_text(account.InvestorID, sizeof(account.InvestorID), unit.cust_id);
-    copy_text(account.Password, sizeof(account.Password), unit.password);
+    copy_text(account.Password, sizeof(account.Password), unit.login_password);
 
     KF_LOG_INFO(logger, "[load_account] gxbse idx=" << idx
         << " cust_id=" << unit.cust_id
@@ -566,7 +568,7 @@ void TDEngineGXBSE::login(long timeout_nsec)
         ATPLoginProperty* login = ATPLoginProperty::NewMessage();
         login->SetUserId(unit.cust_id.c_str());
         login->SetBranchId(unit.branch_id.c_str());
-        login->SetPassword(unit.password.c_str());
+        login->SetPassword(unit.login_password.c_str());
         login->SetLoginMode(ATPLoginModeConst::kCustIDMode);
         login->SetConnectChannel(ATPConnectChannelConst::kSoftChannel);
         ATPErrorCodeType ec = unit.api->Login(login);

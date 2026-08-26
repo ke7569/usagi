@@ -31,7 +31,7 @@ EXPORT_FLAG const char* sse_strategy_build_id();
 }
 
 const char* sse_strategy_build_id() {
-    return "sse-strategy-v05-td-routing-20260820";
+    return "sse-strategy-v06-hybrid-td-routing-20260827";
 }
 
 IWCStrategy* get_obj(kungfu::yijinjing::IControlCenter* cc, const std::string& cfg_name) {

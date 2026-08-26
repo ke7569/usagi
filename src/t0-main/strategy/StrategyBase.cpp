@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include <cstdio>
 #include <ctime>
+#include <chrono>
 
 #ifdef T0_SZE_STRATEGY_ONLY
 #include "SZEProtocol.h"
@@ -32,6 +33,13 @@
 #include <sched.h>
 #include <time.h>
 #endif
+
+SseHybridRuntimeState::SseHybridRuntimeState(const std::string& code)
+    : model_state(), order_book(code), factor_state(), previous_snapshot(),
+      has_previous_snapshot(false), auction59_factors(), signal_view(),
+      pending_tick(), pending_tick_valid(false), pending_flush_scheduled(false),
+      pending_tick_receive_ns(0), pending_tick_source(0), pending_tick_rcv_time(0),
+      last_tick_receive_ns(0), tick_sample_count(0) {}
 
 
 namespace {
@@ -78,6 +86,52 @@ std::uint64_t SnapshotExchangeTimeMs(const LFMarketDataField& value) {
             static_cast<std::uint64_t>(minute) * 60U +
             static_cast<std::uint64_t>(second)) * 1000U +
            static_cast<std::uint64_t>(value.UpdateMillisec);
+}
+
+std::uint64_t SseMonotonicNowNs() {
+    timespec value;
+    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) return 0;
+    return static_cast<std::uint64_t>(value.tv_sec) * 1000000000ULL +
+           static_cast<std::uint64_t>(value.tv_nsec);
+}
+
+bool ParseSseTimeMicros(const char* text, std::uint64_t* output) {
+    if (text == 0 || output == 0) return false;
+    unsigned int hour = 0, minute = 0, second = 0, fraction = 0;
+    char separator = 0;
+    const int fields = std::sscanf(text, "%u:%u:%u%c%u",
+                                    &hour, &minute, &second, &separator, &fraction);
+    if (fields < 3 || hour > 23U || minute > 59U || second > 59U) return false;
+    std::uint64_t micros = 0;
+    if (fields >= 5 && separator == '.') {
+        std::size_t digits = 0;
+        const char* dot = std::strchr(text, '.');
+        if (dot != 0) {
+            for (const char* p = dot + 1; *p >= '0' && *p <= '9'; ++p) ++digits;
+        }
+        if (digits == 0) return false;
+        if (digits <= 6) {
+            micros = static_cast<std::uint64_t>(fraction);
+            for (std::size_t i = digits; i < 6; ++i) micros *= 10ULL;
+        } else {
+            std::uint64_t scale = 1ULL;
+            for (std::size_t i = 0; i < digits - 6; ++i) scale *= 10ULL;
+            micros = static_cast<std::uint64_t>(fraction) / scale;
+        }
+    }
+    *output = (static_cast<std::uint64_t>(hour) * 3600ULL +
+               static_cast<std::uint64_t>(minute) * 60ULL + second) * 1000000ULL + micros;
+    return true;
+}
+
+std::uint64_t SseRawPrice(double price) {
+    if (!std::isfinite(price) || price <= 0.0) return 0;
+    return static_cast<std::uint64_t>(std::llround(price * 1000.0));
+}
+
+std::uint64_t SseRawQuantity(double quantity) {
+    if (!std::isfinite(quantity) || quantity <= 0.0) return 0;
+    return static_cast<std::uint64_t>(std::llround(quantity * 1000.0));
 }
 
 std::uint64_t ExchangeTimeOfDayUs(std::int64_t exchange_time_us) {
@@ -606,6 +660,20 @@ StrategyBase::StrategyBase(const std::string &name, json& src_config): IWCStrate
             params_json["HpLowerPrice"].is_number()) {
             params.HpLowerPrice = params_json["HpLowerPrice"].get<double>();
         }
+        if (params_json.find("UpperLimitPrice") != params_json.end() &&
+            params_json["UpperLimitPrice"].is_number()) {
+            params.HpUpperPrice = params_json["UpperLimitPrice"].get<double>();
+        } else if (params_json.find("upper_limit_price") != params_json.end() &&
+                   params_json["upper_limit_price"].is_number()) {
+            params.HpUpperPrice = params_json["upper_limit_price"].get<double>();
+        }
+        if (params_json.find("LowerLimitPrice") != params_json.end() &&
+            params_json["LowerLimitPrice"].is_number()) {
+            params.HpLowerPrice = params_json["LowerLimitPrice"].get<double>();
+        } else if (params_json.find("lower_limit_price") != params_json.end() &&
+                   params_json["lower_limit_price"].is_number()) {
+            params.HpLowerPrice = params_json["lower_limit_price"].get<double>();
+        }
         if (params_json.find("HpFeeShare") != params_json.end() &&
             params_json["HpFeeShare"].is_number()) {
             params.HpFeeShare = params_json["HpFeeShare"].get<double>();
@@ -638,9 +706,14 @@ StrategyBase::StrategyBase(const std::string &name, json& src_config): IWCStrate
 #endif
     mMarket = src_config["market"].get<std::string>();
     mOrderBookMode = ParseOrderBookRuntimeMode(src_config, mMarket);
-    if (src_config.find("sze_order_routing") != src_config.end() &&
-        src_config["sze_order_routing"].is_object()) {
-        const json& routing = src_config["sze_order_routing"];
+    configure_sse_hybrid(src_config);
+    // Trading/risk startup is exchange-specific.  SSE uses its own routing
+    // block and must not inherit the Shenzhen gate by accident.
+    const char* routing_key = mMarket == "SH"
+        ? "sse_order_routing" : "sze_order_routing";
+    if (src_config.find(routing_key) != src_config.end() &&
+        src_config[routing_key].is_object()) {
+        const json& routing = src_config[routing_key];
         mSzeLiveRoutingEnabled = routing.value("enabled", false);
         mSzePositionRetryIntervalMs = std::max(
             1000, routing.value("position_query_retry_ms", 5000));
@@ -802,7 +875,7 @@ StrategyBase::StrategyBase(const std::string &name, json& src_config): IWCStrate
             sample_num = 12000;
         }
         double thres = params.HistoryAmount / sample_num;
-        if (!using_hp_mode()) {
+        if (!using_hp_mode() && !mSseHybridEnabled) {
             mSnapGeneratorMap[code] = SnapGenerator();
             if (mMarket == "SZ") {
                 mPredictorMap[code] = new SzePredictor(
@@ -930,7 +1003,393 @@ StrategyBase::~StrategyBase() {
             << mSnapshotLegacy15PredictionCount
             << " rejects=" << mSnapshotLegacy15RejectCount);
     }
+    if (mSseHybridEnabled) {
+        for (std::unordered_map<std::string, std::unique_ptr<SseHybridRuntimeState> >::iterator
+                 it = mSseHybridStateMap.begin(); it != mSseHybridStateMap.end(); ++it) {
+            if (it->second.get() != 0 && it->second->pending_tick_valid) {
+                flush_sse_hybrid_tick(it->first, mSseHybridSnapshotSource, 0);
+            }
+        }
+        KF_LOG_INFO(logger, "[SSEHybrid] shutdown snapshot_predictions="
+            << mSseHybridSnapshotPredictionCount
+            << " tick_predictions=" << mSseHybridTickPredictionCount
+            << " rejects=" << mSseHybridRejectCount);
+    }
     dump_full_orderbook_latency_summary();
+}
+
+bool StrategyBase::configure_sse_hybrid(const json& config) {
+    if (mMarket != "SH") return false;
+    const std::string model_type = config.value("model_type", std::string());
+    if (model_type != "sse_hybrid_native") return false;
+
+    const std::string tick_path = config.value("model_path", std::string());
+    const std::string baseline_path = config.value(
+        "snapshot_baseline_model_path", std::string());
+    const std::string baseline_scaler = config.value(
+        "snapshot_baseline_scaler_path", std::string());
+    const std::string auction_path = config.value(
+        "snapshot_auction59_model_path", std::string());
+    const std::string auction_scaler = config.value(
+        "snapshot_auction59_scaler_path", std::string());
+    if (tick_path.empty() || baseline_path.empty() || baseline_scaler.empty() ||
+        auction_path.empty() || auction_scaler.empty()) {
+        throw std::runtime_error("SSE hybrid config requires all model/scaler paths");
+    }
+    std::string error;
+    if (!mSseHybridModel.load(tick_path, baseline_path, baseline_scaler,
+                             auction_path, auction_scaler, &error)) {
+        throw std::runtime_error("SSE hybrid model load failed: " + error);
+    }
+
+    const std::string auction_factors_path = config.value(
+        "snapshot_auction59_factors_path", std::string());
+    if (!auction_factors_path.empty() &&
+        !sse_auction59::load_csv(auction_factors_path, &mSseAuction59Factors,
+                                 &error)) {
+        throw std::runtime_error("SSE Auction59 factor load failed: " + error);
+    }
+    json::const_iterator source = config.find("snapshot_source_id");
+    if (source != config.end() && source->is_number_integer()) {
+        mSseHybridSnapshotSource = static_cast<short>(source->get<int>());
+    }
+
+    for (std::vector<std::string>::const_iterator it = mInstrumentVec.begin();
+         it != mInstrumentVec.end(); ++it) {
+        const std::string& code = *it;
+        std::unique_ptr<SseHybridRuntimeState> state(
+            new SseHybridRuntimeState(code));
+        state->signal_view.reset(new MSMarketDataField(NewMixSignalView()));
+        const InsParams& params = mInsParamsMap.at(code);
+        sse_tick::DailyStaticMetadata metadata;
+        metadata.date = static_cast<std::uint32_t>(params.Date);
+        metadata.avg_amount = params.HistoryAmount;
+        metadata.turnover_threshold = params.HistoryAmount / 8000.0;
+        metadata.free_share = params.FreeShare;
+        metadata.pre_close = params.Close;
+        metadata.limit_price = params.HpUpperPrice > 0.0
+                                   ? params.HpUpperPrice : params.Close * 1.10;
+        metadata.stop_price = params.HpLowerPrice > 0.0
+                                  ? params.HpLowerPrice : params.Close * 0.90;
+        metadata.has_date = metadata.date != 0U;
+        metadata.has_avg_amount = metadata.avg_amount > 0.0;
+        metadata.has_turnover_threshold = metadata.turnover_threshold > 0.0;
+        metadata.has_free_share = metadata.free_share > 0.0;
+        metadata.has_pre_close = metadata.pre_close > 0.0;
+        metadata.has_limit_price = metadata.limit_price > 0.0;
+        metadata.has_stop_price = metadata.stop_price > 0.0;
+        metadata.quality = "runtime_config";
+        state->factor_state.set_static_metadata(metadata);
+        std::map<std::string, std::vector<float> >::const_iterator auction =
+            mSseAuction59Factors.find(code);
+        if (auction != mSseAuction59Factors.end() && auction->second.size() == 59U) {
+            state->auction59_factors = auction->second;
+        } else {
+            state->auction59_factors.assign(59U,
+                std::numeric_limits<float>::quiet_NaN());
+        }
+        mSseHybridStateMap[code] = std::move(state);
+    }
+    mSseHybridEnabled = true;
+    KF_LOG_INFO(logger, "[SSEHybrid] enabled=1 instruments="
+        << mSseHybridStateMap.size() << " snapshot_source="
+        << mSseHybridSnapshotSource << " tick_batch_gap_ns=100000"
+        << " real_td_unchanged=1");
+    return true;
+}
+
+SseHybridRuntimeState* StrategyBase::sse_hybrid_state_for(const std::string& code) {
+    std::unordered_map<std::string, std::unique_ptr<SseHybridRuntimeState> >::iterator it =
+        mSseHybridStateMap.find(code);
+    if (it == mSseHybridStateMap.end() || it->second.get() == 0) return 0;
+    return it->second.get();
+}
+
+bool StrategyBase::make_sse_tick_event(const LFL2OrderField& data,
+                                       short source,
+                                       std::uint64_t receive_ns,
+                                       sse_live::TickEvent* event) const {
+    if (event == 0) return false;
+    const std::string code = NormalizeInstrumentId(data.InstrumentID);
+    if (!sse_live::is_sse_stock(code) || data.ApplSeqNum <= 0 ||
+        data.OrderKind[0] != 'B' && data.OrderKind[0] != 'S') return false;
+    std::uint64_t exchange_time = 0;
+    if (!ParseSseTimeMicros(data.OrderTime, &exchange_time)) return false;
+    const std::uint64_t sequence = data.BizIndex > 0 ?
+        static_cast<std::uint64_t>(data.BizIndex) :
+        static_cast<std::uint64_t>(data.ApplSeqNum);
+    if (sequence == 0 || SseRawPrice(data.Price) == 0 ||
+        SseRawQuantity(data.Volume) == 0) return false;
+    *event = sse_live::TickEvent();
+    event->security_id = code;
+    event->channel_no = source > 0 ? static_cast<std::uint32_t>(source) : 1U;
+    event->provider_sequence = sequence;
+    event->tick_index = sequence;
+    event->app_seq_num = static_cast<std::uint64_t>(data.ApplSeqNum);
+    event->time_of_day_micros = exchange_time;
+    event->event_type = (data.OrdType[0] == 'D' || data.OrdType[0] == '4') ? 'D' : 'A';
+    event->buy_order_no = data.OrderKind[0] == 'B'
+                              ? static_cast<std::uint64_t>(data.OrderNo) : 0U;
+    event->sell_order_no = data.OrderKind[0] == 'S'
+                               ? static_cast<std::uint64_t>(data.OrderNo) : 0U;
+    event->price_raw = static_cast<std::uint32_t>(SseRawPrice(data.Price));
+    event->quantity_raw = SseRawQuantity(data.Volume);
+    event->amount_raw = 0U;
+    event->side = data.OrderKind[0] == 'B' ? 0 : 1;
+    (void)receive_ns;
+    return true;
+}
+
+bool StrategyBase::make_sse_tick_event(const LFL2TradeField& data,
+                                       short source,
+                                       std::uint64_t receive_ns,
+                                       sse_live::TickEvent* event) const {
+    if (event == 0) return false;
+    const std::string code = NormalizeInstrumentId(data.InstrumentID);
+    if (!sse_live::is_sse_stock(code) || data.ApplSeqNum <= 0) return false;
+    std::uint64_t exchange_time = 0;
+    if (!ParseSseTimeMicros(data.TradeTime, &exchange_time)) return false;
+    const std::uint64_t sequence = data.BizIndex > 0 ?
+        static_cast<std::uint64_t>(data.BizIndex) :
+        static_cast<std::uint64_t>(data.ApplSeqNum);
+    if (sequence == 0 || SseRawQuantity(data.Volume) == 0) return false;
+    *event = sse_live::TickEvent();
+    event->security_id = code;
+    event->channel_no = source > 0 ? static_cast<std::uint32_t>(source) : 1U;
+    event->provider_sequence = sequence;
+    event->tick_index = sequence;
+    event->app_seq_num = static_cast<std::uint64_t>(data.ApplSeqNum);
+    event->time_of_day_micros = exchange_time;
+    event->event_type = data.OrderKind[0] == '4' ? 'D' : 'T';
+    event->buy_order_no = data.BidApplSeqNum > 0
+                              ? static_cast<std::uint64_t>(data.BidApplSeqNum) : 0U;
+    event->sell_order_no = data.OfferApplSeqNum > 0
+                               ? static_cast<std::uint64_t>(data.OfferApplSeqNum) : 0U;
+    event->price_raw = static_cast<std::uint32_t>(SseRawPrice(data.Price));
+    event->quantity_raw = SseRawQuantity(data.Volume);
+    event->amount_raw = SseRawQuantity(data.TurnOver);
+    event->side = (data.OrderKind[0] == '4' && data.BidApplSeqNum == 0 &&
+                   data.OfferApplSeqNum != 0) ? 1 : 0;
+    (void)receive_ns;
+    return true;
+}
+
+void StrategyBase::flush_sse_hybrid_tick(const std::string& code,
+                                         short source,
+                                         long rcv_time) {
+    SseHybridRuntimeState* state = sse_hybrid_state_for(code);
+    if (state == 0 || !state->pending_tick_valid) return;
+    state->pending_flush_scheduled = false;
+    const sse_live::TickEvent event = state->pending_tick;
+    state->pending_tick_valid = false;
+    const sse_tick::FactorRow factor_row = state->factor_state.build(
+        state->order_book, event.time_of_day_micros);
+    std::array<float, sse_model::kFeatureCount> factors = factor_row.values;
+    sse_hybrid_model::Prediction output;
+    std::string error;
+    if (!mSseHybridModel.on_tick(factors, "sse", event.time_of_day_micros,
+                                 &state->model_state, &output, &error)) {
+        ++mSseHybridRejectCount;
+        KF_LOG_ERROR(logger, "[SSEHybrid][TickReject] instrument=" << code
+            << " reason=" << error);
+        return;
+    }
+    ++state->tick_sample_count;
+    ++mSseHybridTickPredictionCount;
+    if (output.selected && factor_row.validity.complete &&
+        state->signal_view.get() != 0 &&
+        can_dispatch_trading_signal()) {
+        std::unordered_map<std::string, ZStrategy*>::iterator strategy_it =
+            mZStrategyMap.find(code);
+        if (strategy_it != mZStrategyMap.end() && strategy_it->second != 0) {
+            strategy_it->second->on_signal(state->signal_view.get(),
+                output.selected_pred, source, rcv_time);
+        }
+    }
+    if (state->tick_sample_count <= 3U || state->tick_sample_count % 1000U == 0U) {
+        KF_LOG_INFO(logger, "[SSEHybrid][Tick] instrument=" << code
+            << " source=" << output.selected_source
+            << " prediction=" << output.tick_pred
+            << " factor_complete=" << factor_row.validity.complete
+            << " tick_index=" << event.tick_index);
+    }
+}
+
+void StrategyBase::schedule_sse_hybrid_tick_flush(const std::string& code) {
+    SseHybridRuntimeState* state = sse_hybrid_state_for(code);
+    if (state == 0 || !state->pending_tick_valid ||
+        state->pending_flush_scheduled || util == 0) {
+        return;
+    }
+    state->pending_flush_scheduled = true;
+    BLCallback callback = std::bind(
+        &StrategyBase::flush_sse_hybrid_tick_if_quiet, this, code);
+    const long due = static_cast<long>(
+        state->pending_tick_receive_ns + 100000ULL);
+    if (!util->insert_callback(due, callback)) {
+        state->pending_flush_scheduled = false;
+        KF_LOG_ERROR(logger, "[SSEHybrid][FlushScheduleReject] instrument=" << code);
+    }
+}
+
+void StrategyBase::flush_sse_hybrid_tick_if_quiet(const std::string& code) {
+    SseHybridRuntimeState* state = sse_hybrid_state_for(code);
+    if (state == 0 || !state->pending_tick_valid) return;
+    state->pending_flush_scheduled = false;
+    const std::uint64_t now = SseMonotonicNowNs();
+    const std::uint64_t due = state->pending_tick_receive_ns + 100000ULL;
+    if (now <= due) {
+        // The callback heap may run a little early.  Re-arm the same single
+        // callback; a new market event does not allocate another callback.
+        schedule_sse_hybrid_tick_flush(code);
+        return;
+    }
+    flush_sse_hybrid_tick(code, state->pending_tick_source,
+                          state->pending_tick_rcv_time);
+}
+
+void StrategyBase::process_sse_hybrid_order(const LFL2OrderField* data,
+                                            short source,
+                                            long rcv_time) {
+    if (data == 0) return;
+    const std::string code = NormalizeInstrumentId(data->InstrumentID);
+    SseHybridRuntimeState* state = sse_hybrid_state_for(code);
+    if (state == 0) return;
+    const std::uint64_t now = SseMonotonicNowNs();
+    if (state->pending_tick_valid && now > state->pending_tick_receive_ns + 100000ULL) {
+        flush_sse_hybrid_tick(code, source, rcv_time);
+    }
+    sse_live::TickEvent event;
+    if (!make_sse_tick_event(*data, source, now, &event)) {
+        ++mSseHybridRejectCount;
+        return;
+    }
+    const sse_tick::ApplyResult result = state->order_book.apply(event);
+    if (!result.accepted || !result.sequence_healthy) {
+        ++mSseHybridRejectCount;
+        return;
+    }
+    state->pending_tick = event;
+    state->pending_tick_valid = true;
+    state->pending_tick_receive_ns = now;
+    state->pending_tick_source = source;
+    state->pending_tick_rcv_time = rcv_time;
+    state->last_tick_receive_ns = now;
+    schedule_sse_hybrid_tick_flush(code);
+}
+
+void StrategyBase::process_sse_hybrid_trade(const LFL2TradeField* data,
+                                            short source,
+                                            long rcv_time) {
+    if (data == 0) return;
+    const std::string code = NormalizeInstrumentId(data->InstrumentID);
+    SseHybridRuntimeState* state = sse_hybrid_state_for(code);
+    if (state == 0) return;
+    const std::uint64_t now = SseMonotonicNowNs();
+    if (state->pending_tick_valid && now > state->pending_tick_receive_ns + 100000ULL) {
+        flush_sse_hybrid_tick(code, source, rcv_time);
+    }
+    sse_live::TickEvent event;
+    if (!make_sse_tick_event(*data, source, now, &event)) {
+        ++mSseHybridRejectCount;
+        return;
+    }
+    const sse_tick::ApplyResult result = state->order_book.apply(event);
+    if (!result.accepted || !result.sequence_healthy) {
+        ++mSseHybridRejectCount;
+        return;
+    }
+    state->pending_tick = event;
+    state->pending_tick_valid = true;
+    state->pending_tick_receive_ns = now;
+    state->pending_tick_source = source;
+    state->pending_tick_rcv_time = rcv_time;
+    state->last_tick_receive_ns = now;
+    schedule_sse_hybrid_tick_flush(code);
+}
+
+void StrategyBase::process_sse_hybrid_snapshot(const LFMarketDataField* data,
+                                               short source,
+                                               long rcv_time) {
+    if (data == 0 || source != mSseHybridSnapshotSource) return;
+    const std::string code = NormalizeInstrumentId(data->InstrumentID);
+    SseHybridRuntimeState* state = sse_hybrid_state_for(code);
+    if (state == 0) return;
+    sse_live::Snapshot snapshot = {};
+    snapshot.security_id = code;
+    snapshot.channel_no = 0;
+    snapshot.time_of_day_micros = SnapshotExchangeTimeMs(*data) * 1000ULL;
+    snapshot.last_price = data->LastPrice;
+    snapshot.pre_close_price = data->PreClosePrice;
+    snapshot.open_price = data->OpenPrice;
+    snapshot.high_price = data->HighestPrice;
+    snapshot.low_price = data->LowestPrice;
+    snapshot.volume = data->Volume;
+    snapshot.turnover = data->Turnover;
+    for (std::size_t level = 0; level < 5U; ++level) {
+        snapshot.bid_prices[level] = data->aBidPrice[level];
+        snapshot.bid_volumes[level] = data->aBidVolume[level];
+        snapshot.ask_prices[level] = data->aAskPrice[level];
+        snapshot.ask_volumes[level] = data->aAskVolume[level];
+    }
+    if (!sse_snapshot36::valid(snapshot)) return;
+    if (state->has_previous_snapshot &&
+        snapshot.time_of_day_micros <= state->previous_snapshot.time_of_day_micros) return;
+    const sse_live::Snapshot previous = state->has_previous_snapshot
+        ? state->previous_snapshot : snapshot;
+    state->previous_snapshot = snapshot;
+    state->has_previous_snapshot = true;
+    if (!state->has_previous_snapshot || previous.time_of_day_micros == snapshot.time_of_day_micros)
+        return;
+    const std::vector<float> factors = sse_snapshot36::build(previous, snapshot);
+    std::vector<float> enhanced(factors);
+    if (state->auction59_factors.size() == 59U) {
+        enhanced.insert(enhanced.end(), state->auction59_factors.begin(),
+                        state->auction59_factors.end());
+    } else {
+        enhanced.insert(enhanced.end(), 59U,
+                        std::numeric_limits<float>::quiet_NaN());
+    }
+    sse_hybrid_model::Prediction output;
+    std::string error;
+    if (!mSseHybridModel.on_snapshot(factors, enhanced, "sse",
+                                     snapshot.time_of_day_micros,
+                                     &state->model_state, &output, &error)) {
+        ++mSseHybridRejectCount;
+        return;
+    }
+    MSMarketData& view = state->signal_view->ms_market_data;
+    view = MSMarketData();
+    view.ms_market_data[InstrumentIDIndex] = std::strtod(code.c_str(), 0);
+    view.ms_market_data[MarketTimeIndex] = MixMarketTimeValue(
+        static_cast<std::int64_t>(snapshot.time_of_day_micros));
+    view.ms_market_data[LastPriceIndex] = snapshot.last_price;
+    view.ms_market_data[MidPriceIndex] =
+        (snapshot.bid_prices[0] + snapshot.ask_prices[0]) * 0.5;
+    view.ms_market_data[VolumeIndex] = snapshot.volume;
+    view.ms_market_data[TurnoverIndex] = snapshot.turnover;
+    for (std::size_t level = 0; level < 5U; ++level) {
+        view.ms_market_data[BidPrice1Index + level] = snapshot.bid_prices[level];
+        view.ms_market_data[AskPrice1Index + level] = snapshot.ask_prices[level];
+        view.ms_market_data[BidVolume1Index + level] = snapshot.bid_volumes[level];
+        view.ms_market_data[AskVolume1Index + level] = snapshot.ask_volumes[level];
+    }
+    ++mSseHybridSnapshotPredictionCount;
+    if (output.selected && can_dispatch_trading_signal()) {
+        std::unordered_map<std::string, ZStrategy*>::iterator strategy_it =
+            mZStrategyMap.find(code);
+        if (strategy_it != mZStrategyMap.end() && strategy_it->second != 0) {
+            strategy_it->second->on_signal(state->signal_view.get(),
+                output.selected_pred, source, rcv_time);
+        }
+    }
+    if (mSseHybridSnapshotPredictionCount <= 3U ||
+        mSseHybridSnapshotPredictionCount % 1000U == 0U) {
+        KF_LOG_INFO(logger, "[SSEHybrid][Snapshot] instrument=" << code
+            << " prediction=" << output.snapshot_pred
+            << " selected=" << output.selected
+            << " exchange_time_us=" << snapshot.time_of_day_micros);
+    }
 }
 
 bool StrategyBase::can_dispatch_trading_signal() const {
@@ -2624,6 +3083,10 @@ void StrategyBase::process_l2_order_event(const LFL2OrderField* data,
         return;
     }
     const std::string code = NormalizeInstrumentId(data->InstrumentID);
+    if (mSseHybridEnabled && mMarket == "SH") {
+        process_sse_hybrid_order(data, source, rcv_time);
+        return;
+    }
     if (using_hp_mode()) {
         if (mMix153060Enabled) {
             process_mix153060_order(code, data, source, rcv_time);
@@ -2681,6 +3144,10 @@ void StrategyBase::process_l2_trade_event(const LFL2TradeField* data,
         return;
     }
     const std::string code = NormalizeInstrumentId(data->InstrumentID);
+    if (mSseHybridEnabled && mMarket == "SH") {
+        process_sse_hybrid_trade(data, source, rcv_time);
+        return;
+    }
     if (using_hp_mode()) {
         if (mMix153060Enabled) {
             process_mix153060_trade(code, data, source, rcv_time);
@@ -2920,6 +3387,10 @@ void StrategyBase::update_info(const char* InstrumentID, short source, long rcv_
 }
 
 void StrategyBase::on_market_data(const struct LFMarketDataField *mds, short source, long rcv_time) {
+    if (mSseHybridEnabled && mMarket == "SH") {
+        process_sse_hybrid_snapshot(mds, source, rcv_time);
+        return;
+    }
     if (!mSnapshotLegacy15Enabled || mds == 0 ||
         source != mSnapshotLegacy15Source) {
         return;

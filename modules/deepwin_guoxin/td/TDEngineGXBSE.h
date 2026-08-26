@@ -54,6 +54,7 @@ struct AccountUnitGXBSE
     std::string branch_id;
     std::string account_id;
     std::string password;
+    std::string login_password;
 
     int market_id = T0_TD_DEFAULT_MARKET_ID;
     int business_type = 1;

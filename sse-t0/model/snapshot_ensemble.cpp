@@ -8,7 +8,7 @@ namespace {
 const std::uint64_t kOpen = 34200000000ULL;   // 09:30:00.000000
 const std::uint64_t k0931 = 34260000000ULL;  // 09:31:00.000000
 const std::uint64_t k0934 = 34440000000ULL;  // 09:34:00.000000
-const std::uint64_t kClose = 34500000000ULL; // 09:35:00.000000
+const std::uint64_t kClose = 34860000000ULL; // 09:40:00.000000 generation close
 
 bool finite(float value) { return std::isfinite(value); }
 
@@ -71,7 +71,7 @@ bool Ensemble::predict(const std::vector<float>& snapshot36,
     }
     float baseline_weight = 0.0f, auction59_weight = 0.0f;
     if (!route(time_of_day_micros, &baseline_weight, &auction59_weight)) {
-        if (error) *error = "SSE opening ensemble time outside [09:30,09:35)";
+        if (error) *error = "SSE opening ensemble time outside [09:30,09:40)";
         return false;
     }
 

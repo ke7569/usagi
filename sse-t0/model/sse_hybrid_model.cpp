@@ -87,8 +87,12 @@ bool Model::on_snapshot(const std::vector<float>& snapshot36,
                         Prediction* output,
                         std::string* error) const {
     if (error) error->clear();
+    // Keep generating Snapshot predictions through 09:40 for overlap and
+    // diagnostics. Only [09:30,09:35) is selected for trading.
+    const std::uint64_t kSnapshotGenerationCloseMicros = 34860000000ULL;
     if (!loaded_ || exchange != "sse" || state == 0 || output == 0 ||
-        selected_source(exchange, time_of_day_micros) != kSnapshotSource) {
+        time_of_day_micros < kSseOpenMicros ||
+        time_of_day_micros >= kSnapshotGenerationCloseMicros) {
         if (error) *error = "SSE Snapshot row is outside the active opening window";
         return false;
     }
@@ -103,9 +107,11 @@ bool Model::on_snapshot(const std::vector<float>& snapshot36,
     }
     output->snapshot_generated = true;
     output->snapshot_pred = snapshot_prediction.ensemble_pred;
-    output->selected = true;
-    output->selected_source = kSnapshotSource;
-    output->selected_pred = snapshot_prediction.ensemble_pred;
+    if (selected_source(exchange, time_of_day_micros) == kSnapshotSource) {
+        output->selected = true;
+        output->selected_source = kSnapshotSource;
+        output->selected_pred = snapshot_prediction.ensemble_pred;
+    }
     return true;
 }
 

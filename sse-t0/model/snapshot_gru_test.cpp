@@ -90,7 +90,11 @@ int main(int argc, char** argv) {
     assert(Ensemble::route(34439999999ULL, &wb, &wa) && wb == 0.50f && wa == 0.50f);
     assert(Ensemble::route(34440000000ULL, &wb, &wa) && wb == 0.75f && wa == 0.25f);
     assert(Ensemble::route(34499999999ULL, &wb, &wa) && wb == 0.75f && wa == 0.25f);
-    assert(!Ensemble::route(34500000000ULL, &wb, &wa));
+    // Snapshot predictions continue through 09:40 for diagnostics while the
+    // hybrid arbiter switches selected trading output to tick at 09:35.
+    assert(Ensemble::route(34500000000ULL, &wb, &wa) && wb == 0.75f && wa == 0.25f);
+    assert(Ensemble::route(34859999999ULL, &wb, &wa) && wb == 0.75f && wa == 0.25f);
+    assert(!Ensemble::route(34860000000ULL, &wb, &wa));
 
     const std::string prefix = std::string("/tmp/sse_snapshot_gru_test_") +
                                std::to_string(static_cast<long long>(getpid()));
@@ -122,7 +126,9 @@ int main(int argc, char** argv) {
     enhanced[80] = 0.0f;
     assert(!ensemble.predict(snapshot, enhanced, "SZE", 34200000001ULL,
                              &state, &prediction, &error));
-    assert(!ensemble.predict(snapshot, enhanced, "sse", 34500000000ULL,
+    assert(ensemble.predict(snapshot, enhanced, "sse", 34500000000ULL,
+                            &state, &prediction, &error));
+    assert(!ensemble.predict(snapshot, enhanced, "sse", 34860000000ULL,
                              &state, &prediction, &error));
 
     // Optional artifact smoke: pass baseline.bin baseline.json auction.bin

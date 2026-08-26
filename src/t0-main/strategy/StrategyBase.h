@@ -21,6 +21,12 @@
 #include "../sz_hp_realtime_state.h"
 #include "snapshot_legacy15_factors.h"
 #include "snapshot_legacy15_model.h"
+#include "../../../sse-t0/market_data/sse_primary_decoder.h"
+#include "../../../sse-t0/market_data/sse_tick_factors.h"
+#include "../../../sse-t0/market_data/sse_tick_order_book.h"
+#include "../../../sse-t0/model/auction59_sidecar.h"
+#include "../../../sse-t0/model/snapshot36.h"
+#include "../../../sse-t0/model/sse_hybrid_model.h"
 #include <unordered_set>
 #include <array>
 #include <atomic>
@@ -54,6 +60,28 @@ struct ShSzFullOrderBookSampleState {
     bool has_sample = false;
     int last_mid_price = 0;
     uint32_t last_sample_time_ms = 0;
+};
+
+// SSE owns a separate order book/factor state from the legacy SsePredictor.
+// The two model families also carry independent recurrent states; no state is
+// shared with Snapshot or Shenzhen code paths.
+struct SseHybridRuntimeState {
+    explicit SseHybridRuntimeState(const std::string& code);
+    sse_hybrid_model::State model_state;
+    sse_tick::OrderBook order_book;
+    sse_tick::FactorState factor_state;
+    sse_live::Snapshot previous_snapshot;
+    bool has_previous_snapshot;
+    std::vector<float> auction59_factors;
+    std::unique_ptr<MSMarketDataField> signal_view;
+    sse_live::TickEvent pending_tick;
+    bool pending_tick_valid;
+    bool pending_flush_scheduled;
+    std::uint64_t pending_tick_receive_ns;
+    short pending_tick_source;
+    long pending_tick_rcv_time;
+    std::uint64_t last_tick_receive_ns;
+    std::uint64_t tick_sample_count;
 };
 
 
@@ -223,6 +251,41 @@ private:
         mSnapshotLegacy15SignalViewMap;
     std::uint64_t mSnapshotLegacy15PredictionCount = 0;
     std::uint64_t mSnapshotLegacy15RejectCount = 0;
+
+    bool mSseHybridEnabled = false;
+    short mSseHybridSnapshotSource = 89;
+    sse_hybrid_model::Model mSseHybridModel;
+    sse_auction59::FactorMap mSseAuction59Factors;
+    std::unordered_map<std::string, std::unique_ptr<SseHybridRuntimeState> >
+        mSseHybridStateMap;
+    std::uint64_t mSseHybridSnapshotPredictionCount = 0;
+    std::uint64_t mSseHybridTickPredictionCount = 0;
+    std::uint64_t mSseHybridRejectCount = 0;
+
+    bool configure_sse_hybrid(const json& config);
+    SseHybridRuntimeState* sse_hybrid_state_for(const std::string& code);
+    bool make_sse_tick_event(const LFL2OrderField& data,
+                             short source,
+                             std::uint64_t receive_ns,
+                             sse_live::TickEvent* event) const;
+    bool make_sse_tick_event(const LFL2TradeField& data,
+                             short source,
+                             std::uint64_t receive_ns,
+                             sse_live::TickEvent* event) const;
+    void process_sse_hybrid_order(const LFL2OrderField* data,
+                                  short source,
+                                  long rcv_time);
+    void process_sse_hybrid_trade(const LFL2TradeField* data,
+                                  short source,
+                                  long rcv_time);
+    void flush_sse_hybrid_tick(const std::string& code,
+                               short source,
+                               long rcv_time);
+    void schedule_sse_hybrid_tick_flush(const std::string& code);
+    void flush_sse_hybrid_tick_if_quiet(const std::string& code);
+    void process_sse_hybrid_snapshot(const LFMarketDataField* data,
+                                     short source,
+                                     long rcv_time);
 
 #ifdef T0_SZE_STRATEGY_ONLY
     struct SzeRecoveryConsumerConfig {

@@ -69,7 +69,19 @@ set(SSE_COMMON_SOURCES ${SZE_COMMON_SOURCES})
 list(REMOVE_ITEM SSE_COMMON_SOURCES ${T0}/deepwin_strategy/sze_get_obj.cpp)
 list(APPEND SSE_COMMON_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/strategy/sse_config_guard.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/strategy/sse_get_obj.cpp)
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/strategy/sse_get_obj.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/market_data/sse_primary_decoder.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/market_data/sse_tick_order_book.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/market_data/sse_tick_factors.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/market_data/sse_tick_static_metadata.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/model/snapshot36.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/model/auction59_sidecar.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/model/auction_static_metadata.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/model/auction59_engine.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/model/sse_model_runtime.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/model/snapshot_gru_runtime.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/model/snapshot_ensemble.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/model/sse_hybrid_model.cpp)
 
 set(DEEPWIN_LIBS
   ${WC_LIB}/libwingchunstrategy.so
@@ -93,7 +105,7 @@ set(DEEPWIN_LIBS
 add_library(t0_strategy_sze SHARED ${SZE_COMMON_SOURCES})
 target_compile_definitions(t0_strategy_sze PRIVATE T0_USE_DEEPWIN T0_SZE_STRATEGY_ONLY)
 target_include_directories(t0_strategy_sze PRIVATE
-  ${T0} ${T0}/strategy ${T0}/predictor ${SZE_MD}
+  ${T0} ${T0}/strategy ${T0}/predictor ${T0}/cpp_model/eigen3 ${SZE_MD}
   ${T0}/cpp_model
   ${CMAKE_CURRENT_SOURCE_DIR}/reference/snapshot_legacy15
   ${DEEPWIN_INCLUDE} ${DEEPWIN_INCLUDE}/longfist ${BOOST_INCLUDE} ${PYTHON_INCLUDE})
@@ -106,7 +118,7 @@ set_source_files_properties(${T0}/predictor/mix153060_runtime.cpp
 
 add_library(t0_strategy_sse SHARED ${SSE_COMMON_SOURCES})
 target_compile_definitions(t0_strategy_sse PRIVATE T0_USE_DEEPWIN)
-target_include_directories(t0_strategy_sse PRIVATE ${T0} ${T0}/strategy ${T0}/predictor ${SZE_MD} ${T0}/cpp_model ${CMAKE_CURRENT_SOURCE_DIR}/reference/snapshot_legacy15 ${DEEPWIN_INCLUDE} ${DEEPWIN_INCLUDE}/longfist ${BOOST_INCLUDE} ${PYTHON_INCLUDE})
+target_include_directories(t0_strategy_sse PRIVATE ${T0} ${T0}/strategy ${T0}/predictor ${T0}/cpp_model ${T0}/cpp_model/eigen3 ${SZE_MD} ${CMAKE_CURRENT_SOURCE_DIR}/reference/snapshot_legacy15 ${DEEPWIN_INCLUDE} ${DEEPWIN_INCLUDE}/longfist ${BOOST_INCLUDE} ${PYTHON_INCLUDE})
 target_link_libraries(t0_strategy_sse PRIVATE ${DEEPWIN_LIBS})
 set_target_properties(t0_strategy_sse PROPERTIES OUTPUT_NAME t0_strategy_sse BUILD_RPATH "${WC_LIB};${YJJ_LIB};${TPWC_LIB};${BOOST_LIB}")
 

@@ -41,6 +41,15 @@ bool require_true(const nlohmann::json& object, const char* key,
     return true;
 }
 
+bool require_boolean(const nlohmann::json& object, const char* key,
+                     std::string* error) {
+    nlohmann::json::const_iterator item = object.find(key);
+    if (item == object.end() || !item->is_boolean()) {
+        return reject(std::string("SSE config requires boolean ") + key, error);
+    }
+    return true;
+}
+
 bool has_live_td(const nlohmann::json& config) {
     nlohmann::json::const_iterator td = config.find("td_source_index");
     return td != config.end() && td->is_array() && !td->empty();
@@ -112,7 +121,16 @@ bool validate_config(const nlohmann::json& config, std::string* error) {
     if (live_td) {
         if (!require_string(config, "runtime_mode", "live", error) ||
             !require_true(config, "trading_enabled", error) ||
-            !require_false(config, "production_approval", error)) return false;
+            !require_boolean(config, "production_approval", error)) return false;
+        // A live TD config may be staged with production_approval=false.  The
+        // strategy enforces this as a runtime hard gate; allowing both values
+        // lets deployment be prepared before explicit order authorization.
+        nlohmann::json::const_iterator test = config.find("sse_test_order");
+        if (test != config.end() && test->is_object() &&
+            test->value("enabled", false) &&
+            !config["production_approval"].get<bool>()) {
+            return reject("sse_test_order.enabled requires production_approval=true", error);
+        }
     } else {
         if (!prediction_only->get<bool>())
             return reject("SSE prediction-only config requires prediction_only=true", error);

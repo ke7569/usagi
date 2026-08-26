@@ -109,22 +109,45 @@ int main(int argc, char** argv) {
         std::cerr << "SSE TD source accepted in prediction-only config: " << error << std::endl;
         return 9;
     }
+    config = valid_config();
+    config["runtime_mode"] = "live";
+    config["prediction_only"] = false;
+    config["trading_enabled"] = true;
+    config["td_source_index"].push_back(190);
+    config["sse_order_routing"] = {
+        {"enabled", true}, {"mode", "live"}, {"td_source", 190}
+    };
+    if (!sse_strategy_library::validate_config(config, &error)) {
+        std::cerr << "staged SSE live config rejected: " << error << std::endl;
+        return 10;
+    }
+    config["sse_test_order"] = {{"enabled", true}};
+    if (sse_strategy_library::validate_config(config, &error) ||
+        error.find("production_approval") == std::string::npos) {
+        std::cerr << "unapproved SSE test order accepted: " << error << std::endl;
+        return 11;
+    }
+    config["production_approval"] = true;
+    if (!sse_strategy_library::validate_config(config, &error)) {
+        std::cerr << "approved SSE live config rejected: " << error << std::endl;
+        return 12;
+    }
     if (argc == 2) {
         std::ifstream input(argv[1]);
         nlohmann::json generated;
         if (!input.is_open()) {
             std::cerr << "cannot open generated SSE config: " << argv[1] << std::endl;
-            return 10;
+            return 13;
         }
         try {
             input >> generated;
         } catch (...) {
             std::cerr << "cannot parse generated SSE config" << std::endl;
-            return 11;
+            return 14;
         }
         if (!sse_strategy_library::validate_config(generated, &error)) {
             std::cerr << "generated SSE config rejected: " << error << std::endl;
-            return 12;
+            return 15;
         }
     }
     std::cout << "sse_config_guard_test: PASS" << std::endl;
