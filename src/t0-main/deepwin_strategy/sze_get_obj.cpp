@@ -39,7 +39,7 @@ EXPORT_FLAG const char* sze_strategy_build_id();
 #endif
 
 const char* sze_strategy_build_id() {
-    return "sze-strategy-20260811-turnover-arbiter-v2";
+    return "sze-strategy-20260904-gru-gate-fix-v1";
 }
 
 IWCStrategy* get_obj(kungfu::yijinjing::IControlCenter* cc, const std::string& cfg_name) {

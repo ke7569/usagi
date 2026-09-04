@@ -148,7 +148,6 @@ int main() {
         {"enabled", true},
         {"mode", "live"},
         {"input_mode", "recovery_handoff"},
-        {"max_order_volume", 200},
         {"max_position", 200},
     };
     error = "stale";
@@ -156,6 +155,11 @@ int main() {
         !error.empty()) {
         std::cerr << "recovery trading config was rejected: " << error << std::endl;
         return 28;
+    }
+    nlohmann::json recovery_without_buy_limit = realtime_recovery;
+    recovery_without_buy_limit["sze_order_routing"].erase("max_position");
+    if (!expect_rejected(recovery_without_buy_limit, "positive integer max_position")) {
+        return 281;
     }
     nlohmann::json invalid_position_retry = realtime_recovery;
     invalid_position_retry["sze_order_routing"]["position_query_retry_ms"] = 999;

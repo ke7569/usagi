@@ -102,7 +102,6 @@
       "enabled": true,
       "mode": "live",
       "input_mode": "recovery_handoff",
-      "max_order_volume": 200,
       "max_position": 200
     }
   }

@@ -1629,6 +1629,15 @@ bool Runtime::Impl::maybe_emit(const Cut& cut,
     if (session_id(cut.exchange_time_us) == 0) {
         return false;
     }
+    // The first post-open event establishes the active-session window. It is
+    // a boundary marker, not a model sample; otherwise live replay advances
+    // the GRU once before the formal v0.4 stream begins.
+    if (time_of_day(window_start.exchange_time_us) == kMorningOpenUs &&
+        cut.exchange_time_us > window_start.exchange_time_us) {
+        window_start = cut;
+        flow.clear();
+        return false;
+    }
     if (cut.cut_index <= window_start.cut_index ||
         cut.exchange_time_us == window_start.exchange_time_us) {
         return false;

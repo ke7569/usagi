@@ -101,6 +101,8 @@ private:
     uint64_t mMix153060AdapterRejectCount = 0;
     uint64_t mMix153060BookRejectCount = 0;
     uint64_t mMix153060PredictionRejectCount = 0;
+    uint64_t mCurrentMarketReceiveMonoNs = 0;
+    StrategyLatencyTrace mCurrentLatencyTrace;
     bool mHpRealtimeModelReady = false;
     bool mFullOrderBookTraceEnabled = false;
     bool mFullOrderBookFactorTraceOnly = false;
@@ -254,6 +256,7 @@ private:
         std::uint32_t trading_day;
         std::uint64_t exchange_time_us;
         double turnover;
+        StrategyLatencyTrace latency_trace;
         std::uint64_t queue_sequence;
     };
 
@@ -298,7 +301,8 @@ private:
                                           long receive_time,
                                           sze_prediction::Source prediction_source,
                                           std::uint32_t trading_day,
-                                          std::uint64_t exchange_time_us);
+                                          std::uint64_t exchange_time_us,
+                                          const StrategyLatencyTrace& latency_trace);
 
     SzeRecoveryConsumerConfig mSzeRecoveryConsumerConfig;
     static const std::uint64_t kSzeTradingSignalCapacity = 1024U;

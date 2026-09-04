@@ -82,6 +82,19 @@ struct StrategyContext {
     uint64_t quote_sell_id;
     uint64_t cancel_buy_id;
     uint64_t cancel_sell_id;
+    uint64_t market_receive_realtime_ns = 0;
+};
+
+struct StrategyLatencyTrace {
+    uint64_t market_receive_mono_ns = 0;
+    uint64_t market_receive_realtime_ns = 0;
+    uint64_t consumer_begin_mono_ns = 0;
+    uint64_t book_done_mono_ns = 0;
+    uint64_t sample_done_mono_ns = 0;
+    uint64_t factor_done_mono_ns = 0;
+    uint64_t model_done_mono_ns = 0;
+    uint64_t prediction_done_mono_ns = 0;
+    uint64_t signal_decision_mono_ns = 0;
 };
 
 struct StrategyContextBse {

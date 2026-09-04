@@ -64,7 +64,11 @@ struct AccountUnitGXBSE
     bool enable_latency = false;
     bool bypass_account_queries = false;
     bool enable_position_sync = true;
+#ifdef SSE_TD_BUILD
+    bool startup_cancel_all_orders = false;
+#else
     bool startup_cancel_all_orders = true;
+#endif
     int position_sync_interval_sec = 5;
     int log_level = 4;
     std::string api_log_dir;
@@ -215,6 +219,7 @@ private:
         char instrument[32] = {};
         uint64_t func_enter_ns = 0;
         uint64_t send_time_ns = 0;
+        uint64_t send_realtime_ns = 0;
         uint64_t api_return_time_ns = 0;
         uint64_t log_begin_ns = 0;
         uint64_t enqueue_begin_ns = 0;

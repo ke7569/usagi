@@ -406,6 +406,27 @@ def validate_credentials(system):
         raise ConfigError("TD credentials must have mode 0600: {}".format(path))
 
 
+def rewrite_runtime_paths(root, old_prefix, new_prefix):
+    """Fix absolute references after an atomic temporary-directory rename."""
+    for current, _, names in os.walk(root):
+        for name in names:
+            if not name.endswith((".json", ".conf")):
+                continue
+            path = os.path.join(current, name)
+            value = load_json(path)
+
+            def replace(value):
+                if isinstance(value, str):
+                    return value.replace(old_prefix, new_prefix)
+                if isinstance(value, list):
+                    return [replace(item) for item in value]
+                if isinstance(value, dict):
+                    return {key: replace(item) for key, item in value.items()}
+                return value
+
+            write_json(path, replace(value))
+
+
 def replace_component(component_dir, builder):
     parent = os.path.dirname(component_dir)
     if not os.path.isdir(parent):
@@ -420,6 +441,7 @@ def replace_component(component_dir, builder):
         if os.path.isdir(component_dir):
             os.rename(component_dir, old)
         os.rename(temporary, component_dir)
+        rewrite_runtime_paths(component_dir, temporary, component_dir)
         if os.path.isdir(old):
             shutil.rmtree(old)
     except Exception:

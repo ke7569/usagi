@@ -84,7 +84,6 @@ ZStrategy::ZStrategy(const std::string &InstrumentID,
             virtual_routing_ = routing["mode"].get<std::string>() == "virtual";
         }
         recovery_routing_ = routing.value("input_mode", std::string()) == "recovery_handoff";
-        max_order_volume_ = routing.value("max_order_volume", 0);
         max_position_ = routing.value("max_position", 0);
     }
     if (config.find("sze_startup_warmup_signals") != config.end() &&
@@ -276,15 +275,17 @@ int ZStrategy::insertOrder(RT_Order order, int cancel_delay_ms) {
         return -1;
     }
     if (recovery_routing_) {
-        // T0 permits intraday buy/sell rotation. max_position is a per-order
-        // safety cap; net-position eligibility is checked before insertion.
-        if (max_order_volume_ <= 0 || order.Volume > max_order_volume_ ||
-            (max_position_ > 0 && order.Volume > max_position_)) {
+        // T0 sells may close both the static position and shares bought
+        // earlier in the session. Buy size is additionally capped by the
+        // configured position limit; sell size is governed by shortable.
+        if (order.Volume <= 0 ||
+            (order.Direction == BUY &&
+             (max_position_ <= 0 || order.Volume > max_position_))) {
             KF_LOG_ERROR(logger, "[SZEOrderBlocked] InstrumentID=" << mTradeInstrument
-                << ", reason=position_or_volume_limit"
+                << ", reason=invalid_volume_or_buy_position_limit"
+                << ", side=" << (order.Direction == BUY ? "Buy" : "Sell")
                 << ", volume=" << order.Volume
-                << ", max_order_volume=" << max_order_volume_
-                << ", max_position_per_order=" << max_position_);
+                << ", max_buy_position=" << max_position_);
             return -1;
         }
     }
@@ -394,17 +395,10 @@ void ZStrategy::setOffset() {
 
     g_params.global_bias_factor = global_bias_factor_base_line_;
 
-    if (market_time_minutes < 930) {
-        g_params.position_limit = 0.0;
-    } else if (market_time_minutes < 932) {
-        g_params.position_limit = 0.3 * g_params.position_limit_base_line;
-    } else if (market_time_minutes < 934) {
-        g_params.position_limit = 0.5 * g_params.position_limit_base_line;
-    } else if (market_time_minutes >= 1430) {
-        g_params.position_limit = 0.6 * g_params.position_limit_base_line;
-    } else {
-        g_params.position_limit = g_params.position_limit_base_line;
-    }
+    // Keep the full one-unit position limit throughout the trading day.
+    // Session/order gates remain responsible for preventing pre-open trading;
+    // this value must not shrink after 14:30 and create non-lot-sized caps.
+    g_params.position_limit = 1.0;
 }
 
 void ZStrategy::cancel_order(int request_id) {
@@ -473,6 +467,10 @@ double ZStrategy::getCurPosition() {
 
 void ZStrategy::setGlobalPredAdjFactor(double factor) {
     g_params.global_pred_adj_factor = factor;
+}
+
+void ZStrategy::set_latency_trace(const StrategyLatencyTrace& trace) {
+    latency_trace_ = trace;
 }
 
 void ZStrategy::calcTheo(double prediction) {
@@ -547,6 +545,15 @@ void ZStrategy::hitBuy() {
             << ", CumSell: " << context.cum_sell
             << ", shortable: " << getRemainingShortable()
             << ", RequestID: " << request_id
+            << ", latency_market_receive_mono_ns: " << latency_trace_.market_receive_mono_ns
+            << ", market_receive_realtime_ns: " << context.market_receive_realtime_ns
+            << ", latency_consumer_begin_mono_ns: " << latency_trace_.consumer_begin_mono_ns
+            << ", latency_book_done_mono_ns: " << latency_trace_.book_done_mono_ns
+            << ", latency_sample_done_mono_ns: " << latency_trace_.sample_done_mono_ns
+            << ", latency_factor_done_mono_ns: " << latency_trace_.factor_done_mono_ns
+            << ", latency_model_done_mono_ns: " << latency_trace_.model_done_mono_ns
+            << ", latency_prediction_done_mono_ns: " << latency_trace_.prediction_done_mono_ns
+            << ", latency_signal_decision_mono_ns: " << latency_trace_.signal_decision_mono_ns
             << ", HitBuyTheo: " << theo_.hit_buy_theo
             << ", vl_pos: " << context.vl_pos
             << ", vs_pos: " << context.vs_pos
@@ -597,6 +604,15 @@ void ZStrategy::hitSell() {
             << ", CumSell: " << context.cum_sell
             << ", shortable: " << getRemainingShortable()
             << ", RequestID: " << request_id
+            << ", latency_market_receive_mono_ns: " << latency_trace_.market_receive_mono_ns
+            << ", market_receive_realtime_ns: " << context.market_receive_realtime_ns
+            << ", latency_consumer_begin_mono_ns: " << latency_trace_.consumer_begin_mono_ns
+            << ", latency_book_done_mono_ns: " << latency_trace_.book_done_mono_ns
+            << ", latency_sample_done_mono_ns: " << latency_trace_.sample_done_mono_ns
+            << ", latency_factor_done_mono_ns: " << latency_trace_.factor_done_mono_ns
+            << ", latency_model_done_mono_ns: " << latency_trace_.model_done_mono_ns
+            << ", latency_prediction_done_mono_ns: " << latency_trace_.prediction_done_mono_ns
+            << ", latency_signal_decision_mono_ns: " << latency_trace_.signal_decision_mono_ns
             << ", HitSellTheo: " << theo_.hit_sell_theo
             << ", vl_pos: " << context.vl_pos
             << ", vs_pos: " << context.vs_pos
@@ -635,6 +651,8 @@ void ZStrategy::on_signal(const MSMarketDataField * market_data, double signal, 
         return;
     }
     last_ob_ptr = const_cast<MSMarketDataField*>(market_data);
+    context.market_receive_realtime_ns = rcv_time > 0
+        ? static_cast<uint64_t>(rcv_time) * 1000ULL : 0ULL;
     if (context.last_ob == nullptr) {
         context.last_ob = market_data;
         context.curr_ob = market_data;
@@ -665,6 +683,7 @@ void ZStrategy::on_signal(const MSMarketDataField * market_data, double signal, 
         maybe_send_test_order();
     }
     calcTheo(signal);
+    latency_trace_.signal_decision_mono_ns = util ? static_cast<uint64_t>(util->get_nano()) : 0ULL;
     handleT0();
     context.last_ob = market_data;
 }

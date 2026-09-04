@@ -149,13 +149,13 @@ bool validate_live_routing(const nlohmann::json& config, std::string* error) {
             return reject("recovery trading requires input_mode=recovery_handoff", error);
         }
         const char* required_limits[] = {
-            "max_order_volume", "max_position"
+            "max_position"
         };
         for (std::size_t i = 0; i < sizeof(required_limits) / sizeof(required_limits[0]); ++i) {
             nlohmann::json::const_iterator limit = routing->find(required_limits[i]);
             if (limit == routing->end() || !limit->is_number_integer() ||
                 limit->get<int>() <= 0) {
-                return reject("recovery trading requires positive integer order limits", error);
+                return reject("recovery trading requires a positive integer max_position", error);
             }
         }
     }

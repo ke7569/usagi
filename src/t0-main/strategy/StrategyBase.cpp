@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include <cstdio>
 #include <ctime>
+#include <time.h>
 
 #ifdef T0_SZE_STRATEGY_ONLY
 #include "SZEProtocol.h"
@@ -32,6 +33,15 @@
 #include <sched.h>
 #include <time.h>
 #endif
+
+static std::uint64_t StrategyMonotonicTimeNs() {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0U;
+    }
+    return static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ULL +
+           static_cast<std::uint64_t>(ts.tv_nsec);
+}
 
 
 namespace {
@@ -491,7 +501,7 @@ void StrategyBase::finalize_unresolved_startup_positions(const char* reason) {
     for (short src : mTdSources) {
         mPositionReady[src] = true;
     }
-    KF_LOG_INFO(logger, "[RiskInit][PositionCutoff] reason="
+    KF_LOG_INFO(logger, "[RiskInit][PositionFinalize] reason="
         << (reason == nullptr ? "unknown" : reason)
         << " cutoff_hhmmss=" << mSzePositionCutoffHhmmss
         << " defaulted=" << defaulted
@@ -1209,6 +1219,7 @@ bool StrategyBase::process_sze_recovery_event(
         mSzeRecoveryDecodeErrors.fetch_add(1U, std::memory_order_relaxed);
         return false;
     }
+    mCurrentMarketReceiveMonoNs = event.receive_mono_ns;
     LFL2OrderField order;
     LFL2TradeField trade;
     std::memset(&order, 0, sizeof(order));
@@ -1595,6 +1606,7 @@ bool StrategyBase::enqueue_sze_trading_signal(
     slot.trading_day = trading_day;
     slot.exchange_time_us = exchange_time_us;
     slot.turnover = market_data->Turnover;
+    slot.latency_trace = mCurrentLatencyTrace;
     slot.queue_sequence = head + 1U;
     head_counter.store(head + 1U, std::memory_order_release);
     return true;
@@ -1687,6 +1699,7 @@ void StrategyBase::dispatch_sze_prediction_candidate(const std::string& code) {
     }
     MSMarketDataField market_data = {MSMarketData()};
     market_data.ms_market_data.ms_market_data = chosen->market_data;
+    strategy_it->second->set_latency_trace(chosen->latency_trace);
     strategy_it->second->on_signal(
         &market_data, chosen->prediction, chosen->source,
         chosen->receive_time);
@@ -1719,7 +1732,8 @@ void StrategyBase::dispatch_or_queue_trading_signal(
     long receive_time,
     sze_prediction::Source prediction_source,
     std::uint32_t trading_day,
-    std::uint64_t exchange_time_us) {
+    std::uint64_t exchange_time_us,
+    const StrategyLatencyTrace& latency_trace) {
     const bool snapshot = prediction_source == sze_prediction::kSnapshot;
     if (!is_risk_data_ready() || mSzeRecoveryAnalysisMode ||
         !mSzeTradingQueueHealthy.load(std::memory_order_acquire) ||
@@ -1741,6 +1755,7 @@ void StrategyBase::dispatch_or_queue_trading_signal(
     std::unordered_map<std::string, ZStrategy*>::iterator strategy_it =
         mZStrategyMap.find(code);
     if (strategy_it != mZStrategyMap.end() && strategy_it->second != 0) {
+        strategy_it->second->set_latency_trace(latency_trace);
         strategy_it->second->on_signal(
             market_data, prediction, source, receive_time);
     }
@@ -1951,6 +1966,7 @@ void StrategyBase::process_mix153060_order(const std::string& code,
                                            const LFL2OrderField* data,
                                            short source,
                                            long rcv_time) {
+    const std::uint64_t consumer_begin_ns = StrategyMonotonicTimeNs();
     mix153060::Runtime* runtime = mix153060_runtime_for(code);
     std::unordered_map<std::string, InsParams>::const_iterator params_it =
         mInsParamsMap.find(code);
@@ -1981,6 +1997,10 @@ void StrategyBase::process_mix153060_order(const std::string& code,
                                 mMix153060Capture->detail_enabled_for(code);
     mix153060::EventTiming timing;
     runtime->on_order(event, &samples, capture_detail ? &timing : 0);
+    mCurrentLatencyTrace = StrategyLatencyTrace();
+    mCurrentLatencyTrace.market_receive_mono_ns = mCurrentMarketReceiveMonoNs;
+    mCurrentLatencyTrace.consumer_begin_mono_ns = consumer_begin_ns;
+    mCurrentLatencyTrace.book_done_mono_ns = StrategyMonotonicTimeNs();
 #ifdef T0_SZE_STRATEGY_ONLY
     update_sze_book_health(code, runtime);
 #endif
@@ -2014,6 +2034,7 @@ void StrategyBase::process_mix153060_order(const std::string& code,
                              << "; instrument suppressed");
         return;
     }
+    mCurrentLatencyTrace.sample_done_mono_ns = StrategyMonotonicTimeNs();
     consume_mix153060_samples(code, samples, source, rcv_time);
 }
 
@@ -2021,6 +2042,7 @@ void StrategyBase::process_mix153060_trade(const std::string& code,
                                            const LFL2TradeField* data,
                                            short source,
                                            long rcv_time) {
+    const std::uint64_t consumer_begin_ns = StrategyMonotonicTimeNs();
     mix153060::Runtime* runtime = mix153060_runtime_for(code);
     std::unordered_map<std::string, InsParams>::const_iterator params_it =
         mInsParamsMap.find(code);
@@ -2051,6 +2073,10 @@ void StrategyBase::process_mix153060_trade(const std::string& code,
                                 mMix153060Capture->detail_enabled_for(code);
     mix153060::EventTiming timing;
     runtime->on_trade(event, &samples, capture_detail ? &timing : 0);
+    mCurrentLatencyTrace = StrategyLatencyTrace();
+    mCurrentLatencyTrace.market_receive_mono_ns = mCurrentMarketReceiveMonoNs;
+    mCurrentLatencyTrace.consumer_begin_mono_ns = consumer_begin_ns;
+    mCurrentLatencyTrace.book_done_mono_ns = StrategyMonotonicTimeNs();
 #ifdef T0_SZE_STRATEGY_ONLY
     update_sze_book_health(code, runtime);
 #endif
@@ -2084,6 +2110,7 @@ void StrategyBase::process_mix153060_trade(const std::string& code,
                              << "; instrument suppressed");
         return;
     }
+    mCurrentLatencyTrace.sample_done_mono_ns = StrategyMonotonicTimeNs();
     consume_mix153060_samples(code, samples, source, rcv_time);
 }
 
@@ -2145,6 +2172,10 @@ void StrategyBase::consume_mix153060_samples(const std::string& code,
     for (std::size_t index = 0; index < samples.count; ++index) {
         const mix153060::Sample& sample = samples.values[index];
         float prediction = 0.0f;
+        StrategyLatencyTrace trace = mCurrentLatencyTrace;
+        trace.market_receive_realtime_ns = rcv_time > 0
+            ? static_cast<std::uint64_t>(rcv_time) * 1000ULL : 0ULL;
+        trace.factor_done_mono_ns = StrategyMonotonicTimeNs();
         const std::uint64_t model_begin = capture_detail ? sz_hp::latency_now_ns() : 0;
         if (!mMix153060Model.predict(sample.factors, &state_it->second, &prediction)) {
             ++mMix153060PredictionRejectCount;
@@ -2190,6 +2221,8 @@ void StrategyBase::consume_mix153060_samples(const std::string& code,
                 true);
 #endif
         }
+        trace.model_done_mono_ns = StrategyMonotonicTimeNs();
+        trace.prediction_done_mono_ns = trace.model_done_mono_ns;
         if (using_hp_shadow_mode()) {
             continue;
         }
@@ -2204,12 +2237,13 @@ void StrategyBase::consume_mix153060_samples(const std::string& code,
             code, view, prediction, source, rcv_time,
             sze_prediction::kFullOrderBook,
             mSzeRecoveryConsumerConfig.trading_day,
-            ExchangeTimeOfDayUs(sample.exchange_time_us));
+            ExchangeTimeOfDayUs(sample.exchange_time_us), trace);
 #else
         std::unordered_map<std::string, ZStrategy*>::iterator strategy_it =
             mZStrategyMap.find(code);
         if (can_dispatch_trading_signal() &&
             strategy_it != mZStrategyMap.end() && strategy_it->second != 0) {
+            strategy_it->second->set_latency_trace(trace);
             strategy_it->second->on_signal(view, prediction, source, rcv_time);
         }
 #endif
@@ -2614,6 +2648,7 @@ void StrategyBase::on_l2_order(const struct LFL2OrderField *data,
         return;
     }
 #endif
+    mCurrentMarketReceiveMonoNs = StrategyMonotonicTimeNs();
     process_l2_order_event(data, source, rcv_time);
 }
 
@@ -2671,6 +2706,7 @@ void StrategyBase::on_l2_trade(const struct LFL2TradeField *data,
         return;
     }
 #endif
+    mCurrentMarketReceiveMonoNs = StrategyMonotonicTimeNs();
     process_l2_trade_event(data, source, rcv_time);
 }
 
@@ -2895,6 +2931,12 @@ void StrategyBase::on_rtn_pos_option(const LFRspPositionField* data, bool isLast
         mEarlyPositionRid[source] = request_id;
         return;
     }
+    // The broker position query is a complete snapshot when isLast is set.
+    // Instruments with no returned row therefore have a valid zero position;
+    // they must not keep the entire trading route gated.
+    if (mSzeLiveRoutingEnabled) {
+        finalize_unresolved_startup_positions("position_query_complete");
+    }
     const bool all_positions_resolved =
         mSzeLivePositionReady.size() == mInstrumentVec.size();
     mPositionReady[source] = !mSzeLiveRoutingEnabled || all_positions_resolved;
@@ -3001,7 +3043,7 @@ void StrategyBase::on_market_data(const struct LFMarketDataField *mds, short sou
     dispatch_or_queue_trading_signal(
         code, view_it->second.get(), prediction, source, rcv_time,
         sze_prediction::kSnapshot, ParseTradingDay(current.trading_day),
-        current.exchange_time_ms * 1000U);
+        current.exchange_time_ms * 1000U, mCurrentLatencyTrace);
 #else
     std::unordered_map<std::string, ZStrategy*>::iterator strategy_it =
         mZStrategyMap.find(code);
@@ -3023,6 +3065,7 @@ void StrategyBase::on_market_data_level2(const struct LFL2MarketDataField *mds, 
     if (mds == 0 || !using_hp_mode()) {
         return;
     }
+    mCurrentMarketReceiveMonoNs = StrategyMonotonicTimeNs();
     const std::string code = NormalizeInstrumentId(mds->InstrumentID);
     if (mMix153060Enabled) {
         flush_mix153060_pending(code, source, rcv_time);

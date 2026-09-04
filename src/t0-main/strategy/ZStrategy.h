@@ -112,6 +112,7 @@ public:
     void cancel_order(int request_id);
     void delay_cancel_order(int request_id,int delay_ms);
     void sync_startup_position(int32_t total_position, int32_t available_position);
+    void set_latency_trace(const StrategyLatencyTrace& trace);
 
 
 
@@ -121,6 +122,7 @@ protected:
     InstrumentParams i_params;
     StrategyContext context;
     double current_prediction_;  // 保存当前的prediction值，用于日志输出
+    StrategyLatencyTrace latency_trace_;
 
 private:
     struct TestOrderConfig {
@@ -141,7 +143,6 @@ private:
     bool virtual_routing_ = false;
     bool recovery_routing_ = false;
     int startup_warmup_signal_count_ = 50;
-    int max_order_volume_ = 0;
     int max_position_ = 0;
     TestOrderConfig test_order_;
     bool test_order_sent_ = false;

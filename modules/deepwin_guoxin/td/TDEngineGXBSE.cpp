@@ -140,6 +140,12 @@ uint64_t now_ns()
         std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+uint64_t realtime_ns()
+{
+    const auto now = std::chrono::system_clock::now().time_since_epoch();
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+}
+
 const char* latency_name(const char* name)
 {
     return name != nullptr ? name : "unknown";
@@ -290,6 +296,7 @@ void TDEngineGXBSE::log_td_order_send_entry(const TdOrderSendLogEntry& entry)
          << " instrument=" << entry.instrument
          << " td_func_enter_ns=" << entry.func_enter_ns
          << " td_enter_ns=" << entry.send_time_ns
+         << " td_send_realtime_ns=" << entry.send_realtime_ns
          << " td_send_done_ns=" << entry.api_return_time_ns
          << " td_log_begin_ns=" << entry.log_begin_ns
          << " td_log_queue_delay_ns=" << log_queue_delay_ns
@@ -743,6 +750,7 @@ int TDEngineGXBSE::req_order_insert(const LFInputOrderField* data, int account_i
     route.offset_flag = data->OffsetFlag;
     route.direct_submit = false;
     route.send_time_ns = now_ns();
+    const uint64_t route_send_realtime_ns = realtime_ns();
     const uint64_t route_init_done_ns = route.send_time_ns;
     store_request_route(atp_request_id, route);
     const uint64_t route_store_before_api_done_ns = now_ns();
@@ -773,6 +781,7 @@ int TDEngineGXBSE::req_order_insert(const LFInputOrderField* data, int account_i
     log_entry.send_time_ns = route.send_time_ns;
     log_entry.api_return_time_ns = api_return_time_ns;
     log_entry.log_begin_ns = log_begin_ns;
+    log_entry.send_realtime_ns = route_send_realtime_ns;
     log_entry.api_send_ns = (api_return_time_ns >= route.send_time_ns) ? api_return_time_ns - route.send_time_ns : 0;
     log_entry.func_to_msg_new_begin_ns = (msg_new_begin_ns >= func_enter_ns) ? msg_new_begin_ns - func_enter_ns : 0;
     log_entry.msg_new_ns = (msg_new_done_ns >= msg_new_begin_ns) ? msg_new_done_ns - msg_new_begin_ns : 0;
@@ -851,6 +860,7 @@ int TDEngineGXBSE::direct_cash_order(const GxbseDirectOrderRequest* request, Gxb
         route.offset_flag = request->offset_flag;
         route.direct_submit = true;
         route.send_time_ns = now_ns();
+        const uint64_t route_send_realtime_ns = realtime_ns();
         store_request_route(atp_request_id, route);
 
         ATPErrorCodeType ec = unit->api->ReqCashAuctionOrder(msg, atp_request_id);
@@ -867,6 +877,7 @@ int TDEngineGXBSE::direct_cash_order(const GxbseDirectOrderRequest* request, Gxb
         log_entry.send_time_ns = route.send_time_ns;
         log_entry.api_return_time_ns = api_return_time_ns;
         log_entry.log_begin_ns = api_return_time_ns;
+        log_entry.send_realtime_ns = route_send_realtime_ns;
         log_entry.api_send_ns = api_return_time_ns >= route.send_time_ns ? api_return_time_ns - route.send_time_ns : 0;
         log_entry.pre_log_total_ns = api_return_time_ns >= func_enter_ns ? api_return_time_ns - func_enter_ns : 0;
         log_entry.enqueue_begin_ns = now_ns();
@@ -931,6 +942,7 @@ int TDEngineGXBSE::direct_cash_order(const GxbseDirectOrderRequest* request, Gxb
     route.offset_flag = request->offset_flag;
     route.direct_submit = true;
     route.send_time_ns = now_ns();
+    const uint64_t route_send_realtime_ns = realtime_ns();
     const uint64_t route_init_done_ns = route.send_time_ns;
     store_request_route(atp_request_id, route);
     const uint64_t route_store_before_api_done_ns = now_ns();
@@ -968,6 +980,7 @@ int TDEngineGXBSE::direct_cash_order(const GxbseDirectOrderRequest* request, Gxb
     log_entry.send_time_ns = route.send_time_ns;
     log_entry.api_return_time_ns = api_return_time_ns;
     log_entry.log_begin_ns = log_begin_ns;
+    log_entry.send_realtime_ns = route_send_realtime_ns;
     log_entry.api_send_ns = api_return_time_ns >= route.send_time_ns ? api_return_time_ns - route.send_time_ns : 0;
     log_entry.func_to_msg_new_begin_ns = msg_new_begin_ns >= func_enter_ns ? msg_new_begin_ns - func_enter_ns : 0;
     log_entry.msg_new_ns = msg_new_done_ns >= msg_new_begin_ns ? msg_new_done_ns - msg_new_begin_ns : 0;
