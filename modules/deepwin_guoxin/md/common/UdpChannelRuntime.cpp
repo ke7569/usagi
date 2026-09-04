@@ -189,6 +189,8 @@ struct UdpChannelRuntime::Impl {
 UdpChannelRuntime::UdpChannelRuntime() : impl_(new Impl()) {}
 UdpChannelRuntime::~UdpChannelRuntime() { impl_->running.store(false); delete impl_; }
 
+void UdpChannelRuntime::stop() { impl_->running.store(false); }
+
 bool UdpChannelRuntime::run(const std::vector<ChannelSpec>& channels,
                             const DatagramCallback& callback,
                             long duration_ms,

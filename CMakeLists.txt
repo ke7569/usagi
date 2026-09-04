@@ -231,6 +231,35 @@ target_link_libraries(sze_md PRIVATE
 set_target_properties(sze_md PROPERTIES OUTPUT_NAME sze_md
   BUILD_RPATH "${WC_LIB};${YJJ_LIB};${TPWC_LIB};${BOOST_LIB}")
 
+# Shanghai SSE market-data plugin, loaded by source 89.
+add_library(sse_md SHARED
+  ${SZE_MD}/MDEngineSSE.cpp
+  ${SZE_MD}/common/UdpChannelRuntime.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/market_data/sse_primary_decoder.cpp)
+target_include_directories(sse_md PRIVATE
+  ${SZE_MD} ${SZE_MD}/common
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/market_data
+  ${DEEPWIN_INCLUDE} ${DEEPWIN_INCLUDE}/longfist
+  ${BOOST_INCLUDE} ${PYTHON_INCLUDE})
+target_link_libraries(sse_md PRIVATE
+  ${YJJ_LIB}/libjournal.so.1.1 ${YJJ_LIB}/libkflog.so
+  ${WC_LIB}/libwingchunmd.so ${TPWC_LIB}/libpython3.6m.so.1.0
+  ${TPWC_LIB}/liblog4cplus.so.0
+  ${BOOST_LIB}/libboost_locale.so.1.62.0
+  ${BOOST_LIB}/libboost_date_time.so.1.62.0
+  ${BOOST_LIB}/libboost_filesystem.so.1.62.0
+  ${BOOST_LIB}/libboost_system.so.1.62.0
+  ${BOOST_LIB}/libboost_thread.so.1.62.0
+  ${BOOST_LIB}/libboost_serialization.so.1.62.0
+  ${BOOST_LIB}/libboost_math_tr1.so.1.62.0
+  ${BOOST_LIB}/libboost_python.so.1.62.0
+  ${BOOST_LIB}/libboost_chrono.so.1.62.0
+  ${BOOST_LIB}/libboost_regex.so.1.62.0
+  ${BOOST_LIB}/libboost_program_options.so.1.62.0
+  ${BOOST_LIB}/libboost_atomic.so.1.62.0 pthread dl rt)
+set_target_properties(sse_md PROPERTIES OUTPUT_NAME sse_md
+  BUILD_RPATH "/home/zane/td_query_runtime_20260824/lib")
+
 add_library(sze_l1_md SHARED
   ${SZE_MD}/MDEngineSZEL1.cpp ${SZE_MD}/SZEProtocol.cpp
   ${SZE_MD}/SZERecoverable.cpp)
@@ -412,3 +441,17 @@ add_executable(sze_recovery_verify
   ${SZE_MD}/SZERecoverable.cpp)
 target_include_directories(sze_recovery_verify PRIVATE ${SZE_MD} ${DEEPWIN_INCLUDE})
 target_link_libraries(sze_recovery_verify PRIVATE pthread rt)
+
+# SSE merged trading-main helpers: catch-up gate + async prediction log.
+add_executable(sse_trading_gate_test
+  ${T0}/tests/sse_trading_gate_test.cpp)
+target_include_directories(sse_trading_gate_test PRIVATE ${T0}/strategy)
+target_compile_options(sse_trading_gate_test PRIVATE -UNDEBUG)
+add_test(NAME sse_trading_gate_test COMMAND sse_trading_gate_test)
+
+add_executable(async_prediction_log_test
+  ${T0}/tests/async_prediction_log_test.cpp)
+target_include_directories(async_prediction_log_test PRIVATE ${T0}/strategy)
+target_link_libraries(async_prediction_log_test PRIVATE pthread)
+target_compile_options(async_prediction_log_test PRIVATE -UNDEBUG)
+add_test(NAME async_prediction_log_test COMMAND async_prediction_log_test)

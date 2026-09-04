@@ -707,6 +707,13 @@ StrategyBase::StrategyBase(const std::string &name, json& src_config): IWCStrate
     mMarket = src_config["market"].get<std::string>();
     mOrderBookMode = ParseOrderBookRuntimeMode(src_config, mMarket);
     configure_sse_hybrid(src_config);
+    const std::string sse_prediction_log_path =
+        src_config.value("sse_prediction_log_path", std::string());
+    if (!sse_prediction_log_path.empty() &&
+        !mSsePredictionLog.open(sse_prediction_log_path)) {
+        KF_LOG_ERROR(logger, "[SSEHybrid] failed to open async prediction log: "
+            << sse_prediction_log_path);
+    }
     // Trading/risk startup is exchange-specific.  SSE uses its own routing
     // block and must not inherit the Shenzhen gate by accident.
     const char* routing_key = mMarket == "SH"
@@ -1174,6 +1181,24 @@ bool StrategyBase::make_sse_tick_event(const LFL2TradeField& data,
     return true;
 }
 
+void StrategyBase::log_sse_prediction(const std::string& code,
+                                        std::uint64_t exchange_us,
+                                        const char* model_type,
+                                        double prediction,
+                                        bool selected,
+                                        bool factor_complete,
+                                        std::uint64_t factor_ns,
+                                        std::uint64_t infer_ns,
+                                        std::uint64_t strategy_ns) {
+    std::ostringstream line;
+    line << code << ',' << exchange_us << ','
+         << sse_trading::local_time_of_day_micros() << ',' << model_type << ','
+         << std::setprecision(9) << prediction << ',' << (selected ? 1 : 0) << ','
+         << (factor_complete ? 1 : 0) << ',' << factor_ns << ',' << infer_ns
+         << ',' << strategy_ns;
+    mSsePredictionLog.enqueue(line.str());
+}
+
 void StrategyBase::flush_sse_hybrid_tick(const std::string& code,
                                          short source,
                                          long rcv_time) {
@@ -1182,13 +1207,19 @@ void StrategyBase::flush_sse_hybrid_tick(const std::string& code,
     state->pending_flush_scheduled = false;
     const sse_live::TickEvent event = state->pending_tick;
     state->pending_tick_valid = false;
+    const std::uint64_t factor_started = SseMonotonicNowNs();
     const sse_tick::FactorRow factor_row = state->factor_state.build(
         state->order_book, event.time_of_day_micros);
+    const std::uint64_t factor_ns = SseMonotonicNowNs() - factor_started;
     std::array<float, sse_model::kFeatureCount> factors = factor_row.values;
     sse_hybrid_model::Prediction output;
     std::string error;
-    if (!mSseHybridModel.on_tick(factors, "sse", event.time_of_day_micros,
-                                 &state->model_state, &output, &error)) {
+    const std::uint64_t infer_started = SseMonotonicNowNs();
+    const bool infer_ok = mSseHybridModel.on_tick(
+        factors, "sse", event.time_of_day_micros, &state->model_state, &output,
+        &error);
+    const std::uint64_t infer_ns = SseMonotonicNowNs() - infer_started;
+    if (!infer_ok) {
         ++mSseHybridRejectCount;
         KF_LOG_ERROR(logger, "[SSEHybrid][TickReject] instrument=" << code
             << " reason=" << error);
@@ -1196,15 +1227,23 @@ void StrategyBase::flush_sse_hybrid_tick(const std::string& code,
     }
     ++state->tick_sample_count;
     ++mSseHybridTickPredictionCount;
-    if (output.selected && factor_row.validity.complete &&
-        state->signal_view.get() != 0 &&
-        can_dispatch_trading_signal()) {
-        std::unordered_map<std::string, ZStrategy*>::iterator strategy_it =
-            mZStrategyMap.find(code);
-        if (strategy_it != mZStrategyMap.end() && strategy_it->second != 0) {
-            strategy_it->second->on_signal(state->signal_view.get(),
-                output.selected_pred, source, rcv_time);
+    if (output.selected) {
+        std::uint64_t strategy_ns = 0U;
+        if (factor_row.validity.complete && state->signal_view.get() != 0 &&
+            can_dispatch_trading_signal()) {
+            std::unordered_map<std::string, ZStrategy*>::iterator strategy_it =
+                mZStrategyMap.find(code);
+            if (strategy_it != mZStrategyMap.end() && strategy_it->second != 0) {
+                const std::uint64_t strategy_started = SseMonotonicNowNs();
+                strategy_it->second->on_signal(state->signal_view.get(),
+                    output.selected_pred, source, rcv_time);
+                strategy_ns = SseMonotonicNowNs() - strategy_started;
+            }
         }
+        log_sse_prediction(code, event.time_of_day_micros, "tick",
+                           output.selected_pred, true,
+                           factor_row.validity.complete, factor_ns, infer_ns,
+                           strategy_ns);
     }
     if (state->tick_sample_count <= 3U || state->tick_sample_count % 1000U == 0U) {
         KF_LOG_INFO(logger, "[SSEHybrid][Tick] instrument=" << code
@@ -1341,7 +1380,9 @@ void StrategyBase::process_sse_hybrid_snapshot(const LFMarketDataField* data,
     state->has_previous_snapshot = true;
     if (!state->has_previous_snapshot || previous.time_of_day_micros == snapshot.time_of_day_micros)
         return;
+    const std::uint64_t factor_started = SseMonotonicNowNs();
     const std::vector<float> factors = sse_snapshot36::build(previous, snapshot);
+    const std::uint64_t factor_ns = SseMonotonicNowNs() - factor_started;
     std::vector<float> enhanced(factors);
     if (state->auction59_factors.size() == 59U) {
         enhanced.insert(enhanced.end(), state->auction59_factors.begin(),
@@ -1352,9 +1393,12 @@ void StrategyBase::process_sse_hybrid_snapshot(const LFMarketDataField* data,
     }
     sse_hybrid_model::Prediction output;
     std::string error;
-    if (!mSseHybridModel.on_snapshot(factors, enhanced, "sse",
-                                     snapshot.time_of_day_micros,
-                                     &state->model_state, &output, &error)) {
+    const std::uint64_t infer_started = SseMonotonicNowNs();
+    const bool infer_ok = mSseHybridModel.on_snapshot(
+        factors, enhanced, "sse", snapshot.time_of_day_micros,
+        &state->model_state, &output, &error);
+    const std::uint64_t infer_ns = SseMonotonicNowNs() - infer_started;
+    if (!infer_ok) {
         ++mSseHybridRejectCount;
         return;
     }
@@ -1375,13 +1419,21 @@ void StrategyBase::process_sse_hybrid_snapshot(const LFMarketDataField* data,
         view.ms_market_data[AskVolume1Index + level] = snapshot.ask_volumes[level];
     }
     ++mSseHybridSnapshotPredictionCount;
-    if (output.selected && can_dispatch_trading_signal()) {
-        std::unordered_map<std::string, ZStrategy*>::iterator strategy_it =
-            mZStrategyMap.find(code);
-        if (strategy_it != mZStrategyMap.end() && strategy_it->second != 0) {
-            strategy_it->second->on_signal(state->signal_view.get(),
-                output.selected_pred, source, rcv_time);
+    if (output.selected) {
+        std::uint64_t strategy_ns = 0U;
+        if (can_dispatch_trading_signal()) {
+            std::unordered_map<std::string, ZStrategy*>::iterator strategy_it =
+                mZStrategyMap.find(code);
+            if (strategy_it != mZStrategyMap.end() && strategy_it->second != 0) {
+                const std::uint64_t strategy_started = SseMonotonicNowNs();
+                strategy_it->second->on_signal(state->signal_view.get(),
+                    output.selected_pred, source, rcv_time);
+                strategy_ns = SseMonotonicNowNs() - strategy_started;
+            }
         }
+        log_sse_prediction(code, snapshot.time_of_day_micros, "snapshot",
+                           output.selected_pred, true, true, factor_ns, infer_ns,
+                           strategy_ns);
     }
     if (mSseHybridSnapshotPredictionCount <= 3U ||
         mSseHybridSnapshotPredictionCount % 1000U == 0U) {

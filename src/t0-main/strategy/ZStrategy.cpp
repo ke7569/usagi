@@ -5,6 +5,7 @@
 
 #include "ZStrategy.h"
 #include "StrategyBase.h"
+#include "sse_trading_gate.h"
 #include "sze_position_risk.h"
 #include "../common.h"
 #include "../total_header.h"
@@ -90,6 +91,15 @@ ZStrategy::ZStrategy(const std::string &InstrumentID,
         recovery_routing_ = routing.value("input_mode", std::string()) == "recovery_handoff";
         max_order_volume_ = routing.value("max_order_volume", 0);
         max_position_ = routing.value("max_position", 0);
+        // SSE trading catch-up gate: block orders while the exchange event
+        // time lags local wall clock by more than the configured threshold.
+        // Configured here (idempotently) because the gate is process-global.
+        if (ExchangeID == "SSE") {
+            const bool gate_enabled = routing.value("catchup_gate_enabled", true);
+            const std::uint64_t gate_ms = routing.value("catchup_gate_threshold_ms", 1000U);
+            sse_trading::global_trading_gate().configure(
+                gate_enabled, gate_ms * 1000ULL);
+        }
         // SSE live routing is deliberately two-keyed: the account can log in
         // and synchronize risk while every order remains blocked until the
         // operator explicitly approves production.  Virtual routing remains
@@ -283,6 +293,25 @@ int ZStrategy::insertOrder(RT_Order order) {
         KF_LOG_ERROR(logger, "[OrderBlocked] InstrumentID=" << mTradeInstrument
             << ", reason=routing_disabled");
         return -1;
+    }
+    // SSE catch-up gate: while market data lags local time by more than the
+    // threshold, never reach the TD plugin.  The gate logs the transition
+    // itself (blocked/resumed).
+    if (ExchangeID == "SSE") {
+        std::string transition;
+        const double market_time =
+            context.curr_ob != nullptr ? context.curr_ob->MarketTime : 0.0;
+        if (!sse_trading::global_trading_gate().permit(
+                market_time, sse_trading::local_time_of_day_micros(),
+                &transition)) {
+            if (!transition.empty())
+                KF_LOG_INFO(logger, "[CatchUpGate] state=" << transition
+                    << " instrument=" << mTradeInstrument);
+            KF_LOG_INFO(logger, "[OrderBlocked] InstrumentID=" << mTradeInstrument
+                << ", reason=catchup_gate"
+                << ", market_time=" << market_time);
+            return -1;
+        }
     }
     if (virtual_routing_) {
         KF_LOG_INFO(logger, "[VirtualOrderIntent] InstrumentID=" << mTradeInstrument

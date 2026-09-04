@@ -24,6 +24,8 @@
 #include "../../../sse-t0/market_data/sse_primary_decoder.h"
 #include "../../../sse-t0/market_data/sse_tick_factors.h"
 #include "../../../sse-t0/market_data/sse_tick_order_book.h"
+#include "async_prediction_log.h"
+#include "sse_trading_gate.h"
 #include "../../../sse-t0/model/auction59_sidecar.h"
 #include "../../../sse-t0/model/snapshot36.h"
 #include "../../../sse-t0/model/sse_hybrid_model.h"
@@ -261,7 +263,17 @@ private:
     std::uint64_t mSseHybridSnapshotPredictionCount = 0;
     std::uint64_t mSseHybridTickPredictionCount = 0;
     std::uint64_t mSseHybridRejectCount = 0;
+    sse_trading::AsyncPredictionLog mSsePredictionLog;
 
+    void log_sse_prediction(const std::string& code,
+                            std::uint64_t exchange_us,
+                            const char* model_type,
+                            double prediction,
+                            bool selected,
+                            bool factor_complete,
+                            std::uint64_t factor_ns,
+                            std::uint64_t infer_ns,
+                            std::uint64_t strategy_ns);
     bool configure_sse_hybrid(const json& config);
     SseHybridRuntimeState* sse_hybrid_state_for(const std::string& code);
     bool make_sse_tick_event(const LFL2OrderField& data,

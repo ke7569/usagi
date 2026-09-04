@@ -47,6 +47,7 @@ public:
              const DatagramCallback& callback,
              long duration_ms,
              std::string* error);
+    void stop();
 
 private:
     struct Impl;
