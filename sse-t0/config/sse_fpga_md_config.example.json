@@ -1,15 +1,10 @@
 {
   "market": "SH",
   "source": 89,
-  "site": "jinqiao",
-  "snapshot_primary": "239.35.80.5:37105",
-  "snapshot_backup": "239.57.80.5:37105",
-  "tick_primary": "239.35.80.9:37109",
-  "tick_backup": "239.57.80.9:37109",
-  "index_primary": "239.35.80.2:37102",
-  "index_backup": "239.57.80.2:37102",
-  "lv1_primary": "239.57.80.10:37110",
-  "lv1_backup": "239.57.80.10:37110",
-  "interface": "SET_AT_DEPLOYMENT",
+  "site": "huarun_kayuan",
+  "channels": [
+    {"name": "huarun_fpga20", "kind": "snapshot_tick", "group": "238.127.1.1", "port": 12020, "interface_ip": "SET_HUARUN_INTERFACE_IP"},
+    {"name": "kayuan_fpga20", "kind": "snapshot_tick", "group": "238.125.1.1", "port": 12002, "interface_ip": "SET_KAYUAN_INTERFACE_IP"}
+  ],
   "credentials": "INJECT_AT_DEPLOYMENT"
 }

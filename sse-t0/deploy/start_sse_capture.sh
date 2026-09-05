@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --site dongguan|jinqiao --interface-ip IP [--output-dir DIR]" >&2
+  echo "usage: $0 --site huarun|kayuan --interface-ip IP [--output-dir DIR]" >&2
   exit 2
 }
 
@@ -17,7 +17,7 @@ while [[ $# -gt 0 ]]; do
     *) usage ;;
   esac
 done
-[[ "$SITE" == "dongguan" || "$SITE" == "jinqiao" ]] || usage
+[[ "$SITE" == "huarun" || "$SITE" == "kayuan" ]] || usage
 [[ -n "$INTERFACE_IP" ]] || usage
 [[ "$INTERFACE_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "invalid IPv4 interface" >&2; exit 2; }
 
@@ -40,15 +40,10 @@ STAMP="$(date -u +%Y%m%d_%H%M%S)"
 LOG="$OUTPUT_DIR/sse_udp_${SITE}_${STAMP}.jsonl"
 ERR="$OUTPUT_DIR/sse_udp_${SITE}_${STAMP}.stderr.log"
 ARGS=("$LOG")
-if [[ "$SITE" == "jinqiao" ]]; then
-  ARGS+=(snapshot_primary 239.35.80.5 37105
-         snapshot_backup 239.57.80.5 37105
-         tick_primary 239.35.80.9 37109
-         tick_backup 239.57.80.9 37109)
+if [[ "$SITE" == "huarun" ]]; then
+  ARGS+=(snapshot_tick_huarun 238.127.1.1 12020)
 else
-  # The supplied server sheet lists SSE as primary/backup-consistent in Dongguan.
-  ARGS+=(snapshot 239.57.80.5 37105
-         tick 239.57.80.9 37109)
+  ARGS+=(snapshot_tick_kayuan 238.125.1.1 12002)
 fi
 ARGS+=(--interface-ip "$INTERFACE_IP")
 

@@ -1,4 +1,13 @@
 {
+  "md": {
+    "sse_fpga": {
+      "use_subscribe_filter": false,
+      "channels": [
+        {"name": "huarun_fpga20", "group": "238.127.1.1", "port": 12020, "interface_ip": "SET_HUARUN_INTERFACE_IP"},
+        {"name": "kayuan_fpga20", "group": "238.125.1.1", "port": 12002, "interface_ip": "SET_KAYUAN_INTERFACE_IP"}
+      ]
+    }
+  },
   "td": {
     "sse_td": {
       "BrokerId": "1700",
