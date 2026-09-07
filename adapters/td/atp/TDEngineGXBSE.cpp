@@ -120,6 +120,16 @@ public:
         }
     }
 
+    void OnRspCashTradeOrderQueryResult(const ATPRspCashTradeOrderQueryResultMsg& msg,
+                                        const int64_t request_id,
+                                        const ATPRspErrorInfo& error_info,
+                                        const bool isLast) override
+    {
+        if (engine_ != nullptr) {
+            engine_->on_rsp_cash_trade_order_query(account_index_, msg, request_id, error_info, isLast);
+        }
+    }
+
     void OnRspCashExtQueryResultSecurityInfo(const ATPRspCashExtQueryResultSecurityInfoMsg& msg,
                                              const int64_t request_id,
                                              const ATPRspErrorInfo& error_info,
@@ -162,6 +172,29 @@ std::string StripExchangeSuffix(const char* instrument_id)
 const char* SecurityIdNoExchangeSuffix(const char* instrument_id)
 {
     return instrument_id != nullptr ? instrument_id : "";
+}
+
+bool oms_quantity_from_double(double value, oms::Quantity* output, bool require_positive = false)
+{
+    if (output == nullptr || !std::isfinite(value) || value < 0.0 ||
+        (require_positive && value <= 0.0) || std::floor(value) != value ||
+        value > static_cast<double>(std::numeric_limits<oms::Quantity>::max())) {
+        return false;
+    }
+    *output = static_cast<oms::Quantity>(value);
+    return true;
+}
+
+bool oms_money_from_double(double value, oms::Money* output)
+{
+    return oms::money_from_double(value, output);
+}
+
+bool atp_identity_empty(const char* fund_account_id, const char* account_id, const char* cust_id)
+{
+    return (fund_account_id == nullptr || fund_account_id[0] == '\0') &&
+        (account_id == nullptr || account_id[0] == '\0') &&
+        (cust_id == nullptr || cust_id[0] == '\0');
 }
 
 }
@@ -605,7 +638,9 @@ void TDEngineGXBSE::login(long timeout_nsec)
 void TDEngineGXBSE::logout()
 {
     stop_position_sync_thread();
-    for (auto& unit : account_units_) {
+    for (std::size_t i = 0; i < account_units_.size(); ++i) {
+        abort_oms_query(static_cast<int>(i));
+        AccountUnitGXBSE& unit = account_units_[i];
         if (unit.api) {
             unit.api->Logout();
         }
@@ -623,7 +658,9 @@ void TDEngineGXBSE::release_api()
     }
     for (const auto& backend : backends) backend->close();
     stop_position_sync_thread();
-    for (auto& unit : account_units_) {
+    for (std::size_t i = 0; i < account_units_.size(); ++i) {
+        abort_oms_query(static_cast<int>(i));
+        AccountUnitGXBSE& unit = account_units_[i];
         if (unit.api) {
             unit.api->Logout();
             unit.api->Release();
@@ -714,9 +751,312 @@ std::shared_ptr<oms::Backend> TDEngineGXBSE::make_oms_backend(int account_index,
     if (oms_backends_.count(account_index))
         throw std::logic_error("ATP generation cannot be rebound; recreate the SDK connection owner");
     std::shared_ptr<oms::AtpBackend> backend(new oms::AtpBackend(scope,
-        [this, account_index](const oms::Command& command) { return send_oms_command(account_index, command); }));
+        [this, account_index](const oms::Command& command) { return send_oms_command(account_index, command); },
+        [this, account_index](const oms::Scope& query_scope, std::uint64_t token) {
+            return start_oms_query(account_index, query_scope, token);
+        }));
     oms_backends_[account_index] = backend;
     return backend;
+}
+
+void TDEngineGXBSE::erase_oms_query(const std::shared_ptr<OmsQueryState>& state)
+{
+    std::lock_guard<std::mutex> lock(oms_query_mutex_);
+    auto active = oms_queries_.find(state->account_index);
+    if (active != oms_queries_.end() && active->second == state) {
+        oms_queries_.erase(active);
+    }
+    for (auto it = oms_query_requests_.begin(); it != oms_query_requests_.end();) {
+        if (it->second.state == state) {
+            oms_query_retired_requests_[it->first] = state->account_index;
+            it = oms_query_requests_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void TDEngineGXBSE::abort_oms_query(int account_index)
+{
+    std::shared_ptr<OmsQueryState> state;
+    {
+        std::lock_guard<std::mutex> lock(oms_query_mutex_);
+        auto it = oms_queries_.find(account_index);
+        if (it != oms_queries_.end()) {
+            state = it->second;
+        }
+    }
+    if (state) {
+        erase_oms_query(state);
+    }
+}
+
+bool TDEngineGXBSE::valid_oms_query_identity(const OmsQueryState& state,
+                                             const char* fund_account_id,
+                                             const char* account_id,
+                                             const char* cust_id,
+                                             uint16_t market_id,
+                                             bool validate_market) const
+{
+    const std::string fund = fund_account_id != nullptr ? fund_account_id : "";
+    const std::string account = account_id != nullptr ? account_id : "";
+    const std::string cust = cust_id != nullptr ? cust_id : "";
+    if (state.scope.account.account.empty() || fund != state.scope.account.account ||
+        (validate_market && market_id != state.market_id)) {
+        return false;
+    }
+    if (!state.account_id.empty() && account != state.account_id) {
+        return false;
+    }
+    if (!state.cust_id.empty() && cust != state.cust_id) {
+        return false;
+    }
+    return true;
+}
+
+bool TDEngineGXBSE::is_known_oms_query_request(int64_t request_id, OmsQueryKind kind)
+{
+    (void)kind;
+    std::lock_guard<std::mutex> lock(oms_query_mutex_);
+    auto active = oms_query_requests_.find(request_id);
+    if (active != oms_query_requests_.end()) {
+        return true;
+    }
+    return oms_query_retired_requests_.find(request_id) != oms_query_retired_requests_.end();
+}
+
+bool TDEngineGXBSE::is_oms_query_part(int account_index,
+                                      int64_t request_id,
+                                      OmsQueryKind kind)
+{
+    std::lock_guard<std::mutex> lock(oms_query_mutex_);
+    auto it = oms_query_requests_.find(request_id);
+    return it != oms_query_requests_.end() && it->second.kind == kind &&
+        it->second.state && it->second.state->account_index == account_index;
+}
+
+bool TDEngineGXBSE::consume_oms_query_part(
+    int account_index,
+    int64_t request_id,
+    OmsQueryKind kind,
+    bool is_last,
+    bool callback_ok,
+    const std::function<bool(OmsQueryState&)>& append,
+    oms::Snapshot* snapshot,
+    std::shared_ptr<oms::AtpBackend>* backend)
+{
+    if (snapshot == nullptr || backend == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(oms_query_mutex_);
+    auto request = oms_query_requests_.find(request_id);
+    if (request == oms_query_requests_.end() || request->second.kind != kind ||
+        !request->second.state || request->second.state->account_index != account_index) {
+        return false;
+    }
+    const std::shared_ptr<OmsQueryState> state = request->second.state;
+    if (state->done[kind]) {
+        return false;
+    }
+
+    bool finish = !callback_ok;
+    if (callback_ok && append && !append(*state)) {
+        state->success[kind] = false;
+        finish = true;
+    }
+    if (!callback_ok) {
+        state->success[kind] = false;
+    }
+    if (!finish && !is_last) {
+        return false;
+    }
+    state->done[kind] = true;
+    bool all_done = true;
+    for (int i = 0; i < OmsQueryKindCount; ++i) {
+        if (!state->done[i]) {
+            all_done = false;
+            break;
+        }
+    }
+    if (!all_done) {
+        return false;
+    }
+
+    *snapshot = state->assembler.snapshot(
+        state->success[OmsQueryFund], state->success[OmsQueryShare],
+        state->success[OmsQueryOrder], state->success[OmsQueryTrade],
+        false, false);
+    *backend = state->backend.lock();
+    for (auto it = oms_query_requests_.begin(); it != oms_query_requests_.end();) {
+        if (it->second.state == state) {
+            oms_query_retired_requests_[it->first] = state->account_index;
+            it = oms_query_requests_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    auto active = oms_queries_.find(account_index);
+    if (active != oms_queries_.end() && active->second == state) {
+        oms_queries_.erase(active);
+    }
+    return static_cast<bool>(*backend);
+}
+
+oms::Error TDEngineGXBSE::start_oms_query(int account_index,
+                                          const oms::Scope& scope,
+                                          std::uint64_t token)
+{
+    oms::Error result;
+    AccountUnitGXBSE* unit = unit_at(account_index);
+    if (unit == nullptr || !unit->api || !unit->connected.load() || !unit->logged_in.load()) {
+        result.category = oms::ErrorCategory::NotReady;
+        result.message = "ATP query requires a connected logged-in account";
+        return result;
+    }
+    if (!token || scope.source != source_id || scope.account.broker != "guoxin" ||
+        scope.account.account != unit->fund_account_id || !scope.epoch) {
+        result.category = oms::ErrorCategory::Ownership;
+        result.message = "ATP query scope does not match the account generation";
+        return result;
+    }
+
+    std::shared_ptr<oms::AtpBackend> backend;
+    {
+        std::lock_guard<std::mutex> guard(route_mutex_);
+        auto found = oms_backends_.find(account_index);
+        if (found != oms_backends_.end()) {
+            backend = found->second.lock();
+        }
+    }
+    if (!backend || !(backend->scope() == scope)) {
+        result.category = oms::ErrorCategory::Ownership;
+        result.message = "ATP query has no matching OMS generation";
+        return result;
+    }
+
+    const std::shared_ptr<OmsQueryState> state(
+        new OmsQueryState(account_index, scope, token, unit->account_id,
+                          unit->cust_id, static_cast<uint16_t>(unit->market_id), backend));
+    const int64_t fund_request_id = next_request_id();
+    const int64_t share_request_id = next_request_id();
+    const int64_t order_request_id = next_request_id();
+    const int64_t trade_request_id = next_request_id();
+    {
+        std::lock_guard<std::mutex> lock(oms_query_mutex_);
+        if (oms_queries_.find(account_index) != oms_queries_.end()) {
+            result.category = oms::ErrorCategory::Temporary;
+            result.message = "ATP OMS query already in flight";
+            return result;
+        }
+        oms_queries_[account_index] = state;
+        OmsQueryRequest request;
+        request.state = state; request.kind = OmsQueryFund;
+        oms_query_requests_[fund_request_id] = request;
+        request.kind = OmsQueryShare;
+        oms_query_requests_[share_request_id] = request;
+        request.kind = OmsQueryOrder;
+        oms_query_requests_[order_request_id] = request;
+        request.kind = OmsQueryTrade;
+        oms_query_requests_[trade_request_id] = request;
+    }
+
+    const auto dispatch_failed = [&](ATPErrorCodeType error_code, const char* name) -> oms::Error {
+        erase_oms_query(state);
+        result.category = oms::ErrorCategory::Unknown;
+        result.raw_code = error_code;
+        result.raw_type = "ATPErrorCodeType";
+        result.message = name;
+        return result;
+    };
+
+    ATPReqCashFundQueryMsg* fund = ATPReqCashFundQueryMsg::NewMessage();
+    if (fund == nullptr) {
+        return dispatch_failed(static_cast<ATPErrorCodeType>(-1), "ATP fund query message allocation failed");
+    }
+    fund->SetCustId(unit->cust_id.c_str());
+    fund->SetFundAccountId(unit->fund_account_id.c_str());
+    fund->SetBranchId(unit->branch_id.c_str());
+    fund->SetAccountId(unit->account_id.c_str());
+    fund->SetPassword(unit->password.c_str());
+    fund->SetCurrency("CNY");
+    fund->SetMarketId(static_cast<uint16_t>(unit->market_id));
+    ATPErrorCodeType error_code = unit->api->ReqCashFundQuery(fund, fund_request_id);
+    ATPReqCashFundQueryMsg::DeleteMessage(fund);
+    if (error_code != ATPErrorCode::kSuccess) {
+        return dispatch_failed(error_code, "ATP fund query dispatch failed");
+    }
+
+    ATPReqCashShareQueryMsg* share = ATPReqCashShareQueryMsg::NewMessage();
+    if (share == nullptr) {
+        return dispatch_failed(static_cast<ATPErrorCodeType>(-1), "ATP share query message allocation failed");
+    }
+    share->SetCustId(unit->cust_id.c_str());
+    share->SetFundAccountId(unit->fund_account_id.c_str());
+    share->SetBranchId(unit->branch_id.c_str());
+    share->SetPassword(unit->password.c_str());
+    share->SetAccountId(unit->account_id.c_str());
+    share->SetBusinessType(ATPBusinessTypeConst::kAll);
+    share->SetMarketId(static_cast<uint16_t>(unit->market_id));
+    share->SetSecurityId("");
+    // ReturnNum=0 is the SDK's query-all form; it is not a page size.
+    share->SetReturnNum(0);
+    error_code = unit->api->ReqCashShareQuery(share, share_request_id);
+    ATPReqCashShareQueryMsg::DeleteMessage(share);
+    if (error_code != ATPErrorCode::kSuccess) {
+        return dispatch_failed(error_code, "ATP share query dispatch failed");
+    }
+
+    ATPReqCashOrderQueryMsg* order = ATPReqCashOrderQueryMsg::NewMessage();
+    if (order == nullptr) {
+        return dispatch_failed(static_cast<ATPErrorCodeType>(-1), "ATP order query message allocation failed");
+    }
+    order->SetCustId(unit->cust_id.c_str());
+    order->SetFundAccountId(unit->fund_account_id.c_str());
+    order->SetBranchId(unit->branch_id.c_str());
+    order->SetAccountId(unit->account_id.c_str());
+    order->SetPassword(unit->password.c_str());
+    order->SetClOrdNo(0);
+    order->SetMarketId(static_cast<uint16_t>(unit->market_id));
+    order->SetSecurityId("");
+    order->SetBusinessType(ATPBusinessTypeConst::kAll);
+    order->SetSide(ATPSideConst::kAll);
+    order->SetOrderQueryCondition(ATPOrderQueryConditionConst::kAll);
+    order->SetReturnNum(0);
+    order->SetReturnSeq(ATPReturnSeqConst::kTimeOrderRe);
+    order->SetBatchClOrdNo(0);
+    order->SetQueryIndex(0);
+    error_code = unit->api->ReqCashOrderQuery(order, order_request_id);
+    ATPReqCashOrderQueryMsg::DeleteMessage(order);
+    if (error_code != ATPErrorCode::kSuccess) {
+        return dispatch_failed(error_code, "ATP order query dispatch failed");
+    }
+
+    ATPReqCashTradeOrderQueryMsg* trade = ATPReqCashTradeOrderQueryMsg::NewMessage();
+    if (trade == nullptr) {
+        return dispatch_failed(static_cast<ATPErrorCodeType>(-1), "ATP trade query message allocation failed");
+    }
+    trade->SetCustId(unit->cust_id.c_str());
+    trade->SetFundAccountId(unit->fund_account_id.c_str());
+    trade->SetAccountId(unit->account_id.c_str());
+    trade->SetPassword(unit->password.c_str());
+    trade->SetMarketId(static_cast<uint16_t>(unit->market_id));
+    trade->SetSecurityId("");
+    trade->SetBusinessType(ATPBusinessTypeConst::kAll);
+    trade->SetReturnNum(0);
+    trade->SetReturnSeq(ATPReturnSeqConst::kTimeOrderRe);
+    trade->SetClOrdNo(0);
+    trade->SetClOrdId("");
+    trade->SetExecId("");
+    trade->SetBatchClOrdNo(0);
+    trade->SetTradeOrderQueryCondition(0);
+    trade->SetQueryIndex(0);
+    error_code = unit->api->ReqCashTradeOrderQuery(trade, trade_request_id);
+    ATPReqCashTradeOrderQueryMsg::DeleteMessage(trade);
+    if (error_code != ATPErrorCode::kSuccess) {
+        return dispatch_failed(error_code, "ATP trade query dispatch failed");
+    }
+
+    return result;
 }
 
 oms::SendResult TDEngineGXBSE::send_oms_command(int account_index, const oms::Command& command)
@@ -1334,6 +1674,16 @@ void TDEngineGXBSE::on_login(int account_index, const ATPCustomerInfo& msg)
     }
     unit->logged_in.store(true);
     unit->connected.store(true);
+    std::shared_ptr<oms::AtpBackend> backend;
+    {
+        std::lock_guard<std::mutex> guard(route_mutex_);
+        backend = oms_backends_[account_index].lock();
+    }
+    if (backend) {
+        // Reconnects keep the immutable OMS scope generation; the Engine will
+        // start a fresh tokenized account query from this connection event.
+        backend->connected();
+    }
     login_ok();
     login_cv_.notify_all();
     KF_LOG_INFO(logger, "[OnLogin] account_index=" << account_index
@@ -1343,6 +1693,7 @@ void TDEngineGXBSE::on_login(int account_index, const ATPCustomerInfo& msg)
 
 void TDEngineGXBSE::on_logout(int account_index, const char* desc)
 {
+    abort_oms_query(account_index);
     std::shared_ptr<oms::AtpBackend> backend;
     { std::lock_guard<std::mutex> guard(route_mutex_); backend = oms_backends_[account_index].lock(); }
     if (backend) backend->disconnected();
@@ -1356,6 +1707,7 @@ void TDEngineGXBSE::on_logout(int account_index, const char* desc)
 
 void TDEngineGXBSE::on_recovering(int account_index, const char* desc)
 {
+    abort_oms_query(account_index);
     std::shared_ptr<oms::AtpBackend> backend;
     { std::lock_guard<std::mutex> guard(route_mutex_); backend = oms_backends_[account_index].lock(); }
     if (backend) backend->disconnected();
@@ -1568,6 +1920,43 @@ void TDEngineGXBSE::on_rsp_cash_share_query(int account_index,
                                             const ATPRspErrorInfo& error_info,
                                             bool is_last)
 {
+    if (is_known_oms_query_request(request_id, OmsQueryShare)) {
+        if (!is_oms_query_part(account_index, request_id, OmsQueryShare)) {
+            return;
+        }
+        oms::Snapshot snapshot;
+        std::shared_ptr<oms::AtpBackend> backend;
+        const bool emitted = consume_oms_query_part(
+            account_index, request_id, OmsQueryShare, is_last, error_info.error_id == 0,
+            [this, &msg](OmsQueryState& state) -> bool {
+                const char* fund_account_id = msg.GetFundAccountId();
+                const char* account_id = msg.GetAccountId();
+                const char* cust_id = msg.GetCustId();
+                const bool empty_security = msg.GetSecurityId() == nullptr || msg.GetSecurityId()[0] == '\0';
+                if (atp_identity_empty(fund_account_id, account_id, cust_id) && empty_security &&
+                    msg.GetLeavesQty() == 0.0 && msg.GetAvailableQty() == 0.0) {
+                    return true;
+                }
+                if (!valid_oms_query_identity(state, fund_account_id, account_id, cust_id,
+                                              msg.GetMarketId(), true)) {
+                    return false;
+                }
+                oms::SnapshotPosition position;
+                position.instrument.market = exchange_from_market(msg.GetMarketId());
+                position.instrument.code = StripExchangeSuffix(msg.GetSecurityId());
+                if (!oms_quantity_from_double(msg.GetLeavesQty(), &position.total) ||
+                    !oms_quantity_from_double(msg.GetAvailableQty(), &position.free_sellable)) {
+                    return false;
+                }
+                // Pass the broker-reported available value unchanged; OMS reconstructs reservations.
+                return state.assembler.add_position(position);
+            },
+            &snapshot, &backend);
+        if (emitted && backend) {
+            backend->publish(snapshot);
+        }
+        return;
+    }
     AccountUnitGXBSE* unit = unit_at(account_index);
     if (unit == nullptr) {
         return;
@@ -1702,6 +2091,40 @@ void TDEngineGXBSE::on_rsp_cash_fund_query(int account_index,
                                            const ATPRspErrorInfo& error_info,
                                            bool is_last)
 {
+    if (is_known_oms_query_request(request_id, OmsQueryFund)) {
+        if (!is_oms_query_part(account_index, request_id, OmsQueryFund)) {
+            return;
+        }
+        oms::Snapshot snapshot;
+        std::shared_ptr<oms::AtpBackend> backend;
+        const bool emitted = consume_oms_query_part(
+            account_index, request_id, OmsQueryFund, is_last, error_info.error_id == 0,
+            [this, &msg](OmsQueryState& state) -> bool {
+                const char* fund_account_id = msg.GetFundAccountId();
+                const char* account_id = msg.GetAccountId();
+                const char* cust_id = msg.GetCustId();
+                if (atp_identity_empty(fund_account_id, account_id, cust_id) &&
+                    msg.GetLeavesValue() == 0.0 && msg.GetFrozenAll() == 0.0 &&
+                    msg.GetAvailableT0() == 0.0 && msg.GetAvailableT1() == 0.0) {
+                    return true;
+                }
+                // Fund results expose no MarketId in the installed SDK.
+                if (!valid_oms_query_identity(state, fund_account_id, account_id, cust_id,
+                                              0, false)) {
+                    return false;
+                }
+                oms::Money free_cash = 0;
+                if (!oms_money_from_double(msg.GetAvailableT1(), &free_cash)) {
+                    return false;
+                }
+                return state.assembler.set_free_cash(free_cash);
+            },
+            &snapshot, &backend);
+        if (emitted && backend) {
+            backend->publish(snapshot);
+        }
+        return;
+    }
     AccountUnitGXBSE* unit = unit_at(account_index);
     const bool periodic_account_sync = is_periodic_account_query(request_id);
     if (is_last) {
@@ -1751,6 +2174,67 @@ void TDEngineGXBSE::on_rsp_cash_order_query(int account_index,
                                             const ATPRspErrorInfo& error_info,
                                             bool is_last)
 {
+    if (is_known_oms_query_request(request_id, OmsQueryOrder)) {
+        if (!is_oms_query_part(account_index, request_id, OmsQueryOrder)) {
+            return;
+        }
+        oms::Snapshot snapshot;
+        std::shared_ptr<oms::AtpBackend> backend;
+        const bool emitted = consume_oms_query_part(
+            account_index, request_id, OmsQueryOrder, is_last, error_info.error_id == 0,
+            [this, &msg](OmsQueryState& state) -> bool {
+                const char* fund_account_id = msg.GetFundAccountId();
+                const char* account_id = msg.GetAccountId();
+                const char* cust_id = msg.GetCustId();
+                const char* security_id = msg.GetSecurityId();
+                const char* order_id = msg.GetOrderId();
+                const bool empty_security = security_id == nullptr || security_id[0] == '\0';
+                const bool empty_order_id = order_id == nullptr || order_id[0] == '\0';
+                if (atp_identity_empty(fund_account_id, account_id, cust_id) &&
+                    msg.GetClOrdNo() <= 0 && empty_security && empty_order_id &&
+                    msg.GetOrderQty() == 0.0 && msg.GetCumQty() == 0.0 &&
+                    msg.GetLeavesQty() == 0.0) {
+                    return true;
+                }
+                if (!valid_oms_query_identity(state, fund_account_id, account_id, cust_id,
+                                              msg.GetMarketId(), true)) {
+                    return false;
+                }
+                if (msg.GetClOrdNo() <= 0) {
+                    return false;
+                }
+                oms::SnapshotOrder order;
+                // Batch numbers do not prove OMS ownership; external rows use id=0.
+                order.id = 0;
+                order.owner = "external";
+                order.broker_id = std::to_string(msg.GetClOrdNo());
+                order.instrument.market = exchange_from_market(msg.GetMarketId());
+                order.instrument.code = StripExchangeSuffix(security_id);
+                if (msg.GetSide() != ATPSideConst::kBuy && msg.GetSide() != ATPSideConst::kSell) {
+                    return false;
+                }
+                order.side = msg.GetSide() == ATPSideConst::kSell ? oms::Side::Sell : oms::Side::Buy;
+                if (!oms_money_from_double(msg.GetOrderPrice(), &order.price) ||
+                    !oms_quantity_from_double(msg.GetOrderQty(), &order.original) ||
+                    !oms_quantity_from_double(msg.GetCumQty(), &order.filled) ||
+                    !oms_quantity_from_double(msg.GetLeavesQty(), &order.working)) {
+                    return false;
+                }
+                const char status = to_lf_order_status(msg.GetOrdStatus());
+                order.state = status == LF_CHAR_AllTraded ? oms::OrderState::Filled :
+                    (status == LF_CHAR_Canceled || status == LF_CHAR_PartTradedNotQueueing)
+                        ? oms::OrderState::Canceled :
+                    status == LF_CHAR_Error ? oms::OrderState::Rejected :
+                    status == LF_CHAR_PartTradedQueueing ? oms::OrderState::Partial :
+                    oms::OrderState::Accepted;
+                return state.assembler.add_order(order);
+            },
+            &snapshot, &backend);
+        if (emitted && backend) {
+            backend->publish(snapshot);
+        }
+        return;
+    }
     if (is_last) {
         uint64_t latency_ns = 0;
         if (consume_request_send_latency(request_id, &latency_ns)) {
@@ -1830,6 +2314,72 @@ void TDEngineGXBSE::on_rsp_cash_order_query(int account_index,
                 << " rid=" << request_id
                 << " last=1");
         }
+    }
+}
+
+void TDEngineGXBSE::on_rsp_cash_trade_order_query(
+    int account_index,
+    const ATPRspCashTradeOrderQueryResultMsg& msg,
+    int64_t request_id,
+    const ATPRspErrorInfo& error_info,
+    bool is_last)
+{
+    if (!is_known_oms_query_request(request_id, OmsQueryTrade) ||
+        !is_oms_query_part(account_index, request_id, OmsQueryTrade)) {
+        return;
+    }
+    oms::Snapshot snapshot;
+    std::shared_ptr<oms::AtpBackend> backend;
+    const bool emitted = consume_oms_query_part(
+        account_index, request_id, OmsQueryTrade, is_last, error_info.error_id == 0,
+        [this, &msg](OmsQueryState& state) -> bool {
+            const char* fund_account_id = msg.GetFundAccountId();
+            const char* account_id = msg.GetAccountId();
+            const char* cust_id = msg.GetCustId();
+            const char* exec_id = msg.GetExecId();
+            const char* security_id = msg.GetSecurityId();
+            const bool empty_exec_id = exec_id == nullptr || exec_id[0] == '\0';
+            const bool empty_security = security_id == nullptr || security_id[0] == '\0';
+            if (atp_identity_empty(fund_account_id, account_id, cust_id) &&
+                msg.GetClOrdNo() <= 0 && empty_exec_id && empty_security &&
+                msg.GetLastQty() == 0.0) {
+                return true;
+            }
+            if (!valid_oms_query_identity(state, fund_account_id, account_id, cust_id,
+                                          msg.GetMarketId(), true)) {
+                return false;
+            }
+            if (msg.GetSide() != ATPSideConst::kBuy && msg.GetSide() != ATPSideConst::kSell) {
+                return false;
+            }
+            if (msg.GetCancelFlag()) {
+                return true;
+            }
+            if (msg.GetClOrdNo() <= 0 || empty_exec_id) {
+                return false;
+            }
+            oms::Report trade;
+            trade.scope = state.scope;
+            // Batch numbers do not prove OMS ownership; external rows use id=0.
+            trade.id = 0;
+            trade.broker_id = std::to_string(msg.GetClOrdNo());
+            trade.instrument.market = exchange_from_market(msg.GetMarketId());
+            trade.instrument.code = StripExchangeSuffix(security_id);
+            trade.side = msg.GetSide() == ATPSideConst::kSell ? oms::Side::Sell : oms::Side::Buy;
+            trade.kind = oms::ReportKind::Trade;
+            trade.trade_id = msg.GetExecId();
+            if (!oms_quantity_from_double(msg.GetLastQty(), &trade.trade_quantity, true) ||
+                !oms_money_from_double(msg.GetLastPx(), &trade.trade_price) ||
+                !oms_money_from_double(msg.GetFee(), &trade.trade_fee)) {
+                return false;
+            }
+            trade.cumulative_after = -1;
+            trade.fee_is_final = false;
+            return state.assembler.add_trade(trade);
+        },
+        &snapshot, &backend);
+    if (emitted && backend) {
+        backend->publish(snapshot);
     }
 }
 

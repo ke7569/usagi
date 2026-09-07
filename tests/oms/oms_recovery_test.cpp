@@ -74,6 +74,7 @@ Config config(const TempDir& temp) {
     value.ownership = OwnershipMode::ExclusiveLocal;
     value.journal_path = temp.journal;
     value.lock_directory = temp.path;
+    value.durable_intent = true;
     value.instruments[kSze] = rules();
     value.instruments[kSse] = rules();
     return value;
@@ -195,6 +196,133 @@ void test_durable_active_order_recovery() {
     require(second->account().ready, "recovery ready after controlled rate window");
     require(second->order(sent.id, &recovered) && recovered.working == 500,
             "recovered working reservation retained");
+}
+
+void test_broker_id_recovers_without_oms_snapshot_id() {
+    TempDir temp;
+    Config value = config(temp);
+    std::shared_ptr<ScriptedBackend> first_backend(new ScriptedBackend(capabilities()));
+    first_backend->submit_hook = [](const Command&) {
+        SendResult result; result.disposition = SendDisposition::Submitted; result.broker_id = "B2"; return result;
+    };
+    std::shared_ptr<Engine> first = create(value, first_backend, 1);
+    reconcile(first, first_backend, 1);
+    const SubmitResult sent = first->submit(buy("owner", "broker-id"));
+    require(sent.accepted, "broker-id order submitted");
+    first.reset();
+
+    std::shared_ptr<ScriptedBackend> second_backend(new ScriptedBackend(capabilities()));
+    std::shared_ptr<Engine> second = create(value, second_backend, 2);
+    Snapshot value_snapshot = snapshot_for(second, 2);
+    value_snapshot.orders.push_back(snapshot_order(0, "external", "B2", kSze,
+                                                    Side::Buy, 500, 0, 500,
+                                                    OrderState::Accepted));
+    require(second->begin_reconcile(2, false), "broker-id recovery query");
+    second_backend->publish(value_snapshot);
+    second->advance_to(value.limits.rate_window_ns);
+    OrderView recovered;
+    require(second->order(sent.id, &recovered) && recovered.owned &&
+            recovered.command.broker_id == "B2" && recovered.working == 500,
+            "ATP broker id reconnects query row to local order");
+    require(second->account().ready, "broker-id attribution restores account readiness");
+}
+
+void test_automatic_query_retry_and_reconnect() {
+    TempDir temp;
+    Config value = config(temp);
+    Capabilities caps = capabilities();
+    caps.query_reconcile = true;
+    caps.trades_required_for_snapshot = false;
+    std::shared_ptr<ScriptedBackend> backend(new ScriptedBackend(caps));
+    std::weak_ptr<Engine> weak;
+    int queries = 0;
+    backend->query_hook = [&weak, &backend, &queries](const Scope& scope, std::uint64_t token) {
+        ++queries;
+        if (queries == 1) {
+            Error result; result.category = ErrorCategory::Temporary; result.message = "temporary query failure";
+            return result;
+        }
+        std::shared_ptr<Engine> engine = weak.lock();
+        if (!engine) {
+            Error result; result.category = ErrorCategory::Unknown; result.message = "engine disappeared";
+            return result;
+        }
+        Snapshot snapshot = snapshot_for(engine, token);
+        snapshot.scope = scope;
+        snapshot.all_day_orders = snapshot.all_day_trades = false;
+        backend->publish(snapshot);
+        return Error();
+    };
+    std::shared_ptr<Engine> engine = Engine::create(value, backend);
+    weak = engine;
+    require(engine->start_epoch(1), "automatic recovery epoch");
+    require(queries == 1 && !engine->account().ready, "initial automatic query failure closes gate");
+    engine->advance_to(value.limits.cancel_retry_ns);
+    require(queries == 2 && engine->account().ready, "automatic retry restores account");
+
+    require(engine->set_connected(engine->scope(), false), "disconnect recovery fixture");
+    require(!engine->account().ready, "disconnect closes account gate");
+    require(engine->set_connected(engine->scope(), true), "reconnect recovery fixture");
+    require(queries == 3 && engine->account().ready, "reconnect automatically re-queries account");
+}
+
+void test_query_activity_retries_automatically() {
+    TempDir temp;
+    Config value = config(temp);
+    Capabilities caps = capabilities();
+    caps.query_reconcile = true;
+    caps.trades_required_for_snapshot = false;
+    std::shared_ptr<ScriptedBackend> backend(new ScriptedBackend(caps));
+    std::weak_ptr<Engine> weak;
+    int queries = 0;
+    backend->query_hook = [&weak, &backend, &queries](const Scope& scope, std::uint64_t token) {
+        ++queries;
+        std::shared_ptr<Engine> engine = weak.lock();
+        if (!engine) {
+            Error result; result.category = ErrorCategory::Unknown; result.message = "engine disappeared";
+            return result;
+        }
+        if (queries == 1) {
+            Report report = order_report(engine, 123, kSze, Side::Buy,
+                                         OrderState::Accepted, 0, 100, "R1");
+            engine->report(report);
+        }
+        Snapshot snapshot = snapshot_for(engine, token);
+        snapshot.scope = scope;
+        snapshot.all_day_orders = snapshot.all_day_trades = false;
+        backend->publish(snapshot);
+        return Error();
+    };
+    std::shared_ptr<Engine> engine = Engine::create(value, backend);
+    weak = engine;
+    require(engine->start_epoch(1), "activity recovery epoch");
+    require(queries == 1 && !engine->account().ready,
+            "activity crossing query invalidates first snapshot");
+    engine->advance_to(value.limits.cancel_retry_ns);
+    require(queries == 2 && engine->account().ready,
+            "activity-invalidated query is retried automatically");
+}
+
+void test_query_token_epoch_and_day_boundaries() {
+    TempDir temp;
+    Config value = config(temp);
+    std::shared_ptr<ScriptedBackend> backend(new ScriptedBackend(capabilities()));
+    std::shared_ptr<Engine> engine = create(value, backend, 1);
+    require(engine->begin_reconcile(1, false), "boundary reconcile start");
+
+    Snapshot wrong_day = snapshot_for(engine, 1);
+    wrong_day.scope.day++;
+    backend->publish(wrong_day);
+    require(!engine->account().ready, "wrong trading day cannot install snapshot");
+
+    Snapshot wrong_token = snapshot_for(engine, 2);
+    backend->publish(wrong_token);
+    require(!engine->account().ready, "wrong query token cannot install snapshot");
+
+    Snapshot current = snapshot_for(engine, 1);
+    backend->publish(current);
+    require(engine->account().ready, "current epoch day and token install snapshot");
+    require(!engine->begin_reconcile(1, false), "query token cannot be reused");
 }
 
 void test_unknown_send_is_not_replayed() {
@@ -370,6 +498,10 @@ void test_live_journal_failure_blocks_new_risk_but_allows_owned_cancel() {
 int main() {
     try {
         test_durable_active_order_recovery();
+        test_broker_id_recovers_without_oms_snapshot_id();
+        test_automatic_query_retry_and_reconnect();
+        test_query_activity_retries_automatically();
+        test_query_token_epoch_and_day_boundaries();
         test_unknown_send_is_not_replayed();
         test_external_order_is_read_only_and_self_crosses();
         test_incomplete_query_and_overlapping_report_close_gate();

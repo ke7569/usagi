@@ -10,6 +10,8 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace {
 
@@ -21,6 +23,23 @@ void require(bool value, const std::string& message) {
 
 const Instrument kSze = {"SZE", "000001"};
 const Instrument kSse = {"SSE", "600000"};
+
+struct TempJournal {
+    std::string directory;
+    std::string path;
+    TempJournal() {
+        char value[] = "/tmp/usagi-oms-hot-path-XXXXXX";
+        char* created = ::mkdtemp(value);
+        require(created != 0, "mkdtemp");
+        directory = created;
+        path = directory + "/account.journal";
+    }
+    ~TempJournal() {
+        ::unlink(path.c_str());
+        ::unlink((directory + "/oms-7061706572-756e6974.lock").c_str());
+        ::rmdir(directory.c_str());
+    }
+};
 
 struct Fixture {
     Config config;
@@ -495,6 +514,7 @@ void test_async_log_saturation_preserves_cancel_and_reports() {
     std::condition_variable changed;
     bool entered = false, release = false;
     Fixture f([&](Config& config) {
+        config.durable_intent = false;
         config.audit_sink = [&](const std::string&) {
             std::unique_lock<std::mutex> lock(mutex);
             entered = true; changed.notify_all(); changed.wait(lock, [&]() { return release; });
@@ -504,6 +524,7 @@ void test_async_log_saturation_preserves_cancel_and_reports() {
         std::mutex& mutex; std::condition_variable& changed; bool& flag;
         ~Release() { std::lock_guard<std::mutex> lock(mutex); flag = true; changed.notify_all(); }
     } release_on_exit = {mutex, changed, release};
+    require(!f.config.durable_intent, "fixture exercises default asynchronous intent policy");
     {
         std::unique_lock<std::mutex> lock(mutex);
         require(changed.wait_for(lock, std::chrono::seconds(2), [&]() { return entered; }), "text worker entered");
@@ -523,6 +544,23 @@ void test_async_log_saturation_preserves_cancel_and_reports() {
     OrderView view;
     require(f.engine->order(order.id, &view) && view.terminal && !view.working,
             "reports still update account after async logging fails");
+}
+
+void test_durable_intent_override_waits_for_wal() {
+    TempJournal temp;
+    Fixture f([&](Config& config) {
+        config.ownership = OwnershipMode::ExclusiveLocal;
+        config.journal_path = temp.path;
+        config.lock_directory = temp.directory;
+        config.durable_intent = true;
+    });
+    const AccountView before = f.engine->account();
+    const SubmitResult submitted = f.submit(f.intent("cold", "durable-intent", kSze, Side::Buy, 100));
+    const AccountView after = f.engine->account();
+    require(submitted.accepted && after.durable_sequence > before.durable_sequence,
+            "durable_intent waits for the pre-send WAL barrier");
+    require(after.durable_sequence <= after.audit_sequence,
+            "durable watermark never exceeds accepted journal records");
 }
 
 }  // namespace
@@ -548,6 +586,7 @@ int main() {
         test_orphan_and_bounded_identity_storage();
         test_terminal_cannot_contradict_trade_first_quantity();
         test_async_log_saturation_preserves_cancel_and_reports();
+        test_durable_intent_override_waits_for_wal();
     } catch (const std::exception& error) {
         std::cerr << "oms_test: " << error.what() << std::endl;
         return EXIT_FAILURE;

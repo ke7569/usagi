@@ -105,6 +105,21 @@ ATP 仅以真实 `LastQty/ExecId/LastPx/CumQty` 生成成交事实；没有 Last
 
 构建 SDK 目标后，本机检查需让加载器找到授权 SDK，例如设置 `LD_LIBRARY_PATH=/home/usagi/adapters/td/atp/api/lib`；不复制或发布厂商文件。旧插件路径和导出名保留用于明确失败，不代表旧宿主仍能下单。
 
+### ATP Query Bridge Candidate
+
+The adapter now dispatches fund, share, order, and trade queries with OMS
+scope/token correlation and collects their normalized results into a snapshot.
+Query-all requests use the installed SDK's ReturnNum=0 form; an intermediate
+callback does not trigger another page request. Account identity, sides,
+duplicate rows, and late callbacks are checked. Query dispatch is serialized
+with transport close, and synchronous snapshot publication is supported.
+
+This bridge retains complete_snapshot=false and false all-day coverage flags.
+Query rows are external (id=0); an ATP batch number does not prove OMS ownership.
+Fee values do not imply final fee settlement. Own-order attribution, complete
+zero-position coverage, consistent query boundaries, and reconnect/day coverage
+must be established before certification and real-host integration.
+
 ## 验证与性能
 
 基线为迁移后的 `/home/usagi`，原有 34 个 CTest 全通过后开始 OMS；保存于 `/home/ref/usagi-oms-baseline-20260906-Egyu7w/source.tar.gz`，SHA-256 `af96a1bf377c84886e377f521bc7b7125ef1523d73e5ad224e5f19665e3832d6`。与基线逐目录比较确认 `common/{factors,model}` 和两市 `{factors,sampling,market_data}` 未变。

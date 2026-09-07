@@ -122,13 +122,14 @@ InstrumentRules rules() {
     r.max_order_notional = 1000000000000LL;
     return r;
 }
-Config config(std::size_t count, const std::string& journal) {
+Config config(std::size_t count, const std::string& journal, bool durable_intent) {
     Config c;
     c.scope.account.broker = "paper"; c.scope.account.account = "benchmark";
     c.scope.gateway = "benchmark"; c.scope.day = 20260904; c.scope.source = 1;
     c.instance = "oms-benchmark"; c.enabled = true;
     c.ownership = journal.empty() ? OwnershipMode::Simulation : OwnershipMode::ExclusiveLocal;
     c.journal_path = journal;
+    c.durable_intent = durable_intent;
     if (!journal.empty()) c.lock_directory = journal.substr(0, journal.find_last_of('/'));
     c.limits.max_orders = count + kWarmup;
     c.limits.max_pending = count + kWarmup;
@@ -253,6 +254,15 @@ struct Timings {
         }
         return value;
     }
+    Json segments(bool coarse) const {
+        Json value = {{"strategy_to_oms_submit_return", distribution(total)}};
+        if (coarse) {
+            value["oms_submit_to_backend_entry"] = distribution(pre);
+            value["backend_entry_to_return"] = distribution(backend);
+            value["backend_return_to_oms_submit_return"] = distribution(post);
+        }
+        return value;
+    }
 };
 
 Json state(Engine& engine, std::size_t expected) {
@@ -318,6 +328,9 @@ struct Details {
                     {"exclusive_ns", distribution(exclusive[i])}};
         return value;
     }
+    Json exclusive_metric(profile::Stage stage) const {
+        return distribution(exclusive[static_cast<std::size_t>(stage)]);
+    }
 };
 #endif
 
@@ -326,7 +339,7 @@ Json run_engine(const Options& options, bool durable, Measurement measurement, u
     const std::vector<Intent> input = intents(count);
     std::unique_ptr<TempJournal> journal;
     if (durable || options.audit_text) journal.reset(new TempJournal(options.journal_root));
-    Config settings = config(count, durable ? journal->path() : std::string());
+    Config settings = config(count, durable ? journal->path() : std::string(), durable);
     std::shared_ptr<std::ofstream> audit_output;
     std::atomic<std::uint64_t> audit_records(0), audit_bytes(0);
     if (options.audit_text) {
@@ -384,9 +397,19 @@ Json run_engine(const Options& options, bool durable, Measurement measurement, u
     observer.verify(input.size());
     Json output = {{"kind", "run"}, {"build", build_name()}, {"repetition", repetition},
         {"path", durable ? "durable" : "memory"}, {"measurement", measurement_name(measurement)},
+        {"intent_policy", settings.durable_intent ? "durable_intent" : "async_queue"},
+        {"producer_waits_for_journal", settings.durable_intent},
         {"count", count}, {"warmup", kWarmup}, {"cpu", ::sched_getcpu()},
         {"resident_kb", resident_kb()}, {"latency_ns", timings.json(timed != 0)},
         {"state", state(*engine, input.size())}};
+    output["latency_segments_ns"] = timings.segments(timed != 0);
+#ifdef USAGI_OMS_PROFILE
+    // JournalAppend is the producer-side enqueue scope. Its exclusive time
+    // excludes the nested JournalSync wait in durable-intent paths.
+    if (details && durable && measurement == Measurement::Detailed)
+        output["latency_segments_ns"]["async_journal_enqueue"] =
+            details->exclusive_metric(profile::Stage::JournalAppend);
+#endif
     if (durable) output["journal_root"] = options.journal_root;
     output["audit_text"] = options.audit_text;
     if (options.audit_text) {
@@ -445,7 +468,9 @@ Json metadata(const Options& options) {
         {"repetitions", options.repetitions}, {"journal_root", options.journal_root},
         {"focus", options.focus},
         {"audit_text", options.audit_text},
-        {"intent_construction_timed", false}, {"timing_overhead_subtracted", false}};
+        {"intent_construction_timed", false}, {"output_formatting_timed", false},
+        {"timing_overhead_subtracted", false},
+        {"async_journal_enqueue", "profiled detailed durable rows only"}};
 }
 }  // namespace
 

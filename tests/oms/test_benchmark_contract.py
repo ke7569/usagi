@@ -36,6 +36,7 @@ class BenchmarkContractTest(unittest.TestCase):
         self.assertEqual(16, rows[0]["orders"])
         self.assertEqual(2, rows[0]["durable_orders"])
         self.assertFalse(rows[0]["intent_construction_timed"])
+        self.assertFalse(rows[0]["output_formatting_timed"])
         self.assertFalse(rows[0]["timing_overhead_subtracted"])
         for row in runs:
             self.assertIn(row["path"], ("direct_paper", "memory", "durable"), row)
@@ -60,6 +61,25 @@ class BenchmarkContractTest(unittest.TestCase):
                                        latency["backend"]["mean"] +
                                        latency["post_backend"]["mean"],
                                        delta=0.01, msg=row)
+            if row["path"] != "direct_paper":
+                segments = row["latency_segments_ns"]
+                self.assertIn("strategy_to_oms_submit_return", segments, row)
+                for name, metric in segments.items():
+                    self.assertIsInstance(metric, dict, (name, row))
+                    for key in ("p50", "p95", "p99", "max", "mean"):
+                        self.assertGreaterEqual(metric[key], 0, row)
+                self.assertEqual(latency["total"], segments["strategy_to_oms_submit_return"], row)
+                if row["measurement"] in ("total", "focused"):
+                    self.assertEqual({"strategy_to_oms_submit_return"}, set(segments), row)
+                else:
+                    self.assertEqual({"strategy_to_oms_submit_return", "oms_submit_to_backend_entry",
+                                      "backend_entry_to_return", "backend_return_to_oms_submit_return"},
+                                     set(segments) - {"async_journal_enqueue"}, row)
+                    self.assertAlmostEqual(segments["strategy_to_oms_submit_return"]["mean"],
+                                           segments["oms_submit_to_backend_entry"]["mean"] +
+                                           segments["backend_entry_to_return"]["mean"] +
+                                           segments["backend_return_to_oms_submit_return"]["mean"],
+                                           delta=0.01, msg=row)
             if row["path"] != "direct_paper":
                 state = row["state"]
                 self.assertEqual(audit_text, row["audit_text"], row)
@@ -87,8 +107,10 @@ class BenchmarkContractTest(unittest.TestCase):
                                            stages["submit"]["inclusive_ns"]["mean"], delta=0.01, msg=row)
                     if row["path"] == "memory":
                         self.assertEqual(0, stages["journal_sync"]["calls"], row)
+                        self.assertNotIn("async_journal_enqueue", row["latency_segments_ns"], row)
                     else:
                         self.assertEqual(row["count"], stages["journal_sync"]["calls"], row)
+                        self.assertIn("async_journal_enqueue", row["latency_segments_ns"], row)
                 else:
                     self.assertNotIn("stages", row)
         return rows

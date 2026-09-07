@@ -136,6 +136,12 @@ public:
                                  int64_t request_id,
                                  const atp::quant_api::ATPRspErrorInfo& error_info,
                                  bool is_last);
+    void on_rsp_cash_trade_order_query(
+        int account_index,
+        const atp::quant_api::ATPRspCashTradeOrderQueryResultMsg& msg,
+        int64_t request_id,
+        const atp::quant_api::ATPRspErrorInfo& error_info,
+        bool is_last);
     void on_rsp_cash_security_info_query(int account_index,
                                          const atp::quant_api::ATPRspCashExtQueryResultSecurityInfoMsg& msg,
                                          int64_t request_id,
@@ -176,6 +182,45 @@ private:
         std::unordered_set<std::string> seen_instruments;
     };
 
+    enum OmsQueryKind { OmsQueryFund = 0, OmsQueryShare = 1,
+                        OmsQueryOrder = 2, OmsQueryTrade = 3,
+                        OmsQueryKindCount = 4 };
+
+    struct OmsQueryState
+    {
+        OmsQueryState(int account_index_value, const oms::Scope& scope_value,
+                      std::uint64_t token_value,
+                      const std::string& account_id_value,
+                      const std::string& cust_id_value,
+                      uint16_t market_id_value,
+                      const std::shared_ptr<oms::AtpBackend>& backend_value)
+            : account_index(account_index_value), scope(scope_value), token(token_value),
+              account_id(account_id_value), cust_id(cust_id_value), market_id(market_id_value),
+              backend(backend_value), assembler(scope_value, token_value) {
+            for (int i = 0; i < OmsQueryKindCount; ++i) {
+                done[i] = false;
+                success[i] = true;
+            }
+        }
+
+        int account_index;
+        oms::Scope scope;
+        std::uint64_t token;
+        std::string account_id;
+        std::string cust_id;
+        uint16_t market_id;
+        std::weak_ptr<oms::AtpBackend> backend;
+        oms::AtpSnapshotAssembler assembler;
+        bool done[OmsQueryKindCount];
+        bool success[OmsQueryKindCount];
+    };
+
+    struct OmsQueryRequest
+    {
+        std::shared_ptr<OmsQueryState> state;
+        OmsQueryKind kind = OmsQueryFund;
+    };
+
     struct LatencyCounter
     {
         uint64_t count = 0;
@@ -203,6 +248,10 @@ private:
     std::unordered_map<int64_t, PositionQueryContext> position_query_contexts_;
     std::mutex account_query_mutex_;
     std::unordered_set<int64_t> periodic_account_query_requests_;
+    std::mutex oms_query_mutex_;
+    std::unordered_map<int64_t, OmsQueryRequest> oms_query_requests_;
+    std::unordered_map<int64_t, int> oms_query_retired_requests_;
+    std::unordered_map<int, std::shared_ptr<OmsQueryState> > oms_queries_;
     std::atomic<bool> position_sync_running_{false};
     std::thread position_sync_thread_;
     std::mutex latency_mutex_;
@@ -279,6 +328,22 @@ private:
     void send_periodic_position_query(int account_index);
     bool is_periodic_account_query(int64_t request_id);
     bool consume_periodic_account_query(int64_t request_id);
+    bool is_known_oms_query_request(int64_t request_id, OmsQueryKind kind);
+    bool is_oms_query_part(int account_index, int64_t request_id, OmsQueryKind kind);
+    oms::Error start_oms_query(int account_index, const oms::Scope& scope, std::uint64_t token);
+    bool consume_oms_query_part(int account_index, int64_t request_id, OmsQueryKind kind,
+                                bool is_last, bool callback_ok,
+                                const std::function<bool(OmsQueryState&)>& append,
+                                oms::Snapshot* snapshot,
+                                std::shared_ptr<oms::AtpBackend>* backend);
+    void erase_oms_query(const std::shared_ptr<OmsQueryState>& state);
+    void abort_oms_query(int account_index);
+    bool valid_oms_query_identity(const OmsQueryState& state,
+                                  const char* fund_account_id,
+                                  const char* account_id,
+                                  const char* cust_id,
+                                  uint16_t market_id,
+                                  bool validate_market) const;
     void forward_periodic_position(const LFRspPositionField& pos, bool is_last, int request_id);
     LFRspPositionField make_zero_position(const AccountUnitGXBSE& unit,
                                           const PositionQueryContext& context) const;

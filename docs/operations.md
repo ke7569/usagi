@@ -32,3 +32,24 @@ cmake3 --build build/dev -- -j4
 源码已迁移至 `/home/usagi`，生产安装路径没有更改。旧插件在本地的构建、符号和依赖检查不替代券商联调或生产切换。详细生命周期约束见[市场运行入口 API](contracts/runtime-api.md)，配置锁和绑定见[统一配置工具](contracts/unified-config.md)。
 
 `deploy/sse/build_live_package.sh` 只打包旧 JSON 观察器，不是公共行情流的完整录制入口；它接受 `USAGI_BUILD_DIR` 和 `USAGI_PACKAGE_DIR`，默认 `build/dev`、`build/packages`。实盘与离线共用的完整录制使用 `t0_md_stream` 或市场 stream 入口。旧 SSE daily 脚本需要显式提供 `SSE_STATIC_METADATA_VALIDATOR`；该外部校验器未提供时，在生成输出前失败。旧宿主 runtime 包要求显式指定策略、TD、main、模型包和依赖包，不能自动选用历史日期的构建产物。
+
+## Shenzhen Model Verification
+
+The standalone Shenzhen model target uses the Eigen implementation. Keep
+`-DSZE_MARCH_NATIVE=ON` as an explicit target-host build choice; the model
+benchmark does not change the production model implementation.
+
+Provide `SZE_MODEL_FILE` and `SZE_MODEL_GOLDEN` as existing file paths at configure
+time to enable `mix153060_sequence_test`. The MIXGOLD2 fixture is an independent
+prediction reference; the test checks prediction tolerance, instrument-state
+interleaving, reset, and invalid input. Model and fixture files are not bundled.
+
+```bash
+cmake3 --build build/dev --target mix153060_sequence_test mix153060_model_benchmark -- -j2
+build/dev/mix153060_sequence_test /path/to/model.bin /path/to/full.golden.bin
+build/dev/mix153060_model_benchmark /path/to/model.bin /path/to/full.golden.bin 3
+```
+
+The benchmark reports prediction-only p50/p95/p99 in nanoseconds with warmup,
+loading, and output formatting outside the measured interval. It retains timer
+overhead and does not impose a timing threshold in CTest.

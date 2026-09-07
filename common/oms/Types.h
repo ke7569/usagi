@@ -76,6 +76,11 @@ struct Capabilities {
     bool native_fak = false;
     bool cancel_requires_broker_id = true;
     bool cancel_acknowledgements = true;
+    // The backend can collect a current account snapshot through query().
+    // This is separate from complete_snapshot: the latter certifies coverage
+    // of every optional history stream, while this flag only enables the
+    // Engine's automatic recovery state machine.
+    bool query_reconcile = false;
     bool complete_snapshot = false;
     bool absence_proves_unsent = false;
     bool trades_required_for_snapshot = true;
@@ -121,6 +126,9 @@ struct Config {
     // Optional export sink. Runs on a separate worker; throw on output failure.
     // Payload is a compact record (legacy JSON for cold events), not printable text.
     std::function<void(const std::string&)> audit_sink;
+    // Force the pre-send intent record to wait for durable storage. When false,
+    // OMS uses the bounded async journal unless backend recovery is uncertified.
+    bool durable_intent = false;
     std::string lock_directory;
     bool single_host_account = true;
     bool enabled = false;

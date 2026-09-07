@@ -156,6 +156,9 @@ struct Engine::Impl {
     Config config;
     Capabilities caps;
     std::shared_ptr<Backend> backend;
+    // A backend without complete snapshot recovery cannot safely rely on a
+    // queued intent after a crash; retain the pre-send barrier there.
+    bool durable_intent;
     std::unique_ptr<AccountLease> lease;
     AsyncJournal journal;
     mutable std::mutex mutex;
@@ -178,6 +181,8 @@ struct Engine::Impl {
     std::uint64_t audit_seq = 0, stale = 0, anomalies = 0, admissions = 0, rejections = 0;
     bool connected = false, reconciled = false, reconciling = false, stopping = false;
     bool replaying = false, recovered = false;
+    bool reconcile_retry_pending = false;
+    Time reconcile_retry_at = -1;
     bool have_header = false;
     std::string fault, reason = "connection and reconciliation required";
     Snapshot replay_snapshot;
@@ -185,11 +190,67 @@ struct Engine::Impl {
 
     Impl(const Config& value, const std::shared_ptr<Backend>& transport)
         : config(value), caps(transport->capabilities()), backend(transport),
+          durable_intent(value.durable_intent || !caps.complete_snapshot),
           journal(value.journal_path, 8192, value.audit_sink) {}
 
     bool ready() const {
         return config.enabled && connected && reconciled && !reconciling && !stopping &&
             fault.empty() && journal.healthy() && orphans.empty() && now >= new_not_before && cash >= reserved;
+    }
+    bool next_query_token(std::uint64_t* output) {
+        if (!output || last_token == std::numeric_limits<std::uint64_t>::max()) {
+            freeze("OMS reconciliation token exhausted");
+            return false;
+        }
+        *output = last_token + 1;
+        return true;
+    }
+    void schedule_reconcile_retry(const std::string& why, Time delay = 0) {
+        reconciled = false;
+        reconciling = false;
+        // No pre-reconnect dispatch may survive into a new account query. A
+        // pending cancel is represented by cancel_requested and is requeued
+        // after the authoritative snapshot is installed.
+        actions.clear();
+        for (auto& item : orders) {
+            item.second.cancel_queued = false;
+            item.second.cancel_waiting = false;
+        }
+        reason = why;
+        reconcile_retry_pending = true;
+        try {
+            reconcile_retry_at = delay > 0 ? later(now, delay) : now;
+        } catch (const std::exception& e) {
+            reconcile_retry_pending = false;
+            reconcile_retry_at = -1;
+            freeze(e.what());
+        }
+        note("reconcile-retry", 0, why);
+    }
+    bool begin_reconcile_locked(std::uint64_t requested_token, bool request_backend) {
+        if (!connected || stopping || !requested_token || requested_token <= last_token ||
+            (request_backend && actions.size() >= config.limits.max_actions)) return false;
+        reconciled = false;
+        reconciling = true;
+        token = last_token = requested_token;
+        reconcile_retry_pending = false;
+        reconcile_retry_at = -1;
+        snapshot_activity = activity;
+        reason = "account snapshot in progress";
+        if (!save("query", Json{{"token", token}})) {
+            schedule_reconcile_retry("query journal registration failed");
+            return false;
+        }
+        if (request_backend) actions.push_back(Impl::Action{Impl::Action::Query, 0, token});
+        return true;
+    }
+    bool trigger_reconcile_retry_locked() {
+        if (!caps.query_reconcile || !reconcile_retry_pending || reconciling || !connected || stopping ||
+            now < reconcile_retry_at)
+            return false;
+        std::uint64_t retry_token = 0;
+        if (!next_query_token(&retry_token)) return false;
+        return begin_reconcile_locked(retry_token, true);
     }
     void note(const std::string& type, OrderId id, const std::string& detail = std::string()) {
         OMS_PROFILE_SCOPE(profile_note, AuditNote);
@@ -436,46 +497,59 @@ Scope Engine::scope() const { std::lock_guard<std::mutex> guard(impl_->mutex); r
 Capabilities Engine::capabilities() const { return impl_->caps; }
 
 bool Engine::start_epoch(std::uint64_t epoch, bool connected) {
-    std::lock_guard<std::mutex> guard(impl_->mutex);
-    Impl& s = *impl_;
-    if (!epoch || epoch <= s.config.scope.epoch || s.stopping) return false;
-    s.save("epoch", Json{{"epoch", epoch}, {"connected", connected}}, true);
-    s.config.scope.epoch = epoch; s.connected = connected; s.reconciled = s.reconciling = false;
-    s.reason = "new epoch requires account reconciliation";
-    ++s.activity; s.broker_ids.clear(); s.timers.clear(); s.orphans.clear(); s.actions.clear();
-    for (auto& item : s.orders) {
-        Impl::Order& o = item.second;
-        o.cancel_queued = o.cancel_waiting = false; o.cancel_epoch_verified = false; o.deadline = -1;
-        if (!o.view.terminal) o.view.state = OrderState::Unknown;
+    bool auto_query = false;
+    {
+        std::lock_guard<std::mutex> guard(impl_->mutex);
+        Impl& s = *impl_;
+        if (!epoch || epoch <= s.config.scope.epoch || s.stopping) return false;
+        s.save("epoch", Json{{"epoch", epoch}, {"connected", connected}}, true);
+        s.config.scope.epoch = epoch; s.connected = connected; s.reconciled = s.reconciling = false;
+        s.reconcile_retry_pending = false; s.reconcile_retry_at = -1;
+        s.reason = "new epoch requires account reconciliation";
+        ++s.activity; s.broker_ids.clear(); s.timers.clear(); s.orphans.clear(); s.actions.clear();
+        for (auto& item : s.orders) {
+            Impl::Order& o = item.second;
+            o.cancel_queued = o.cancel_waiting = false; o.cancel_epoch_verified = false; o.deadline = -1;
+            if (!o.view.terminal) o.view.state = OrderState::Unknown;
+        }
+        if (connected && s.caps.query_reconcile) {
+            std::uint64_t token = 0;
+            auto_query = s.next_query_token(&token) && s.begin_reconcile_locked(token, true);
+        }
     }
+    if (auto_query) drain();
     return true;
 }
 
 bool Engine::set_connected(const Scope& scope, bool connected) {
-    std::lock_guard<std::mutex> guard(impl_->mutex);
-    Impl& s = *impl_;
-    if (!(scope == s.config.scope)) { ++s.stale; return false; }
-    s.save("connected", Json{{"connected", connected}});
-    s.connected = connected; ++s.activity;
-    if (!connected) { s.reconciled = s.reconciling = false; s.reason = "TD disconnected"; }
+    bool auto_query = false;
+    {
+        std::lock_guard<std::mutex> guard(impl_->mutex);
+        Impl& s = *impl_;
+        if (!(scope == s.config.scope)) { ++s.stale; return false; }
+        s.save("connected", Json{{"connected", connected}});
+        s.connected = connected; ++s.activity;
+        if (!connected) {
+            s.schedule_reconcile_retry("TD disconnected");
+        } else if (s.caps.query_reconcile && !s.reconciling && !s.reconciled) {
+            s.reconcile_retry_pending = true;
+            s.reconcile_retry_at = s.now;
+            auto_query = s.trigger_reconcile_retry_locked();
+        }
+    }
+    if (auto_query) drain();
     return true;
 }
 
 bool Engine::begin_reconcile(std::uint64_t token, bool request_backend) {
+    bool started = false;
     {
         std::lock_guard<std::mutex> guard(impl_->mutex);
         Impl& s = *impl_;
-        if (!s.caps.complete_snapshot) {
-            s.reason = "TD cannot certify complete account queries"; s.note("query-unsupported", 0, s.reason); return false;
-        }
-        if (!s.connected || s.stopping || !token || token <= s.last_token ||
-            (request_backend && s.actions.size() >= s.config.limits.max_actions)) return false;
-        s.reconciled = false; s.reconciling = true; s.token = s.last_token = token;
-        s.snapshot_activity = s.activity; s.reason = "account snapshot in progress";
-        s.save("query", Json{{"token", token}});
-        if (request_backend) s.actions.push_back(Impl::Action{Impl::Action::Query, 0, token});
+        started = s.begin_reconcile_locked(token, request_backend);
     }
-    drain(); return true;
+    if (started) drain();
+    return started;
 }
 
 SubmitResult Engine::submit(const Intent& intent, const std::function<bool()>& gate) {
@@ -548,8 +622,11 @@ SubmitResult Engine::submit(const Intent& intent, const std::function<bool()>& g
             order.view.working = intent.quantity; order.fee_cap = s.config.limits.fee_reserve_per_order; order.gate = gate;
             OMS_PROFILE_STOP(profile_construct);
             OMS_PROFILE_SCOPE(profile_intent, IntentAudit);
-            if (!s.save_bytes(s.journal.recording() ? records::intent(s.now, order.view.command) : std::string(), true)) {
-                reject(ErrorCategory::Persistence, "pre-send durable registration failed"); return result;
+            if (!s.save_bytes(s.journal.recording() ? records::intent(s.now, order.view.command) : std::string(),
+                              s.durable_intent)) {
+                reject(ErrorCategory::Persistence,
+                       s.durable_intent ? "pre-send durable registration failed" :
+                       "pre-send intent enqueue failed"); return result;
             }
             OMS_PROFILE_STOP(profile_intent);
             OrderView empty; s.apply_delta(order, empty, 0);
@@ -616,11 +693,13 @@ bool Engine::schedule_cancel(const std::string& owner, OrderId id, Time delay_ns
 }
 
 void Engine::advance_to(Time now_ns) {
+    bool auto_query = false;
     {
         std::lock_guard<std::mutex> guard(impl_->mutex);
         Impl& s = *impl_;
         if (now_ns < s.now || now_ns < 0) { s.freeze("OMS clock regressed"); return; }
         s.now = now_ns;
+        auto_query = s.trigger_reconcile_retry_locked();
         while (!s.orphans.empty() && s.orphans.front().expires <= s.now) {
             s.freeze("unmatched broker report expired", s.orphans.front().report.id); s.orphans.pop_front();
         }
@@ -640,6 +719,7 @@ void Engine::advance_to(Time now_ns) {
         }
     }
     impl_->backend->advance_to(now_ns); drain();
+    if (auto_query) drain();
 }
 
 void Engine::begin_stop() {
@@ -844,11 +924,21 @@ bool Engine::report(const Report& report) {
         ++s.activity;
         try {
             if (report.broker_id.size() > 128 || report.trade_id.size() > 128 ||
-                !instrument_ok(report.instrument)) {
+             !instrument_ok(report.instrument)) {
                 s.freeze("report metadata outside normalized contract", report.id); return false;
             }
             s.save_bytes(s.journal.recording() ? records::report(s.now, report) : std::string());
-            result = s.apply_report(report, true);
+            if (s.reconciling || s.reconcile_retry_pending) {
+                // A broker event crossing a snapshot boundary invalidates that
+                // snapshot.  Keep the event in the journal and let the next
+                // complete ATP query establish the new baseline.
+                s.schedule_reconcile_retry("account activity overlapped snapshot",
+                                           s.config.limits.cancel_retry_ns);
+                s.note("report-invalidated-query", report.id);
+                result = false;
+            } else {
+                result = s.apply_report(report, true);
+            }
         }
         catch (const std::exception& e) { s.freeze(e.what(), report.id); }
     }
@@ -888,7 +978,8 @@ void Engine::drain() {
             if (result.failed()) {
                 std::lock_guard<std::mutex> guard(s.mutex);
                 if (query_scope == s.config.scope && action.token == s.token) {
-                    s.reconciling = s.reconciled = false; s.reason = result.message;
+                    s.schedule_reconcile_retry(result.message.empty() ? "TD query failed" : result.message,
+                                                s.config.limits.cancel_retry_ns);
                     s.note("query-failed", 0, result.message);
                 }
             }
@@ -1031,10 +1122,26 @@ bool Engine::Impl::install_snapshot(const Snapshot& snapshot, bool persisted) {
             return reject("invalid snapshot order");
         OrderId id = row.id;
         auto own = new_orders.find(id);
-        const bool owned = own != new_orders.end() && own->second.view.owned;
+        bool matched_by_broker = false;
+        bool owned = own != new_orders.end() && own->second.view.owned;
+        if (!owned && !row.broker_id.empty()) {
+            // ATP query rows do not carry the OMS order id.  A broker id that
+            // was already observed and persisted is the only safe cross-boot
+            // association; tuple matching alone could claim a manual order.
+            for (auto candidate = new_orders.begin(); candidate != new_orders.end(); ++candidate) {
+                if (!candidate->second.view.owned ||
+                    candidate->second.view.command.broker_id != row.broker_id) continue;
+                if (matched_by_broker) return reject("snapshot broker ID maps to multiple OMS orders");
+                id = candidate->first;
+                own = candidate;
+                matched_by_broker = true;
+                owned = true;
+            }
+        }
         if (owned) {
             const Intent& intent = own->second.view.command.intent;
-            if (intent.owner != row.owner || !(intent.instrument == row.instrument) || intent.side != row.side ||
+            if ((!matched_by_broker && intent.owner != row.owner) ||
+                !(intent.instrument == row.instrument) || intent.side != row.side ||
                 intent.price != row.price || intent.quantity != row.original || row.filled < own->second.view.filled ||
                 (!own->second.view.command.broker_id.empty() && own->second.view.command.broker_id != row.broker_id) ||
                 !seen_owned.insert(id).second) return reject("snapshot cannot prove historical order ownership");
@@ -1149,10 +1256,20 @@ bool Engine::complete_snapshot(const Snapshot& snapshot) {
             ++s.stale; return false;
         }
         if (s.activity != s.snapshot_activity) {
-            s.reconciling = false; s.reconciled = false; s.reason = "account activity overlapped snapshot"; return false;
+            s.schedule_reconcile_retry("account activity overlapped snapshot",
+                                       s.config.limits.cancel_retry_ns);
+            return false;
         }
-        try { result = s.install_snapshot(snapshot, false); }
-        catch (const std::exception& e) { s.reconciling = false; s.freeze(e.what()); }
+        try {
+            result = s.install_snapshot(snapshot, false);
+            if (!result && s.connected && s.caps.query_reconcile)
+                s.schedule_reconcile_retry(s.reason.empty() ? "account snapshot rejected" : s.reason,
+                                           s.config.limits.cancel_retry_ns);
+        }
+        catch (const std::exception& e) {
+            s.schedule_reconcile_retry(e.what(), s.config.limits.cancel_retry_ns);
+            s.freeze(e.what());
+        }
     }
     drain(); return result;
 }
