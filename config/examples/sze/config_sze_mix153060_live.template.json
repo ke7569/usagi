@@ -1,0 +1,52 @@
+{
+  "strategy_name": "sze_mix153060_live",
+  "name": "ZStrategy",
+  "market": "SZ",
+  "sz_orderbook_mode": "hp-shadow",
+  "orderbook_mode": "hp-shadow",
+  "model_path": "/home/bse-t0/models/mix153060_sze_v04_a3_eff60.bin",
+  "mix153060_model_sha256": "ce5bf6378a45e9a90f1f00607cc1ced4c31a80b1d99ac0e58d28c2745f14ce6d",
+  "sze_startup_warmup_signals": 50,
+  "md_source_index": [],
+  "td_source_index": [],
+  "instrument_id": [
+    "002620",
+    "002366",
+    "002803",
+    "301509",
+    "000661"
+  ],
+  "his_amt": [],
+  "static_position": [0, 0, 0, 0, 0],
+  "last_position": [0, 0, 0, 0, 0],
+  "ins_params": {
+    "002620.SZ": {
+      "static_position": 0,
+      "last_position": 0
+    },
+    "002366.SZ": {
+      "static_position": 0,
+      "last_position": 0
+    },
+    "002803.SZ": {
+      "static_position": 0,
+      "last_position": 0
+    },
+    "301509.SZ": {
+      "static_position": 0,
+      "last_position": 0
+    },
+    "000661.SZ": {
+      "static_position": 0,
+      "last_position": 0
+    }
+  },
+  "global_params": {
+    "offset": 0.8,
+    "quote_offset": 5,
+    "bias_factor": 0.5,
+    "position_limit": 0.3,
+    "global_bias_factor": 1,
+    "position_base_line": 100000.0
+  }
+}

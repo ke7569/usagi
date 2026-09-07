@@ -1,0 +1,1752 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#include "adapters/deepwin/md/MDEngineSZE.h"
+
+#include <arpa/inet.h>
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <pthread.h>
+#include <sched.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cctype>
+#include <climits>
+#include <stdexcept>
+#include <sstream>
+#include <utility>
+
+#ifndef SO_BUSY_POLL
+#define SO_BUSY_POLL 46
+#endif
+
+#ifndef SO_RCVBUFFORCE
+#define SO_RCVBUFFORCE 33
+#endif
+
+extern "C" const char* sze_md_build_id()
+{
+    return "sze-md-20260724-protocol-v2";
+}
+
+WC_NAMESPACE_START
+
+namespace {
+
+const std::size_t kMaxPacketSize = 65536;
+const std::size_t kMaxRecordsPerPacket = kMaxPacketSize / sizeof(sze_md::SzeHpfOrder);
+const int kMaxBatch = 256;
+const short kSzeSourceId = 88;
+
+template <typename T>
+T json_value_or(const json& value, const char* key, const T& fallback)
+{
+    if (value.find(key) == value.end()) {
+        return fallback;
+    }
+    try {
+        return value[key].get<T>();
+    } catch (...) {
+        return fallback;
+    }
+}
+
+std::vector<std::string> json_string_vector_or(const json& value,
+                                               const char* key)
+{
+    std::vector<std::string> result;
+    if (value.find(key) == value.end() || !value[key].is_array()) {
+        return result;
+    }
+    for (const auto& item : value[key]) {
+        try {
+            result.push_back(item.get<std::string>());
+        } catch (...) {
+            // Invalid optional filter entries are ignored; the receiver still
+            // validates all wire records before publishing them.
+        }
+    }
+    return result;
+}
+
+bool valid_port(int value)
+{
+    return value > 0 && value <= 65535;
+}
+
+}  // namespace
+
+MDEngineSZE::MDEngineSZE() : IMDEngine(kSzeSourceId)
+{
+    logger = yijinjing::KfLog::getLogger("MdEngine.SZE");
+    std::unique_ptr<FilterState> initial(new FilterState());
+    const FilterState* initial_ptr = initial.get();
+    filter_versions_.push_back(std::move(initial));
+    filter_state_.store(initial_ptr, std::memory_order_release);
+}
+
+MDEngineSZE::~MDEngineSZE()
+{
+    release_api();
+}
+
+void MDEngineSZE::copy_channel_json(const json& source,
+                                    ChannelConfig* destination)
+{
+    destination->multicast_ip = json_value_or<std::string>(
+        source, "multicast_ip", json_value_or<std::string>(
+            source, "group", json_value_or<std::string>(
+                source, "multicast_group", destination->multicast_ip)));
+    destination->port = json_value_or<int>(source, "port", json_value_or<int>(
+        source, "multicast_port", destination->port));
+    destination->iface_ip = json_value_or<std::string>(
+        source, "iface_ip", json_value_or<std::string>(
+            source, "local_ip", destination->iface_ip));
+    destination->ifname = json_value_or<std::string>(
+        source, "ifname", json_value_or<std::string>(
+            source, "interface", destination->ifname));
+    destination->bind_ip = json_value_or<std::string>(
+        source, "bind_ip", destination->bind_ip);
+    destination->bind_port = json_value_or<int>(
+        source, "bind_port", destination->bind_port);
+    destination->cpu = json_value_or<int>(source, "cpu", destination->cpu);
+    destination->cpu = json_value_or<int>(source, "cpu_affinity", destination->cpu);
+    destination->rcvbuf_mb = json_value_or<int>(
+        source, "rcvbuf_mb", destination->rcvbuf_mb);
+    destination->busy_poll_us = json_value_or<int>(
+        source, "busy_poll_us", destination->busy_poll_us);
+    destination->realtime_prio = json_value_or<int>(
+        source, "realtime_prio", destination->realtime_prio);
+}
+
+void MDEngineSZE::load(const json& j_config)
+{
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    if (logged_in_ || running_.load(std::memory_order_acquire)) {
+        throw std::runtime_error("cannot reload sze md while receiver is running");
+    }
+    channels_.clear();
+
+    batch_size_ = json_value_or<int>(j_config, "batch", batch_size_);
+    batch_size_ = std::max(1, std::min(kMaxBatch, batch_size_));
+    use_subscribe_filter_ = json_value_or<bool>(
+        j_config, "use_subscribe_filter", use_subscribe_filter_);
+    use_subscribe_filter_ = json_value_or<bool>(
+        j_config, "symbol_filter", use_subscribe_filter_);
+
+    ChannelConfig defaults;
+    defaults.multicast_ip = json_value_or<std::string>(
+        j_config, "multicast_ip", json_value_or<std::string>(
+            j_config, "group", json_value_or<std::string>(
+                j_config, "multicast_group", std::string())));
+    defaults.port = json_value_or<int>(j_config, "port", json_value_or<int>(
+        j_config, "multicast_port", 0));
+    defaults.iface_ip = json_value_or<std::string>(
+        j_config, "iface_ip", json_value_or<std::string>(
+            j_config, "local_ip", ""));
+    defaults.ifname = json_value_or<std::string>(
+        j_config, "ifname", json_value_or<std::string>(
+            j_config, "interface", ""));
+    defaults.bind_ip = json_value_or<std::string>(
+        j_config, "bind_ip", "0.0.0.0");
+    defaults.bind_port = json_value_or<int>(j_config, "bind_port", 0);
+    defaults.cpu = json_value_or<int>(j_config, "cpu", -1);
+    defaults.cpu = json_value_or<int>(j_config, "cpu_affinity", defaults.cpu);
+    defaults.rcvbuf_mb = json_value_or<int>(j_config, "rcvbuf_mb", 64);
+    defaults.busy_poll_us = json_value_or<int>(j_config, "busy_poll_us", 0);
+    defaults.realtime_prio = json_value_or<int>(j_config, "realtime_prio", 0);
+
+    if (j_config.find("channels") != j_config.end() &&
+        j_config["channels"].is_array() && !j_config["channels"].empty()) {
+        for (const auto& item : j_config["channels"]) {
+            if (!item.is_object()) {
+                throw std::runtime_error("sze md channel must be an object");
+            }
+            ChannelConfig channel = defaults;
+            copy_channel_json(item, &channel);
+            channels_.push_back(channel);
+        }
+    } else {
+        channels_.push_back(defaults);
+    }
+
+    if (channels_.size() > 16U) {
+        throw std::runtime_error("sze md supports at most 16 channels");
+    }
+    for (const auto& channel : channels_) {
+        if (channel.multicast_ip.empty() || !valid_port(channel.port) ||
+            channel.bind_port < 0 || channel.bind_port > 65535 ||
+            channel.rcvbuf_mb < 1 || channel.rcvbuf_mb > 2048 ||
+            channel.busy_poll_us < 0 || channel.realtime_prio < 0 ||
+            channel.realtime_prio > 99) {
+            throw std::runtime_error(
+                "invalid sze md channel configuration: multicast_ip/port are required");
+        }
+    }
+    stats_.assign(channels_.size(), ChannelStats());
+
+    std::vector<std::string> configured_symbols =
+        json_string_vector_or(j_config, "symbols");
+    std::unique_ptr<FilterState> filter(new FilterState());
+    filter->enabled = use_subscribe_filter_;
+    filter->all = json_value_or<bool>(j_config, "subscribe_all", !use_subscribe_filter_);
+    for (const auto& symbol : configured_symbols) {
+        const std::string normalized = normalize_symbol(symbol);
+        if (!normalized.empty()) {
+            filter->symbols.insert(normalized);
+        }
+    }
+    if (!configured_symbols.empty()) {
+        filter->all = false;
+    }
+    const bool filter_enabled = filter->enabled;
+    const bool filter_all = filter->all;
+    {
+        std::lock_guard<std::mutex> subscription_lock(subscription_mutex_);
+        const FilterState* filter_ptr = filter.get();
+        filter_versions_.push_back(std::move(filter));
+        filter_state_.store(filter_ptr, std::memory_order_release);
+    }
+    load_recovery_config(j_config);
+
+    KF_LOG_INFO(logger, "[load] sze md config channels=" << channels_.size()
+        << " build_id=" << sze_md_build_id()
+        << " batch=" << batch_size_
+        << " symbol_filter=" << (filter_enabled ? 1 : 0)
+        << " subscribe_all=" << (filter_all ? 1 : 0)
+        << " recoverable=" << (recovery_config_.enabled ? 1 : 0)
+        << " receiver_backend=" << recovery_config_.backend
+        << " rcvbuf_mb=" << (channels_.empty() ? 0 : channels_[0].rcvbuf_mb));
+}
+
+void MDEngineSZE::load_recovery_config(const json& j_config)
+{
+    recovery_config_ = RecoveryConfig();
+    if (j_config.find("recoverable_pipeline") == j_config.end()) {
+        return;
+    }
+    const json& config = j_config["recoverable_pipeline"];
+    if (!config.is_object()) {
+        throw std::runtime_error("sze recoverable_pipeline must be an object");
+    }
+    recovery_config_.enabled = json_value_or<bool>(config, "enabled", false);
+    recovery_config_.backend = json_value_or<std::string>(
+        config, "backend", recovery_config_.backend);
+    recovery_config_.trading_day = json_value_or<std::uint32_t>(
+        config, "trading_day", 0U);
+    recovery_config_.journal_directory = json_value_or<std::string>(
+        config, "journal_directory", std::string());
+    recovery_config_.journal_prefix = json_value_or<std::string>(
+        config, "journal_prefix", recovery_config_.journal_prefix);
+    const std::uint64_t segment_mb = json_value_or<std::uint64_t>(
+        config, "journal_segment_mb", 1024U);
+    recovery_config_.journal_segment_bytes = json_value_or<std::uint64_t>(
+        config, "journal_segment_bytes", segment_mb * 1024ULL * 1024ULL);
+    recovery_config_.journal_max_payload_bytes = json_value_or<std::uint32_t>(
+        config, "journal_max_payload_bytes",
+        recovery_config_.journal_max_payload_bytes);
+    const std::uint64_t min_free_gb = json_value_or<std::uint64_t>(
+        config, "journal_min_free_gb_after_allocate", 80U);
+    recovery_config_.journal_min_free_bytes_after_allocate =
+        min_free_gb * 1024ULL * 1024ULL * 1024ULL;
+    recovery_config_.flush_interval_ms = json_value_or<int>(
+        config, "flush_interval_ms", recovery_config_.flush_interval_ms);
+    recovery_config_.flush_cpu = json_value_or<int>(
+        config, "flush_cpu", recovery_config_.flush_cpu);
+    recovery_config_.shm_path = json_value_or<std::string>(
+        config, "shm_path", std::string());
+    recovery_config_.shm_capacity = json_value_or<std::uint32_t>(
+        config, "shm_capacity", recovery_config_.shm_capacity);
+    recovery_config_.shm_max_payload_bytes = json_value_or<std::uint32_t>(
+        config, "shm_max_payload_bytes",
+        recovery_config_.shm_max_payload_bytes);
+    recovery_config_.replace_stale_shm = json_value_or<bool>(
+        config, "replace_stale_shm", recovery_config_.replace_stale_shm);
+    recovery_config_.unlink_shm_on_clean_shutdown = json_value_or<bool>(
+        config, "unlink_shm_on_clean_shutdown",
+        recovery_config_.unlink_shm_on_clean_shutdown);
+    recovery_config_.malformed_diagnostic_path = json_value_or<std::string>(
+        config, "malformed_diagnostic_path", std::string());
+    recovery_config_.malformed_diagnostic_max_records =
+        json_value_or<std::uint32_t>(
+            config, "malformed_diagnostic_max_records", 1000U);
+    recovery_config_.health_state_enabled = json_value_or<bool>(
+        config, "health_state_enabled", true);
+    recovery_config_.health_state_path = json_value_or<std::string>(
+        config, "health_state_path", std::string());
+    if (recovery_config_.health_state_path.empty() &&
+        !recovery_config_.shm_path.empty()) {
+        recovery_config_.health_state_path =
+            sze_health::capture_health_path(recovery_config_.shm_path);
+    }
+    if (config.find("direct_sharded_ring") != config.end()) {
+        throw std::runtime_error(
+            "direct_sharded_ring is experimental and unavailable in production sze_md");
+    }
+    if (!recovery_config_.enabled) {
+        return;
+    }
+    const bool socket_backend = recovery_config_.backend == "socket" ||
+        recovery_config_.backend == "recvmmsg";
+    const FilterState* filter = filter_state_.load(std::memory_order_acquire);
+    if (!socket_backend || channels_.size() != 1U ||
+        recovery_config_.trading_day < 20000101U ||
+        recovery_config_.trading_day > 99991231U ||
+        recovery_config_.journal_directory.empty() ||
+        recovery_config_.journal_prefix.empty() ||
+        recovery_config_.journal_segment_bytes < 8192U ||
+        recovery_config_.journal_max_payload_bytes < sizeof(sze_md::SzeHpfOrder) ||
+        recovery_config_.journal_max_payload_bytes > 65535U ||
+        recovery_config_.flush_interval_ms < 10 ||
+        recovery_config_.flush_interval_ms > 60000 ||
+        recovery_config_.shm_path.empty() || recovery_config_.shm_capacity < 2U ||
+        recovery_config_.shm_max_payload_bytes < sizeof(sze_md::SzeHpfOrder) ||
+        recovery_config_.shm_max_payload_bytes > 65535U ||
+        recovery_config_.malformed_diagnostic_max_records < 1U ||
+        recovery_config_.malformed_diagnostic_max_records > 65536U ||
+        (recovery_config_.health_state_enabled &&
+         recovery_config_.health_state_path.empty()) ||
+        !filter) {
+        throw std::runtime_error(
+            "invalid sze recoverable_pipeline configuration");
+    }
+    if (recovery_config_.malformed_diagnostic_path.empty()) {
+        std::ostringstream path;
+        path << recovery_config_.journal_directory << "/"
+             << recovery_config_.journal_prefix << "_"
+             << recovery_config_.trading_day << "_malformed.bin";
+        recovery_config_.malformed_diagnostic_path = path.str();
+    }
+    const std::string csv_suffix = ".csv";
+    if (recovery_config_.malformed_diagnostic_path.size() >= csv_suffix.size() &&
+        recovery_config_.malformed_diagnostic_path.compare(
+            recovery_config_.malformed_diagnostic_path.size() - csv_suffix.size(),
+            csv_suffix.size(), csv_suffix) == 0) {
+        recovery_config_.malformed_diagnostic_path.replace(
+            recovery_config_.malformed_diagnostic_path.size() - csv_suffix.size(),
+            csv_suffix.size(), ".bin");
+    }
+}
+
+bool MDEngineSZE::initialize_malformed_diagnostics()
+{
+    if (!recovery_config_.enabled) {
+        return true;
+    }
+    const std::size_t capacity =
+        recovery_config_.malformed_diagnostic_max_records;
+    const std::size_t mapping_size = sizeof(sze_md::DiagnosticFileHeader) +
+        capacity * sizeof(sze_md::DiagnosticRecord);
+    malformed_diagnostic_fd_ = ::open(
+        recovery_config_.malformed_diagnostic_path.c_str(),
+        O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (malformed_diagnostic_fd_ < 0) {
+        KF_LOG_ERROR(logger, "[recovery] cannot open SZE malformed diagnostic"
+            << " path=" << recovery_config_.malformed_diagnostic_path
+            << " errno=" << errno << " message=" << std::strerror(errno));
+        return false;
+    }
+    struct stat info;
+    if (::fstat(malformed_diagnostic_fd_, &info) != 0 || info.st_size < 0) {
+        KF_LOG_ERROR(logger, "[recovery] cannot stat SZE malformed diagnostic"
+            << " path=" << recovery_config_.malformed_diagnostic_path
+            << " errno=" << errno << " message=" << std::strerror(errno));
+        close_malformed_diagnostics();
+        return false;
+    }
+    const bool fresh = info.st_size == 0;
+    if (fresh && ::ftruncate(
+            malformed_diagnostic_fd_, static_cast<off_t>(mapping_size)) != 0) {
+        KF_LOG_ERROR(logger, "[recovery] cannot size SZE malformed diagnostic"
+            << " path=" << recovery_config_.malformed_diagnostic_path
+            << " errno=" << errno << " message=" << std::strerror(errno));
+        close_malformed_diagnostics();
+        return false;
+    }
+    if (!fresh && static_cast<std::uint64_t>(info.st_size) != mapping_size) {
+        KF_LOG_ERROR(logger, "[recovery] incompatible SZE malformed diagnostic size"
+            << " path=" << recovery_config_.malformed_diagnostic_path
+            << " actual=" << info.st_size << " expected=" << mapping_size);
+        close_malformed_diagnostics();
+        return false;
+    }
+
+    void* mapping = ::mmap(0, mapping_size, PROT_READ | PROT_WRITE,
+                           MAP_SHARED, malformed_diagnostic_fd_, 0);
+    if (mapping == MAP_FAILED) {
+        KF_LOG_ERROR(logger, "[recovery] cannot mmap SZE malformed diagnostic"
+            << " path=" << recovery_config_.malformed_diagnostic_path
+            << " errno=" << errno << " message=" << std::strerror(errno));
+        close_malformed_diagnostics();
+        return false;
+    }
+    malformed_diagnostic_mapping_ = mapping;
+    malformed_diagnostic_mapping_size_ = mapping_size;
+    malformed_diagnostic_header_ =
+        static_cast<sze_md::DiagnosticFileHeader*>(mapping);
+    malformed_diagnostic_records_ = reinterpret_cast<sze_md::DiagnosticRecord*>(
+        static_cast<unsigned char*>(mapping) +
+        sizeof(sze_md::DiagnosticFileHeader));
+
+    if (fresh) {
+        std::memset(mapping, 0, mapping_size);
+        malformed_diagnostic_header_->magic = sze_md::kDiagnosticFileMagic;
+        malformed_diagnostic_header_->version = sze_md::kDiagnosticFileVersion;
+        malformed_diagnostic_header_->header_size =
+            sizeof(sze_md::DiagnosticFileHeader);
+        malformed_diagnostic_header_->record_size =
+            sizeof(sze_md::DiagnosticRecord);
+        malformed_diagnostic_header_->capacity = capacity;
+        malformed_diagnostic_header_->created_realtime_ns =
+            sze_recovery::realtime_ns();
+        malformed_diagnostic_header_->trading_day =
+            recovery_config_.trading_day;
+        malformed_diagnostic_header_->source_id =
+            static_cast<std::uint16_t>(kSzeSourceId);
+        std::strncpy(malformed_diagnostic_header_->build_id, sze_md_build_id(),
+                     sizeof(malformed_diagnostic_header_->build_id) - 1U);
+        if (::msync(mapping, sizeof(sze_md::DiagnosticFileHeader), MS_SYNC) != 0 ||
+            ::fdatasync(malformed_diagnostic_fd_) != 0) {
+            KF_LOG_ERROR(logger, "[recovery] cannot initialize SZE diagnostic header"
+                << " path=" << recovery_config_.malformed_diagnostic_path
+                << " errno=" << errno << " message=" << std::strerror(errno));
+            close_malformed_diagnostics();
+            return false;
+        }
+    } else if (malformed_diagnostic_header_->magic !=
+                   sze_md::kDiagnosticFileMagic ||
+               malformed_diagnostic_header_->version !=
+                   sze_md::kDiagnosticFileVersion ||
+               malformed_diagnostic_header_->header_size !=
+                   sizeof(sze_md::DiagnosticFileHeader) ||
+               malformed_diagnostic_header_->record_size !=
+                   sizeof(sze_md::DiagnosticRecord) ||
+               malformed_diagnostic_header_->capacity != capacity ||
+               malformed_diagnostic_header_->trading_day !=
+                   recovery_config_.trading_day ||
+               malformed_diagnostic_header_->source_id !=
+                   static_cast<std::uint16_t>(kSzeSourceId)) {
+        KF_LOG_ERROR(logger, "[recovery] incompatible SZE diagnostic header"
+            << " path=" << recovery_config_.malformed_diagnostic_path);
+        close_malformed_diagnostics();
+        return false;
+    }
+
+    std::uint64_t committed = __atomic_load_n(
+        &malformed_diagnostic_header_->committed_records, __ATOMIC_ACQUIRE);
+    if (committed > capacity) {
+        committed = capacity;
+    }
+    std::uint64_t valid = 0U;
+    while (valid < committed &&
+           __atomic_load_n(&malformed_diagnostic_records_[valid].commit,
+                           __ATOMIC_ACQUIRE) ==
+               sze_md::kDiagnosticRecordCommit) {
+        ++valid;
+    }
+    if (valid != committed) {
+        __atomic_store_n(&malformed_diagnostic_header_->committed_records,
+                         valid, __ATOMIC_RELEASE);
+    }
+    malformed_diagnostic_next_record_.store(valid, std::memory_order_release);
+    return true;
+}
+
+void MDEngineSZE::close_malformed_diagnostics()
+{
+    if (malformed_diagnostic_mapping_ != 0) {
+        (void)::msync(malformed_diagnostic_mapping_,
+                      malformed_diagnostic_mapping_size_, MS_SYNC);
+    }
+    if (malformed_diagnostic_fd_ >= 0) {
+        (void)::fdatasync(malformed_diagnostic_fd_);
+    }
+    if (malformed_diagnostic_mapping_ != 0) {
+        (void)::munmap(malformed_diagnostic_mapping_,
+                       malformed_diagnostic_mapping_size_);
+    }
+    if (malformed_diagnostic_fd_ >= 0) {
+        ::close(malformed_diagnostic_fd_);
+    }
+    malformed_diagnostic_fd_ = -1;
+    malformed_diagnostic_mapping_ = 0;
+    malformed_diagnostic_mapping_size_ = 0U;
+    malformed_diagnostic_header_ = 0;
+    malformed_diagnostic_records_ = 0;
+    malformed_diagnostic_next_record_.store(0U, std::memory_order_release);
+    malformed_diagnostic_dirty_.store(false, std::memory_order_release);
+}
+
+void MDEngineSZE::flush_malformed_diagnostics()
+{
+    if (!malformed_diagnostic_dirty_.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (malformed_diagnostic_fd_ < 0 || malformed_diagnostic_mapping_ == 0 ||
+        !malformed_diagnostic_dirty_.load(std::memory_order_relaxed)) {
+        return;
+    }
+    if (::msync(malformed_diagnostic_mapping_,
+                malformed_diagnostic_mapping_size_, MS_ASYNC) != 0 ||
+        ::fdatasync(malformed_diagnostic_fd_) != 0) {
+        recovery_stats_.flush_errors.fetch_add(1U, std::memory_order_relaxed);
+        KF_LOG_ERROR(logger, "[recovery] failed to flush SZE malformed diagnostic"
+            << " path=" << recovery_config_.malformed_diagnostic_path
+            << " errno=" << errno << " message=" << std::strerror(errno));
+        return;
+    }
+    malformed_diagnostic_dirty_.store(false, std::memory_order_release);
+}
+
+void MDEngineSZE::record_wire_diagnostic(
+    std::size_t channel_index,
+    std::uint64_t packet_number,
+    std::uint64_t receive_mono_ns,
+    std::size_t record_offset,
+    const unsigned char* record,
+    std::size_t record_length,
+    std::size_t datagram_length,
+    sze_md::DecodeStatus status,
+    sze_md::DecodeFailureReason reason,
+    bool invalidating)
+{
+    if (!recovery_config_.enabled || record == 0 || record_length == 0U) {
+        return;
+    }
+
+    const std::uint64_t index = malformed_diagnostic_next_record_.fetch_add(
+        1U, std::memory_order_acq_rel);
+    if (malformed_diagnostic_header_ == 0 ||
+        malformed_diagnostic_records_ == 0 ||
+        index >= recovery_config_.malformed_diagnostic_max_records) {
+        const std::uint64_t dropped =
+            recovery_stats_.malformed_diagnostic_dropped.fetch_add(
+                1U, std::memory_order_relaxed) + 1U;
+        if (malformed_diagnostic_header_ != 0) {
+            __atomic_store_n(&malformed_diagnostic_header_->dropped_records,
+                             dropped, __ATOMIC_RELEASE);
+        }
+        return;
+    }
+
+    sze_md::DiagnosticRecord diagnostic;
+    std::memset(&diagnostic, 0, sizeof(diagnostic));
+    diagnostic.diagnostic_realtime_ns = sze_recovery::realtime_ns();
+    diagnostic.receive_mono_ns = receive_mono_ns;
+    diagnostic.packet_number = packet_number;
+    diagnostic.channel_index = static_cast<std::uint32_t>(channel_index);
+    diagnostic.record_offset = static_cast<std::uint32_t>(record_offset);
+    diagnostic.record_length = static_cast<std::uint32_t>(record_length);
+    diagnostic.datagram_length = static_cast<std::uint32_t>(datagram_length);
+    diagnostic.decode_status = static_cast<std::uint8_t>(status);
+    diagnostic.failure_reason = static_cast<std::uint8_t>(reason);
+    diagnostic.message_type = 255U;
+    if (!invalidating) {
+        diagnostic.flags |= sze_md::kDiagnosticNonInvalidating;
+    }
+    if (record_length >= 9U) {
+        diagnostic.message_type = record[8];
+    }
+    if (record_length >= sizeof(std::uint32_t)) {
+        std::uint32_t raw_sequence = 0U;
+        std::memcpy(&raw_sequence, record, sizeof(raw_sequence));
+        diagnostic.feed_sequence = raw_sequence;
+    }
+    if (record_length >= sizeof(sze_md::SzeHpfHead)) {
+        sze_md::SzeHpfHead head;
+        std::memcpy(&head, record, sizeof(head));
+        diagnostic.feed_sequence = head.sequence;
+        diagnostic.channel_number = head.channel_num;
+        diagnostic.channel_sequence = head.sequence_num;
+        diagnostic.exchange_time = head.quote_update_time;
+    }
+    const std::size_t captured = std::min(
+        record_length, static_cast<std::size_t>(sze_md::kDiagnosticPayloadBytes));
+    diagnostic.captured_length = static_cast<std::uint16_t>(captured);
+    if (captured < record_length) {
+        diagnostic.flags |= sze_md::kDiagnosticPayloadTruncated;
+    }
+    std::memcpy(diagnostic.payload, record, captured);
+
+    sze_md::DiagnosticRecord* destination =
+        &malformed_diagnostic_records_[index];
+    std::memcpy(destination, &diagnostic,
+                offsetof(sze_md::DiagnosticRecord, commit));
+    __atomic_store_n(&destination->commit, sze_md::kDiagnosticRecordCommit,
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&malformed_diagnostic_header_->committed_records,
+                     index + 1U, __ATOMIC_RELEASE);
+    recovery_stats_.malformed_diagnostic_records.fetch_add(
+        1U, std::memory_order_relaxed);
+    malformed_diagnostic_dirty_.store(true, std::memory_order_release);
+}
+
+void MDEngineSZE::connect(long timeout_nsec)
+{
+    (void)timeout_nsec;
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    connected_ = !channels_.empty();
+}
+
+void MDEngineSZE::login(long timeout_nsec)
+{
+    (void)timeout_nsec;
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    if (logged_in_) {
+        return;
+    }
+    if (!connected_) {
+        connected_ = !channels_.empty();
+    }
+    if (!connected_) {
+        KF_LOG_ERROR(logger, "[login] no SZE MD channels configured");
+        return;
+    }
+
+    sockets_.clear();
+    sockets_.reserve(channels_.size());
+    for (std::size_t index = 0; index < channels_.size(); ++index) {
+        const ChannelConfig& channel = channels_[index];
+        const int fd = open_socket(channel);
+        if (fd < 0) {
+            const int socket_error = errno;
+            KF_LOG_ERROR(logger, "[login] failed to open SZE multicast socket"
+                << " channel=" << index
+                << " group=" << channel.multicast_ip
+                << " port=" << channel.port
+                << " ifname=" << channel.ifname
+                << " iface_ip=" << channel.iface_ip
+                << " errno=" << socket_error
+                << " message=" << std::strerror(socket_error));
+            close_sockets();
+            connected_ = false;
+            return;
+        }
+        sockets_.push_back(fd);
+    }
+
+    if (!initialize_recovery()) {
+        KF_LOG_ERROR(logger, "[login] failed to initialize SZE recoverable pipeline");
+        close_sockets();
+        connected_ = false;
+        return;
+    }
+
+    running_.store(true, std::memory_order_release);
+    workers_.clear();
+    workers_.reserve(sockets_.size());
+    for (std::size_t index = 0; index < sockets_.size(); ++index) {
+        workers_.push_back(std::thread(&MDEngineSZE::worker_loop, this, index));
+    }
+    logged_in_ = true;
+    KF_LOG_INFO(logger, "[login] SZE tick receiver started channels=" << workers_.size());
+}
+
+void MDEngineSZE::logout()
+{
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    running_.store(false, std::memory_order_release);
+    for (const int fd : sockets_) {
+        if (fd >= 0) {
+            ::shutdown(fd, SHUT_RDWR);
+        }
+    }
+    for (auto& worker : workers_) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+    workers_.clear();
+    close_sockets();
+    if (logged_in_) {
+        log_stats(true);
+    }
+    shutdown_recovery(true);
+    logged_in_ = false;
+    connected_ = false;
+}
+
+void MDEngineSZE::release_api()
+{
+    logout();
+}
+
+void MDEngineSZE::subscribeMarketData(const std::vector<std::string>& instruments,
+                                      const std::vector<std::string>& markets)
+{
+    (void)markets;
+    update_filter(instruments);
+}
+
+void MDEngineSZE::subscribeL2MD(const std::vector<std::string>& instruments,
+                                const std::vector<std::string>& markets)
+{
+    (void)markets;
+    update_filter(instruments);
+}
+
+void MDEngineSZE::subscribeOrderTrade(const std::vector<std::string>& instruments,
+                                      const std::vector<std::string>& markets)
+{
+    (void)markets;
+    update_filter(instruments);
+}
+
+void MDEngineSZE::update_filter(const std::vector<std::string>& instruments)
+{
+    std::lock_guard<std::mutex> lock(subscription_mutex_);
+    const FilterState* old_state = filter_state_.load(std::memory_order_acquire);
+    std::unique_ptr<FilterState> next(new FilterState());
+    if (old_state) {
+        *next = *old_state;
+    }
+    next->enabled = use_subscribe_filter_;
+    if (instruments.empty()) {
+        next->all = true;
+        next->symbols.clear();
+    } else {
+        // Deepwin may deliver subscriptions in several calls (for example one
+        // call per strategy shard). Keep the existing set and add the new
+        // instruments, matching the other native MD engines.
+        for (const auto& instrument : instruments) {
+            const std::string normalized = normalize_symbol(instrument);
+            if (!normalized.empty()) {
+                next->symbols.insert(normalized);
+                sub(normalized);
+            }
+            sub(instrument);
+        }
+    }
+    const FilterState* next_ptr = next.get();
+    filter_versions_.push_back(std::move(next));
+    filter_state_.store(next_ptr, std::memory_order_release);
+}
+
+bool MDEngineSZE::should_forward(const char* symbol) const
+{
+    const FilterState* state = filter_state_.load(std::memory_order_acquire);
+    if (!state || !state->enabled || state->all) {
+        return true;
+    }
+    const std::string normalized = normalize_symbol(symbol);
+    return !normalized.empty() && state->symbols.find(normalized) != state->symbols.end();
+}
+
+bool MDEngineSZE::replace_stale_ring(const std::string& path)
+{
+    struct stat info;
+    if (::stat(path.c_str(), &info) != 0) {
+        return errno == ENOENT;
+    }
+    sze_recovery::ShmEventRing existing;
+    if (existing.attach(path)) {
+        const sze_recovery::ShmRingHeader* header = existing.header();
+        const pid_t producer = header
+            ? static_cast<pid_t>(header->producer_pid) : static_cast<pid_t>(0);
+        if (producer > 0 && (::kill(producer, 0) == 0 || errno == EPERM)) {
+            return false;
+        }
+        existing.close();
+    }
+    return ::unlink(path.c_str()) == 0 || errno == ENOENT;
+}
+
+bool MDEngineSZE::unlink_owned_generation(const std::string& path,
+                                          std::uint64_t generation)
+{
+    if (path.empty() || generation == 0U) {
+        return false;
+    }
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return errno == ENOENT;
+    }
+    std::uint64_t current = 0U;
+    const ssize_t bytes = ::pread(fd, &current, sizeof(current), 8);
+    ::close(fd);
+    if (bytes != static_cast<ssize_t>(sizeof(current)) || current != generation) {
+        return false;
+    }
+    return ::unlink(path.c_str()) == 0 || errno == ENOENT;
+}
+
+bool MDEngineSZE::initialize_recovery()
+{
+    recovery_stats_.continuity_records.store(0U, std::memory_order_relaxed);
+    recovery_stats_.duplicates.store(0U, std::memory_order_relaxed);
+    recovery_stats_.missing_records.store(0U, std::memory_order_relaxed);
+    recovery_stats_.regressions.store(0U, std::memory_order_relaxed);
+    recovery_stats_.malformed_records.store(0U, std::memory_order_relaxed);
+    recovery_stats_.journal_events.store(0U, std::memory_order_relaxed);
+    recovery_stats_.journal_errors.store(0U, std::memory_order_relaxed);
+    recovery_stats_.ring_events.store(0U, std::memory_order_relaxed);
+    recovery_stats_.ring_errors.store(0U, std::memory_order_relaxed);
+    recovery_stats_.flush_errors.store(0U, std::memory_order_relaxed);
+    recovery_stats_.invalid_transitions.store(0U, std::memory_order_relaxed);
+    recovery_stats_.control_records.store(0U, std::memory_order_relaxed);
+    recovery_stats_.unknown_control_records.store(0U, std::memory_order_relaxed);
+    recovery_stats_.malformed_diagnostic_records.store(
+        0U, std::memory_order_relaxed);
+    recovery_stats_.malformed_diagnostic_dropped.store(
+        0U, std::memory_order_relaxed);
+    recovery_forced_invalid_.store(false, std::memory_order_release);
+    recovery_journal_degraded_.store(false, std::memory_order_release);
+    recovery_ring_last_event_id_.store(0U, std::memory_order_release);
+    recovery_invalid_reason_.store(
+        static_cast<int>(sze_recovery::kInvalidNone), std::memory_order_release);
+    recovery_latest_feed_sequence_.store(0U, std::memory_order_release);
+    if (!recovery_config_.enabled) {
+        return true;
+    }
+
+    struct stat ring_info;
+    if (::stat(recovery_config_.shm_path.c_str(), &ring_info) == 0) {
+        if (!recovery_config_.replace_stale_shm ||
+            !replace_stale_ring(recovery_config_.shm_path)) {
+            KF_LOG_ERROR(logger, "[recovery] SZE shm ring already has a live producer"
+                << " path=" << recovery_config_.shm_path);
+            return false;
+        }
+    }
+
+    std::unique_ptr<sze_recovery::JournalWriter> journal(
+        new sze_recovery::JournalWriter());
+    sze_recovery::JournalConfig journal_config;
+    journal_config.directory = recovery_config_.journal_directory;
+    journal_config.prefix = recovery_config_.journal_prefix;
+    journal_config.trading_day = recovery_config_.trading_day;
+    journal_config.source_id = static_cast<std::uint32_t>(kSzeSourceId);
+    journal_config.segment_bytes = recovery_config_.journal_segment_bytes;
+    journal_config.max_payload_bytes = recovery_config_.journal_max_payload_bytes;
+    journal_config.min_free_bytes_after_allocate =
+        recovery_config_.journal_min_free_bytes_after_allocate;
+    const sze_recovery::JournalOpenResult opened = journal->open(journal_config);
+    if (opened.status != sze_recovery::kJournalOk) {
+        KF_LOG_ERROR(logger, "[recovery] failed to open SZE journal"
+            << " status=" << static_cast<int>(opened.status)
+            << " directory=" << recovery_config_.journal_directory);
+        return false;
+    }
+
+    continuity_trackers_.clear();
+    continuity_trackers_.resize(channels_.size());
+    sze_recovery::ContinuityState initial_state = opened.continuity_state;
+    sze_recovery::InvalidReason initial_reason = opened.invalid_reason;
+    if (opened.unclean_restart || opened.corrupt_tail) {
+        initial_state = sze_recovery::kContinuityInvalid;
+        initial_reason = opened.corrupt_tail
+            ? sze_recovery::kInvalidJournalCorruption
+            : sze_recovery::kInvalidUncleanRestart;
+    }
+    if (opened.last_feed_sequence == 0U &&
+        initial_state != sze_recovery::kContinuityInvalid) {
+        continuity_trackers_[0].reset(recovery_config_.trading_day);
+        initial_state = sze_recovery::kContinuityInitializing;
+        initial_reason = sze_recovery::kInvalidNone;
+    } else {
+        continuity_trackers_[0].restore(recovery_config_.trading_day,
+                                        opened.last_feed_sequence,
+                                        initial_state, initial_reason);
+    }
+    if (initial_state == sze_recovery::kContinuityInvalid) {
+        recovery_forced_invalid_.store(true, std::memory_order_release);
+        recovery_invalid_reason_.store(
+            static_cast<int>(initial_reason), std::memory_order_release);
+        recovery_stats_.invalid_transitions.fetch_add(1U, std::memory_order_relaxed);
+    }
+    recovery_latest_feed_sequence_.store(
+        opened.last_feed_sequence, std::memory_order_release);
+    recovery_ring_last_event_id_.store(
+        opened.last_event_id, std::memory_order_release);
+
+    std::unique_ptr<sze_recovery::ShmEventRing> ring(
+        new sze_recovery::ShmEventRing());
+    sze_recovery::RingConfig ring_config;
+    ring_config.path = recovery_config_.shm_path;
+    ring_config.trading_day = recovery_config_.trading_day;
+    ring_config.source_id = static_cast<std::uint32_t>(kSzeSourceId);
+    ring_config.capacity = recovery_config_.shm_capacity;
+    ring_config.max_payload_bytes = recovery_config_.shm_max_payload_bytes;
+    ring_config.generation = journal->generation();
+    if (!ring->create(ring_config)) {
+        KF_LOG_ERROR(logger, "[recovery] failed to create SZE shm ring"
+            << " path=" << recovery_config_.shm_path);
+        journal->close(true);
+        (void)::unlink(recovery_config_.shm_path.c_str());
+        if (recovery_config_.health_state_enabled) {
+            (void)::unlink(recovery_config_.health_state_path.c_str());
+        }
+        continuity_trackers_.clear();
+        return false;
+    }
+
+    recovery_journal_ = std::move(journal);
+    recovery_ring_ = std::move(ring);
+    if (recovery_config_.health_state_enabled) {
+        std::unique_ptr<sze_health::CaptureHealthWriter> health(
+            new sze_health::CaptureHealthWriter());
+        if (!health->create(recovery_config_.health_state_path,
+                            recovery_config_.trading_day,
+                            static_cast<std::uint32_t>(kSzeSourceId),
+                            recovery_ring_->generation(),
+                            recovery_config_.replace_stale_shm)) {
+            KF_LOG_ERROR(logger, "[recovery] failed to create capture health page"
+                << " path=" << recovery_config_.health_state_path);
+            reset_recovery_resources(true, true);
+            (void)::unlink(recovery_config_.health_state_path.c_str());
+            return false;
+        }
+        recovery_health_ = std::move(health);
+        recovery_health_->publish_feed(
+            initial_state == sze_recovery::kContinuityInvalid
+                ? sze_health::kHealthFailed : sze_health::kHealthHealthy,
+            initial_reason,
+            initial_state == sze_recovery::kContinuityInvalid
+                ? sze_health::kScopeGlobalFeed : sze_health::kScopeNone,
+            0U, opened.last_event_id, opened.last_feed_sequence);
+        recovery_health_->publish_journal(
+            sze_health::kHealthHealthy, 0U, 0U);
+        recovery_health_->publish_ring(sze_health::kHealthHealthy, 0U, 0U);
+    }
+    if (!initialize_malformed_diagnostics()) {
+        reset_recovery_resources(true, true);
+        return false;
+    }
+    recovery_journal_->publish_continuity(
+        initial_state, initial_reason, opened.last_feed_sequence);
+    recovery_ring_->publish_state(
+        initial_state, sze_recovery::kReadinessNotReady,
+        initial_reason, opened.last_event_id, opened.last_feed_sequence);
+    recovery_ring_->set_journal_degraded(false);
+
+    recovery_flush_running_.store(true, std::memory_order_release);
+    try {
+        recovery_flush_worker_ = std::thread(
+            &MDEngineSZE::recovery_flush_loop, this);
+    } catch (...) {
+        recovery_flush_running_.store(false, std::memory_order_release);
+        reset_recovery_resources(true, true);
+        return false;
+    }
+    KF_LOG_INFO(logger, "[recovery] SZE recoverable pipeline initialized"
+        << " trading_day=" << recovery_config_.trading_day
+        << " existing=" << (opened.existing ? 1 : 0)
+        << " unclean_restart=" << (opened.unclean_restart ? 1 : 0)
+        << " corrupt_tail=" << (opened.corrupt_tail ? 1 : 0)
+        << " last_event_id=" << opened.last_event_id
+        << " last_feed_sequence=" << opened.last_feed_sequence
+        << " continuity=" << static_cast<int>(initial_state)
+        << " journal=" << recovery_config_.journal_directory
+        << " shm=" << recovery_config_.shm_path);
+    return true;
+}
+
+void MDEngineSZE::reset_recovery_resources(bool clean_shutdown, bool remove_ipc)
+{
+    const std::uint64_t ring_generation = recovery_ring_
+        ? recovery_ring_->generation() : 0U;
+    const std::uint64_t health_generation = recovery_health_ &&
+        recovery_health_->page() ? recovery_health_->page()->generation : 0U;
+    close_malformed_diagnostics();
+    if (recovery_health_) {
+        if (clean_shutdown) {
+            recovery_health_->heartbeat();
+        }
+        recovery_health_->close();
+        recovery_health_.reset();
+    }
+    if (recovery_ring_) {
+        recovery_ring_->close();
+        recovery_ring_.reset();
+    }
+    if (recovery_journal_) {
+        if (recovery_journal_->close(clean_shutdown) != sze_recovery::kJournalOk) {
+            recovery_stats_.flush_errors.fetch_add(1U, std::memory_order_relaxed);
+        }
+        recovery_journal_.reset();
+    }
+    if (remove_ipc && recovery_config_.enabled) {
+        (void)unlink_owned_generation(recovery_config_.shm_path, ring_generation);
+        (void)unlink_owned_generation(recovery_config_.health_state_path,
+                                      health_generation);
+    }
+    continuity_trackers_.clear();
+}
+
+void MDEngineSZE::shutdown_recovery(bool clean_shutdown)
+{
+    recovery_flush_running_.store(false, std::memory_order_release);
+    if (recovery_flush_worker_.joinable()) {
+        recovery_flush_worker_.join();
+    }
+    if (recovery_ring_) {
+        const sze_recovery::ContinuityState state =
+            recovery_forced_invalid_.load(std::memory_order_acquire)
+                ? sze_recovery::kContinuityInvalid
+                : (continuity_trackers_.empty()
+                    ? sze_recovery::kContinuityInitializing
+                    : continuity_trackers_[0].state());
+        const sze_recovery::InvalidReason reason =
+            static_cast<sze_recovery::InvalidReason>(
+                recovery_invalid_reason_.load(std::memory_order_acquire));
+        const std::uint64_t feed_sequence =
+            recovery_latest_feed_sequence_.load(std::memory_order_acquire);
+        recovery_ring_->publish_state(
+            state, sze_recovery::kReadinessNotReady,
+            reason, recovery_journal_ ? recovery_journal_->last_event_id() : 0U,
+            feed_sequence);
+        publish_recovery_metrics();
+    }
+    reset_recovery_resources(
+        clean_shutdown,
+        clean_shutdown && recovery_config_.unlink_shm_on_clean_shutdown);
+}
+
+void MDEngineSZE::recovery_flush_loop()
+{
+    set_cpu_affinity(recovery_config_.flush_cpu);
+    struct timespec delay;
+    delay.tv_sec = recovery_config_.flush_interval_ms / 1000;
+    delay.tv_nsec = static_cast<long>(
+        recovery_config_.flush_interval_ms % 1000) * 1000000L;
+    while (recovery_flush_running_.load(std::memory_order_acquire)) {
+        struct timespec remaining = delay;
+        while (::nanosleep(&remaining, &remaining) != 0 && errno == EINTR &&
+               recovery_flush_running_.load(std::memory_order_acquire)) {
+        }
+        if (!recovery_flush_running_.load(std::memory_order_acquire)) {
+            break;
+        }
+        if (recovery_journal_ &&
+            recovery_journal_->flush(false) != sze_recovery::kJournalOk) {
+            recovery_stats_.flush_errors.fetch_add(1U, std::memory_order_relaxed);
+            mark_journal_degraded("flush", static_cast<int>(
+                sze_recovery::kJournalIoError));
+        }
+        flush_malformed_diagnostics();
+        publish_recovery_metrics();
+    }
+}
+
+void MDEngineSZE::mark_recovery_invalid(sze_recovery::InvalidReason reason,
+                                        std::uint64_t feed_sequence)
+{
+    bool expected = false;
+    if (recovery_forced_invalid_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        recovery_invalid_reason_.store(static_cast<int>(reason),
+                                       std::memory_order_release);
+        recovery_stats_.invalid_transitions.fetch_add(1U, std::memory_order_relaxed);
+    }
+    const sze_recovery::InvalidReason sticky_reason =
+        static_cast<sze_recovery::InvalidReason>(
+            recovery_invalid_reason_.load(std::memory_order_acquire));
+    if (recovery_journal_) {
+        (void)recovery_journal_->publish_continuity(
+            sze_recovery::kContinuityInvalid, sticky_reason, feed_sequence);
+    }
+    if (recovery_ring_) {
+        recovery_ring_->publish_state(
+            sze_recovery::kContinuityInvalid, sze_recovery::kReadinessNotReady,
+            sticky_reason, recovery_ring_->latest_event_id(),
+            feed_sequence);
+    }
+    if (recovery_health_) {
+        recovery_health_->publish_feed(
+            sze_health::kHealthFailed, sticky_reason,
+            sze_health::kScopeGlobalFeed, 0U,
+            recovery_ring_ ? recovery_ring_->latest_event_id() : 0U,
+            feed_sequence);
+    }
+}
+
+void MDEngineSZE::mark_journal_degraded(const char* operation, int status)
+{
+    bool expected = false;
+    if (recovery_journal_degraded_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        recovery_stats_.journal_errors.fetch_add(1U, std::memory_order_relaxed);
+        KF_LOG_ERROR(logger, "[recovery] journal degraded; keeping SHM live"
+            << " operation=" << (operation ? operation : "unknown")
+            << " status=" << status
+            << " segment=" << (recovery_journal_
+                ? recovery_journal_->segment_index() : 0U));
+    }
+    if (recovery_ring_) {
+        recovery_ring_->set_journal_degraded(true);
+    }
+    if (recovery_health_) {
+        recovery_health_->publish_journal(
+            sze_health::kHealthDegraded, static_cast<std::uint32_t>(status),
+            recovery_stats_.journal_errors.load(std::memory_order_relaxed));
+    }
+}
+
+bool MDEngineSZE::observe_recovery_sequence(std::size_t index,
+                                            std::uint32_t raw_sequence,
+                                            std::uint16_t channel_number,
+                                            std::uint64_t channel_sequence,
+                                            std::uint64_t receive_mono_ns,
+                                            std::uint64_t* expanded_sequence,
+                                            bool* duplicate)
+{
+    if (!recovery_config_.enabled || index >= continuity_trackers_.size() ||
+        expanded_sequence == 0 || duplicate == 0) {
+        return false;
+    }
+    sze_recovery::FeedSequenceTracker& tracker = continuity_trackers_[index];
+    if (recovery_forced_invalid_.load(std::memory_order_acquire)) {
+        tracker.invalidate(static_cast<sze_recovery::InvalidReason>(
+            recovery_invalid_reason_.load(std::memory_order_acquire)));
+    }
+    const sze_recovery::SequenceResult result = tracker.observe(raw_sequence);
+    const std::uint64_t continuity_count =
+        recovery_stats_.continuity_records.fetch_add(
+            1U, std::memory_order_relaxed) + 1U;
+    *expanded_sequence = result.sequence;
+    recovery_latest_feed_sequence_.store(result.sequence, std::memory_order_release);
+    *duplicate = result.status == sze_recovery::kSequenceDuplicate;
+    if (*duplicate) {
+        recovery_stats_.duplicates.fetch_add(1U, std::memory_order_relaxed);
+    } else if (result.status == sze_recovery::kSequenceGap) {
+        recovery_stats_.missing_records.fetch_add(
+            result.missing, std::memory_order_relaxed);
+        KF_LOG_INFO(logger, "[recovery] feed sequence gap"
+            << " channel=" << index
+            << " expected=" << result.expected
+            << " actual=" << result.sequence
+            << " missing=" << result.missing
+            << " receive_mono_ns=" << receive_mono_ns
+            << " channel_number=" << channel_number
+            << " channel_sequence=" << channel_sequence
+            << " first_affected_event_id="
+            << (recovery_journal_ ? recovery_journal_->last_event_id() + 1U : 0U));
+        mark_recovery_invalid(sze_recovery::kInvalidForwardGap, result.sequence);
+    } else if (result.status == sze_recovery::kSequenceRegression) {
+        recovery_stats_.regressions.fetch_add(1U, std::memory_order_relaxed);
+        mark_recovery_invalid(sze_recovery::kInvalidRegression, result.sequence);
+    }
+
+    const bool forced_invalid =
+        recovery_forced_invalid_.load(std::memory_order_acquire);
+    const sze_recovery::ContinuityState state = forced_invalid
+        ? sze_recovery::kContinuityInvalid : tracker.state();
+    const sze_recovery::InvalidReason reason = forced_invalid
+        ? static_cast<sze_recovery::InvalidReason>(
+            recovery_invalid_reason_.load(std::memory_order_acquire))
+        : tracker.invalid_reason();
+    if (recovery_journal_ && recovery_journal_->publish_continuity(
+            state, reason, result.sequence) != sze_recovery::kJournalOk) {
+        mark_journal_degraded("publish_continuity", static_cast<int>(
+            sze_recovery::kJournalIoError));
+    }
+    if (recovery_ring_) {
+        recovery_ring_->publish_continuity(
+            state, reason,
+            recovery_journal_ ? recovery_journal_->last_event_id() : 0U,
+            result.sequence);
+    }
+    if ((continuity_count & 4095U) == 0U) {
+        publish_recovery_metrics();
+    }
+    return true;
+}
+
+bool MDEngineSZE::publish_recovery_event(DecodedEvent* event)
+{
+    if (!recovery_config_.enabled || !event || !recovery_journal_ ||
+        !recovery_ring_ || !event->raw_record || event->raw_length == 0U) {
+        return !recovery_config_.enabled;
+    }
+    event->canonical.payload_size = static_cast<std::uint16_t>(event->raw_length);
+    if (!recovery_journal_degraded_.load(std::memory_order_acquire)) {
+        const sze_recovery::JournalStatus journal_status =
+            recovery_journal_->append(&event->canonical, event->raw_record);
+        if (journal_status != sze_recovery::kJournalOk) {
+            mark_journal_degraded("append", static_cast<int>(journal_status));
+        } else {
+            recovery_stats_.journal_events.fetch_add(1U,
+                std::memory_order_relaxed);
+            recovery_ring_last_event_id_.store(
+                event->canonical.event_id, std::memory_order_release);
+        }
+    }
+    if (recovery_journal_degraded_.load(std::memory_order_acquire)) {
+        event->canonical.event_id =
+            recovery_ring_last_event_id_.fetch_add(1U, std::memory_order_acq_rel) + 1U;
+    }
+    if (!recovery_ring_->publish(event->canonical, event->raw_record)) {
+        recovery_stats_.ring_errors.fetch_add(1U, std::memory_order_relaxed);
+        mark_recovery_invalid(sze_recovery::kInvalidRingOverrun,
+                              event->canonical.feed_sequence);
+        return false;
+    }
+    recovery_stats_.ring_events.fetch_add(1U, std::memory_order_relaxed);
+    return true;
+}
+
+void MDEngineSZE::publish_recovery_metrics()
+{
+    if (!recovery_ring_) {
+        return;
+    }
+    recovery_ring_->publish_capture_metrics(
+        recovery_stats_.continuity_records.load(std::memory_order_relaxed),
+        recovery_stats_.journal_events.load(std::memory_order_relaxed),
+        recovery_stats_.duplicates.load(std::memory_order_relaxed),
+        recovery_stats_.missing_records.load(std::memory_order_relaxed),
+        recovery_stats_.malformed_records.load(std::memory_order_relaxed));
+    recovery_ring_->publish_storage_metrics(
+        recovery_stats_.journal_events.load(std::memory_order_relaxed),
+        recovery_stats_.journal_errors.load(std::memory_order_relaxed),
+        recovery_journal_ ? recovery_journal_->flush_count() : 0U,
+        recovery_journal_ ? recovery_journal_->published_offset() : 0U,
+        recovery_journal_ ? recovery_journal_->flushed_offset() : 0U);
+    if (recovery_health_) {
+        const bool feed_invalid =
+            recovery_forced_invalid_.load(std::memory_order_acquire);
+        const sze_recovery::InvalidReason reason =
+            static_cast<sze_recovery::InvalidReason>(
+                recovery_invalid_reason_.load(std::memory_order_acquire));
+        recovery_health_->publish_feed(
+            feed_invalid ? sze_health::kHealthFailed : sze_health::kHealthHealthy,
+            reason, feed_invalid ? sze_health::kScopeGlobalFeed
+                                 : sze_health::kScopeNone,
+            0U, recovery_ring_->latest_event_id(),
+            recovery_latest_feed_sequence_.load(std::memory_order_acquire));
+        recovery_health_->publish_journal(
+            recovery_journal_degraded_.load(std::memory_order_acquire)
+                ? sze_health::kHealthDegraded : sze_health::kHealthHealthy,
+            0U, recovery_stats_.journal_errors.load(std::memory_order_relaxed));
+        recovery_health_->publish_ring(
+            recovery_stats_.ring_errors.load(std::memory_order_relaxed) == 0U
+                ? sze_health::kHealthHealthy : sze_health::kHealthDegraded,
+            0U, recovery_stats_.ring_errors.load(std::memory_order_relaxed));
+        recovery_health_->heartbeat();
+    }
+}
+
+void MDEngineSZE::worker_loop(std::size_t index)
+{
+    if (index >= sockets_.size()) {
+        return;
+    }
+    const ChannelConfig& channel = channels_[index];
+    set_cpu_affinity(channel.cpu);
+    set_realtime_priority(channel.realtime_prio);
+
+    const int fd = sockets_[index];
+    const int batch = std::max(1, std::min(kMaxBatch, batch_size_));
+    std::vector<mmsghdr> messages(static_cast<std::size_t>(batch));
+    std::vector<iovec> iovecs(static_cast<std::size_t>(batch));
+    std::vector<unsigned char> packet_storage(
+        static_cast<std::size_t>(batch) * kMaxPacketSize);
+    std::vector<DecodedEvent> decoded;
+    decoded.reserve(kMaxRecordsPerPacket);
+    ChannelStats& channel_stats = stats_[index];
+
+    for (int i = 0; i < batch; ++i) {
+        std::memset(&messages[static_cast<std::size_t>(i)], 0, sizeof(mmsghdr));
+        iovecs[static_cast<std::size_t>(i)].iov_base =
+            packet_storage.data() + static_cast<std::size_t>(i) * kMaxPacketSize;
+        iovecs[static_cast<std::size_t>(i)].iov_len = kMaxPacketSize;
+        messages[static_cast<std::size_t>(i)].msg_hdr.msg_iov =
+            &iovecs[static_cast<std::size_t>(i)];
+        messages[static_cast<std::size_t>(i)].msg_hdr.msg_iovlen = 1;
+    }
+
+    while (running_.load(std::memory_order_acquire)) {
+        const int received = recvmmsg(fd, messages.data(), static_cast<unsigned int>(batch),
+                                      MSG_WAITFORONE | MSG_DONTWAIT, 0);
+        if (received < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                pollfd wait_fd;
+                wait_fd.fd = fd;
+                wait_fd.events = POLLIN;
+                wait_fd.revents = 0;
+                (void)::poll(&wait_fd, 1, 10);
+                continue;
+            }
+            if (!running_.load(std::memory_order_acquire) || errno == EBADF || errno == EINVAL) {
+                break;
+            }
+            ++channel_stats.recv_errors;
+            continue;
+        }
+        for (int message_index = 0; message_index < received; ++message_index) {
+            const std::size_t length = messages[static_cast<std::size_t>(message_index)].msg_len;
+            const unsigned char* packet = packet_storage.data() +
+                static_cast<std::size_t>(message_index) * kMaxPacketSize;
+            const std::uint64_t receive_mono_ns =
+                sze_recovery::monotonic_time_ns();
+            ++channel_stats.packets;
+            channel_stats.bytes += length;
+
+            decoded.clear();
+            bool packet_valid = true;
+            std::size_t record_offset = 0U;
+            while (record_offset < length) {
+                const std::size_t remaining = length - record_offset;
+                const unsigned char* record = packet + record_offset;
+                if (remaining < 9U) {
+                    ++channel_stats.malformed;
+                    record_wire_diagnostic(
+                        index, channel_stats.packets, receive_mono_ns,
+                        record_offset, record, remaining, length,
+                        sze_md::DecodeStatus::kMalformed,
+                        sze_md::DecodeFailureReason::kInvalidLength, true);
+                    if (recovery_config_.enabled) {
+                        recovery_stats_.malformed_records.fetch_add(
+                            1U, std::memory_order_relaxed);
+                        mark_recovery_invalid(
+                            sze_recovery::kInvalidMalformedRecord,
+                            recovery_latest_feed_sequence_.load(
+                                std::memory_order_acquire));
+                    }
+                    packet_valid = false;
+                    break;
+                }
+
+                const std::uint8_t message_type = record[8];
+                std::size_t record_size =
+                    sze_md::wire_record_size(message_type);
+                if (record_size == 0U) {
+                    if (remaining == sizeof(sze_md::SzeHpfHeartbeat)) {
+                        sze_md::DecodeFailureReason failure =
+                            sze_md::DecodeFailureReason::kNone;
+                        const sze_md::DecodeStatus status = sze_md::decode_record(
+                            record, remaining, 0, 0, &failure);
+                        std::uint32_t raw_sequence = 0U;
+                        std::memcpy(&raw_sequence, record, sizeof(raw_sequence));
+                        std::uint64_t expanded_sequence = raw_sequence;
+                        bool duplicate = false;
+                        if (recovery_config_.enabled) {
+                            (void)observe_recovery_sequence(
+                                index, raw_sequence, 0U, 0U, receive_mono_ns,
+                                &expanded_sequence, &duplicate);
+                            recovery_stats_.unknown_control_records.fetch_add(
+                                1U, std::memory_order_relaxed);
+                        }
+                        ++channel_stats.unknown;
+                        ++channel_stats.unknown_controls;
+                        record_wire_diagnostic(
+                            index, channel_stats.packets, receive_mono_ns,
+                            record_offset, record, remaining, length,
+                            status, failure, false);
+                        record_offset += remaining;
+                        continue;
+                    }
+
+                    // Tick datagrams are 72-byte records. Retain the old
+                    // framing only as an invalidating fallback so a new type
+                    // cannot hide later, recognizable records in the packet.
+                    if (remaining >= sze_md::kOrderRecordSize &&
+                        remaining % sze_md::kOrderRecordSize == 0U) {
+                        record_size = sze_md::kOrderRecordSize;
+                    } else {
+                        ++channel_stats.unknown;
+                        record_wire_diagnostic(
+                            index, channel_stats.packets, receive_mono_ns,
+                            record_offset, record, remaining, length,
+                            sze_md::DecodeStatus::kUnknown,
+                            sze_md::DecodeFailureReason::kUnsupportedMessageType,
+                            true);
+                        if (recovery_config_.enabled) {
+                            recovery_stats_.malformed_records.fetch_add(
+                                1U, std::memory_order_relaxed);
+                            mark_recovery_invalid(
+                                sze_recovery::kInvalidMalformedRecord,
+                                recovery_latest_feed_sequence_.load(
+                                    std::memory_order_acquire));
+                        }
+                        packet_valid = false;
+                        break;
+                    }
+                }
+                if (record_size > remaining) {
+                    ++channel_stats.malformed;
+                    record_wire_diagnostic(
+                        index, channel_stats.packets, receive_mono_ns,
+                        record_offset, record, remaining, length,
+                        sze_md::DecodeStatus::kMalformed,
+                        sze_md::DecodeFailureReason::kInvalidLength, true);
+                    if (recovery_config_.enabled) {
+                        recovery_stats_.malformed_records.fetch_add(
+                            1U, std::memory_order_relaxed);
+                        mark_recovery_invalid(
+                            sze_recovery::kInvalidMalformedRecord,
+                            recovery_latest_feed_sequence_.load(
+                                std::memory_order_acquire));
+                    }
+                    packet_valid = false;
+                    break;
+                }
+
+                DecodedEvent event;
+                sze_md::DecodeFailureReason failure =
+                    sze_md::DecodeFailureReason::kNone;
+                const sze_md::DecodeStatus status = sze_md::decode_record(
+                    record, record_size, &event.order, &event.trade,
+                    &failure);
+                std::uint32_t raw_sequence = 0U;
+                std::memcpy(&raw_sequence, record, sizeof(raw_sequence));
+                std::uint64_t expanded_sequence = raw_sequence;
+                bool duplicate = false;
+                if (recovery_config_.enabled) {
+                    sze_md::SzeHpfHead head;
+                    std::memset(&head, 0, sizeof(head));
+                    if (record_size >= sizeof(head)) {
+                        std::memcpy(&head, record, sizeof(head));
+                    }
+                    (void)observe_recovery_sequence(
+                        index, raw_sequence, head.channel_num, head.sequence_num,
+                        receive_mono_ns, &expanded_sequence, &duplicate);
+                }
+                if (status == sze_md::DecodeStatus::kOrder) {
+                    if (!duplicate) {
+                        event.type = sze_md::kOrderMessage;
+                        event.raw_record = record;
+                        event.raw_length = record_size;
+                    }
+                } else if (status == sze_md::DecodeStatus::kExecution) {
+                    if (!duplicate) {
+                        event.type = sze_md::kExecutionMessage;
+                        event.raw_record = record;
+                        event.raw_length = record_size;
+                    }
+                } else if (status == sze_md::DecodeStatus::kHeartbeat) {
+                    ++channel_stats.heartbeats;
+                    if (recovery_config_.enabled) {
+                        recovery_stats_.control_records.fetch_add(
+                            1U, std::memory_order_relaxed);
+                    }
+                } else if (status == sze_md::DecodeStatus::kKnownNonTarget) {
+                    ++channel_stats.known_non_target;
+                    if (recovery_config_.enabled) {
+                        recovery_stats_.control_records.fetch_add(
+                            1U, std::memory_order_relaxed);
+                    }
+                } else {
+                    if (status == sze_md::DecodeStatus::kUnknown) {
+                        ++channel_stats.unknown;
+                    } else {
+                        ++channel_stats.malformed;
+                    }
+                    record_wire_diagnostic(
+                        index, channel_stats.packets, receive_mono_ns,
+                        record_offset, record, record_size, length,
+                        status, failure, true);
+                    if (recovery_config_.enabled) {
+                        recovery_stats_.malformed_records.fetch_add(
+                            1U, std::memory_order_relaxed);
+                        mark_recovery_invalid(
+                            sze_recovery::kInvalidMalformedRecord,
+                            expanded_sequence);
+                    }
+                    // Keep scanning this datagram. A malformed record makes
+                    // the day invalid, but must not hide valid records before
+                    // or after it from continuity diagnostics and journaling.
+                    packet_valid = false;
+                }
+                if (!duplicate &&
+                    (status == sze_md::DecodeStatus::kOrder ||
+                     status == sze_md::DecodeStatus::kExecution)) {
+                    sze_md::SzeHpfHead head;
+                    std::memcpy(&head, record, sizeof(head));
+                    event.canonical.feed_sequence = expanded_sequence;
+                    event.canonical.channel_sequence = head.sequence_num;
+                    event.canonical.receive_mono_ns = receive_mono_ns;
+                    event.canonical.exchange_time = head.quote_update_time;
+                    event.canonical.trading_day = recovery_config_.enabled
+                        ? recovery_config_.trading_day : 0U;
+                    event.canonical.source_id =
+                        static_cast<std::uint16_t>(kSzeSourceId);
+                    event.canonical.channel_number = head.channel_num;
+                    event.canonical.payload_size = static_cast<std::uint16_t>(
+                        record_size);
+                    event.canonical.message_type = head.message_type;
+                    event.canonical.record_kind = sze_recovery::kRecordMarketData;
+                    event.symbol_id = sze_health::parse_symbol_id(
+                        reinterpret_cast<const char*>(head.symbol));
+                    if (recovery_config_.enabled &&
+                        head.quote_update_time / 1000000000ULL !=
+                        recovery_config_.trading_day) {
+                        mark_recovery_invalid(
+                            sze_recovery::kInvalidTradingDayMismatch,
+                            expanded_sequence);
+                    }
+                    decoded.push_back(event);
+                }
+                record_offset += record_size;
+            }
+            if (!packet_valid && !recovery_config_.enabled) {
+                // Preserve the pre-recovery callback contract for the legacy
+                // direct path; only the recoverable capture path retains
+                // valid records surrounding a rejected wire record.
+                continue;
+            }
+            for (auto& event : decoded) {
+                if (event.type == sze_md::kOrderMessage) {
+                    if (!should_forward(event.order.InstrumentID)) {
+                        ++channel_stats.filtered;
+                        continue;
+                    }
+                    if (recovery_config_.enabled) {
+                        (void)publish_recovery_event(&event);
+                    }
+                    ++channel_stats.orders;
+                    on_market_data(&event.order);
+                } else {
+                    if (!should_forward(event.trade.InstrumentID)) {
+                        ++channel_stats.filtered;
+                        continue;
+                    }
+                    if (recovery_config_.enabled) {
+                        (void)publish_recovery_event(&event);
+                    }
+                    ++channel_stats.executions;
+                    on_market_data(&event.trade);
+                }
+            }
+        }
+
+    }
+    if (recovery_config_.enabled &&
+        running_.load(std::memory_order_acquire)) {
+        mark_recovery_invalid(
+            sze_recovery::kInvalidReceiverStopped,
+            recovery_latest_feed_sequence_.load(std::memory_order_acquire));
+    }
+}
+
+int MDEngineSZE::open_socket(const ChannelConfig& config) const
+{
+    const int fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    int one = 1;
+    (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#ifdef SO_REUSEPORT
+    (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+#endif
+    if (!config.ifname.empty()) {
+        if (::setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, config.ifname.c_str(),
+                         config.ifname.size() + 1) != 0) {
+            ::close(fd);
+            return -1;
+        }
+    }
+    const long long requested_receive_bytes =
+        static_cast<long long>(config.rcvbuf_mb) * 1024LL * 1024LL;
+    const int receive_bytes = requested_receive_bytes > INT_MAX
+                                  ? INT_MAX
+                                  : static_cast<int>(requested_receive_bytes);
+    if (::setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &receive_bytes,
+                     sizeof(receive_bytes)) != 0 &&
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receive_bytes,
+                     sizeof(receive_bytes)) != 0) {
+        ::close(fd);
+        return -1;
+    }
+    int actual_receive_bytes = 0;
+    socklen_t actual_receive_length = sizeof(actual_receive_bytes);
+    if (::getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actual_receive_bytes,
+                     &actual_receive_length) != 0 ||
+        actual_receive_bytes < receive_bytes) {
+        ::close(fd);
+        return -1;
+    }
+    KF_LOG_INFO(logger, "[socket] SZE receive buffer"
+        << " requested_bytes=" << receive_bytes
+        << " actual_bytes=" << actual_receive_bytes);
+    if (config.busy_poll_us > 0) {
+        (void)::setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &config.busy_poll_us,
+                           sizeof(config.busy_poll_us));
+    }
+    timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 100000;
+    (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    sockaddr_in bind_address;
+    std::memset(&bind_address, 0, sizeof(bind_address));
+    bind_address.sin_family = AF_INET;
+    bind_address.sin_port = htons(static_cast<std::uint16_t>(
+        config.bind_port > 0 ? config.bind_port : config.port));
+    if (::inet_pton(AF_INET, config.bind_ip.c_str(), &bind_address.sin_addr) != 1 ||
+        ::bind(fd, reinterpret_cast<const sockaddr*>(&bind_address),
+               sizeof(bind_address)) != 0) {
+        ::close(fd);
+        return -1;
+    }
+
+    ip_mreqn membership;
+    std::memset(&membership, 0, sizeof(membership));
+    if (::inet_pton(AF_INET, config.multicast_ip.c_str(),
+                    &membership.imr_multiaddr) != 1) {
+        ::close(fd);
+        return -1;
+    }
+    if (!config.iface_ip.empty() &&
+        ::inet_pton(AF_INET, config.iface_ip.c_str(), &membership.imr_address) != 1) {
+        ::close(fd);
+        return -1;
+    }
+    if (!config.ifname.empty()) {
+        membership.imr_ifindex = static_cast<int>(::if_nametoindex(config.ifname.c_str()));
+        if (membership.imr_ifindex == 0) {
+            ::close(fd);
+            return -1;
+        }
+    }
+    if (::setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &membership,
+                     sizeof(membership)) != 0) {
+        ::close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+void MDEngineSZE::close_sockets()
+{
+    for (int& fd : sockets_) {
+        if (fd >= 0) {
+            ::close(fd);
+            fd = -1;
+        }
+    }
+    sockets_.clear();
+}
+
+void MDEngineSZE::log_stats(bool final)
+{
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    for (std::size_t index = 0; index < stats_.size(); ++index) {
+        const ChannelStats& value = stats_[index];
+        KF_LOG_INFO(logger, "[stats] sze channel=" << index
+            << " final=" << (final ? 1 : 0)
+            << " packets=" << value.packets
+            << " bytes=" << value.bytes
+            << " orders=" << value.orders
+            << " executions=" << value.executions
+            << " heartbeats=" << value.heartbeats
+            << " known_non_target=" << value.known_non_target
+            << " unknown_controls=" << value.unknown_controls
+            << " filtered=" << value.filtered
+            << " malformed=" << value.malformed
+            << " unknown=" << value.unknown
+            << " recv_errors=" << value.recv_errors);
+    }
+    if (recovery_config_.enabled) {
+        KF_LOG_INFO(logger, "[recovery_stats] sze"
+            << " final=" << (final ? 1 : 0)
+            << " continuity_records="
+            << recovery_stats_.continuity_records.load(std::memory_order_relaxed)
+            << " duplicates="
+            << recovery_stats_.duplicates.load(std::memory_order_relaxed)
+            << " missing_records="
+            << recovery_stats_.missing_records.load(std::memory_order_relaxed)
+            << " regressions="
+            << recovery_stats_.regressions.load(std::memory_order_relaxed)
+            << " malformed_records="
+            << recovery_stats_.malformed_records.load(std::memory_order_relaxed)
+            << " journal_events="
+            << recovery_stats_.journal_events.load(std::memory_order_relaxed)
+            << " journal_errors="
+            << recovery_stats_.journal_errors.load(std::memory_order_relaxed)
+            << " ring_events="
+            << recovery_stats_.ring_events.load(std::memory_order_relaxed)
+            << " ring_errors="
+            << recovery_stats_.ring_errors.load(std::memory_order_relaxed)
+            << " flush_errors="
+            << recovery_stats_.flush_errors.load(std::memory_order_relaxed)
+            << " invalid_transitions="
+            << recovery_stats_.invalid_transitions.load(std::memory_order_relaxed)
+            << " control_records="
+            << recovery_stats_.control_records.load(std::memory_order_relaxed)
+            << " unknown_control_records="
+            << recovery_stats_.unknown_control_records.load(std::memory_order_relaxed)
+            << " malformed_diagnostic_records="
+            << recovery_stats_.malformed_diagnostic_records.load(std::memory_order_relaxed)
+            << " malformed_diagnostic_dropped="
+            << recovery_stats_.malformed_diagnostic_dropped.load(std::memory_order_relaxed)
+            << " malformed_diagnostic_path="
+            << recovery_config_.malformed_diagnostic_path
+            << " journal_published_offset="
+            << (recovery_journal_ ? recovery_journal_->published_offset() : 0U)
+            << " journal_flushed_offset="
+            << (recovery_journal_ ? recovery_journal_->flushed_offset() : 0U));
+    }
+}
+
+std::string MDEngineSZE::normalize_symbol(const std::string& value)
+{
+    return normalize_symbol(value.c_str());
+}
+
+std::string MDEngineSZE::normalize_symbol(const char* value)
+{
+    if (value == 0) {
+        return std::string();
+    }
+    std::string result;
+    result.reserve(9);
+    for (const char* cursor = value; *cursor != '\0' && result.size() < 9U; ++cursor) {
+        if (*cursor == '.' || *cursor == ' ') {
+            break;
+        }
+        result.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(*cursor))));
+    }
+    return result;
+}
+
+void MDEngineSZE::set_cpu_affinity(int cpu)
+{
+    if (cpu < 0 || cpu >= CPU_SETSIZE) {
+        return;
+    }
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    (void)::pthread_setaffinity_np(::pthread_self(), sizeof(set), &set);
+}
+
+void MDEngineSZE::set_realtime_priority(int priority)
+{
+    if (priority <= 0) {
+        return;
+    }
+    sched_param parameter;
+    std::memset(&parameter, 0, sizeof(parameter));
+    parameter.sched_priority = std::min(priority, 99);
+    (void)::pthread_setschedparam(::pthread_self(), SCHED_FIFO, &parameter);
+}
+
+#define EXPORT_FLAG __attribute__((__visibility__("default")))
+
+extern "C" {
+EXPORT_FLAG IMDEngine* get_obj(IControlCenter* pcc);
+}
+
+IMDEngine* get_obj(IControlCenter* pcc)
+{
+    return kungfu::wingchun::md_get_obj<MDEngineSZE>(pcc, "sze");
+}
+
+WC_NAMESPACE_END

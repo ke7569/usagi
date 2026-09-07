@@ -8,8 +8,8 @@
 #include <limits>
 #include <sstream>
 
-#include "eigen3/Eigen/Dense"
-#include "json.hpp"
+#include "third_party/eigen3/Eigen/Dense"
+#include "third_party/nlohmann/json.hpp"
 
 namespace sze_snapshot15 {
 namespace {

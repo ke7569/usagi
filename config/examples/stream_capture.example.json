@@ -1,0 +1,19 @@
+{
+  "channels": [
+    {"name": "tick", "group": "127.0.0.1", "port": 39001, "interface_ip": "127.0.0.1"},
+    {"name": "snapshot", "group": "127.0.0.1", "port": 39002, "interface_ip": "127.0.0.1"}
+  ],
+  "recording_directory": "capture-example-new",
+  "recording_required": true,
+  "duration_ms": 1000,
+  "queue_capacity": 4096,
+  "max_datagram_bytes": 8192,
+  "receive_batch_size": 64,
+  "receive_buffer_bytes": 16777216,
+  "idle_gap_ns": 100000,
+  "segment_bytes": 268435456,
+  "flush_interval_ms": 100,
+  "receive_cpu": -1,
+  "dispatch_cpu": -1,
+  "writer_cpu": -1
+}

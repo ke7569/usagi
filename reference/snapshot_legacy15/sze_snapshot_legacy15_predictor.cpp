@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 
-#include "../../modules/deepwin_guoxin/md/SZEProtocol.h"
+#include "sze/market_data/SZEProtocol.h"
 #include "snapshot_legacy15_factors.h"
 #include "snapshot_legacy15_model.h"
 

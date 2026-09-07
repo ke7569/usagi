@@ -23,6 +23,8 @@ runtime_so/
 artifacts/
 modules/deepwin_guoxin/api/include/atp_quant_*.h
 modules/deepwin_guoxin/api/lib/*
+adapters/td/atp/api/include/
+adapters/td/atp/api/lib/
 reference/sz_md_recv/sze_l1_snapshot_collector
 reference/sz_md_recv/*.pre_*
 reference/snapshot_legacy15/benchmark_sze_snapshot_legacy15

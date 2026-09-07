@@ -1,0 +1,53 @@
+{
+  "strategy_name": "sze_mix153060_v04_cases_20260401",
+  "name": "ZStrategy",
+  "market": "SZ",
+  "sz_orderbook_mode": "hp-shadow",
+  "orderbook_mode": "hp-shadow",
+  "model_path": "/home/bse-t0/models/mix153060_sze_v04_a3_eff60.bin",
+  "mix153060_model_sha256": "ce5bf6378a45e9a90f1f00607cc1ced4c31a80b1d99ac0e58d28c2745f14ce6d",
+  "md_source_index": [],
+  "td_source_index": [],
+  "instrument_id": ["000001", "000807"],
+  "his_amt": [936528914.8, 1885071454.2],
+  "static_position": [0, 0],
+  "last_position": [0, 0],
+  "ins_params": {
+    "000001.SZ": {
+      "Date": 20260401,
+      "Close": 11.08,
+      "HistoryAmount": 936528914.8,
+      "FreeShare": 816048.1215,
+      "free_share_unit": "10k_shares",
+      "free_share_source": "tushare.daily_basic",
+      "free_share_source_date": 20260331,
+      "HpUpperPrice": 12.19,
+      "HpLowerPrice": 9.97,
+      "HistoryVolatility20d": 0.0,
+      "static_position": 0,
+      "last_position": 0
+    },
+    "000807.SZ": {
+      "Date": 20260401,
+      "Close": 31.0,
+      "HistoryAmount": 1885071454.2,
+      "FreeShare": 200781.2153,
+      "free_share_unit": "10k_shares",
+      "free_share_source": "tushare.daily_basic",
+      "free_share_source_date": 20260331,
+      "HpUpperPrice": 34.1,
+      "HpLowerPrice": 27.9,
+      "HistoryVolatility20d": 0.0,
+      "static_position": 0,
+      "last_position": 0
+    }
+  },
+  "global_params": {
+    "offset": 0.8,
+    "quote_offset": 5,
+    "bias_factor": 0.5,
+    "position_limit": 0.3,
+    "global_bias_factor": 1,
+    "position_base_line": 100000.0
+  }
+}
