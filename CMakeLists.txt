@@ -46,3 +46,9 @@ add_subdirectory(tests)
 if(USAGI_BUILD_DEEPWIN OR SZE_BUILD_TD OR SSE_BUILD_TD)
   add_subdirectory(adapters/deepwin)
 endif()
+
+option(USAGI_BUILD_SSE_EXPERIMENTS
+  "Build the historical Shanghai memory-pipeline experiment" OFF)
+if(USAGI_BUILD_SSE_EXPERIMENTS)
+  add_subdirectory(sse/experimental/memory_pipeline)
+endif()

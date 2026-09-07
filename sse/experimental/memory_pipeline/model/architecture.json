@@ -1,0 +1,22 @@
+{
+  "bundle": "v04-legacy-midmix-sse",
+  "exchange": "sse",
+  "feature_count": 50,
+  "external_scaler": null,
+  "architecture": "ivo_residual_feature_stack",
+  "feature_stack": [
+    {"op": "linear", "in": 50, "out": 512},
+    {"op": "softsign"},
+    {"op": "linear", "in": 512, "out": 256},
+    {"op": "softsign"},
+    {"op": "linear", "in": 256, "out": 128},
+    {"op": "softsign"}
+  ],
+  "projection": {"in": 50, "out": 128},
+  "gru": {"input_size": 128, "hidden_size": 64, "num_layers": 1, "batch_first": true, "gate_order": ["reset", "update", "new"]},
+  "residual_gru": {"in": 128, "out": 64},
+  "layer_norm": {"size": 64, "eps": 0.00001},
+  "head": [{"op": "linear", "in": 64, "out": 8}, {"op": "softsign"}, {"op": "linear", "in": 8, "out": 1}],
+  "output_unit": "permille",
+  "sampling": {"candidate": "CompleteOrderBookSH Level2", "next_local_gap_us_strictly_greater_than": 100}
+}

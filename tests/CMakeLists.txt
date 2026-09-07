@@ -95,6 +95,19 @@ if(T0_BUILD_SZE_STREAM_PROCESSOR)
 endif()
 
 if(T0_BUILD_SSE_STREAM_PROCESSOR)
+  foreach(sse_support_test sse_cpu_affinity_test sse_shard_plan_test)
+    add_executable(${sse_support_test} ${USAGI_ROOT}/tests/sse/${sse_support_test}.cpp)
+    target_link_libraries(${sse_support_test} PRIVATE sse_runtime_support)
+    target_compile_options(${sse_support_test} PRIVATE -UNDEBUG)
+    add_test(NAME ${sse_support_test} COMMAND ${sse_support_test})
+  endforeach()
+  find_program(T0_SSE_AFFINITY_PYTHON NAMES python3 python3.6 python2.7 python2)
+  if(T0_SSE_AFFINITY_PYTHON)
+    add_test(NAME sse_runtime_cpu_affinity_test
+      COMMAND ${T0_SSE_AFFINITY_PYTHON} -B ${USAGI_ROOT}/tests/sse/sse_runtime_cpu_affinity_test.py
+        $<TARGET_FILE:t0_sse_runtime>)
+    set_tests_properties(sse_runtime_cpu_affinity_test PROPERTIES TIMEOUT 30 RUN_SERIAL TRUE)
+  endif()
   add_executable(sse_config_guard_test
     ${USAGI_ROOT}/tests/sse/sse_config_guard_test.cpp
     ${USAGI_ROOT}/adapters/deepwin/sse/sse_config_guard.cpp)
@@ -144,10 +157,13 @@ if(T0_BUILD_SSE_STREAM_PROCESSOR)
   add_executable(sse_udp_observer_test
     ${USAGI_ROOT}/tests/sse/sse_udp_observer_test.cpp)
   add_test(NAME sse_udp_observer_test COMMAND sse_udp_observer_test)
-  add_test(NAME sse_udp_observer_offline_test
-    COMMAND /usr/bin/python3.6m
-    ${USAGI_ROOT}/tests/sse/sse_udp_observer_offline_test.py
-    $<TARGET_FILE:sse_udp_observer>)
+  if(T0_SSE_AFFINITY_PYTHON)
+    add_test(NAME sse_udp_observer_offline_test
+      COMMAND ${T0_SSE_AFFINITY_PYTHON}
+      ${USAGI_ROOT}/tests/sse/sse_udp_observer_offline_test.py
+      $<TARGET_FILE:sse_udp_observer>)
+    set_tests_properties(sse_udp_observer_offline_test PROPERTIES TIMEOUT 10 RUN_SERIAL TRUE)
+  endif()
 endif()
 
 if(T0_STREAM_PYTHON AND T0_BUILD_SZE_STREAM_PROCESSOR AND T0_BUILD_SSE_STREAM_PROCESSOR)

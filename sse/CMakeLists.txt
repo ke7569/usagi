@@ -1,3 +1,9 @@
+add_library(sse_runtime_support STATIC
+  ${USAGI_ROOT}/sse/runtime/sse_cpu_affinity.cpp
+  ${USAGI_ROOT}/sse/runtime/sse_shard_plan.cpp)
+target_include_directories(sse_runtime_support PUBLIC ${USAGI_ROOT})
+target_link_libraries(sse_runtime_support PUBLIC pthread)
+
 if(T0_BUILD_SSE_STREAM_PROCESSOR)
   add_library(sse_live_sampling STATIC
     ${USAGI_ROOT}/sse/sampling/sse_batch_end_sampler.cpp)
@@ -53,7 +59,7 @@ if(T0_BUILD_SSE_STREAM_PROCESSOR)
   add_library(t0_sse_runtime SHARED ${USAGI_ROOT}/apps/MarketRuntime.cpp)
   target_compile_definitions(t0_sse_runtime PRIVATE T0_STREAM_SSE)
   target_include_directories(t0_sse_runtime PRIVATE ${BOOST_INCLUDE})
-  target_link_libraries(t0_sse_runtime PRIVATE sse_strategy_session)
+  target_link_libraries(t0_sse_runtime PRIVATE sse_strategy_session sse_runtime_support)
   add_executable(t0_sse_stream ${USAGI_ROOT}/apps/t0_market_runtime_main.cpp)
   target_link_libraries(t0_sse_stream PRIVATE t0_sse_runtime pthread)
 endif()

@@ -1,0 +1,71 @@
+{
+  "strategy_name": "sse_hybrid_prediction_20260818",
+  "name": "HStrategy",
+  "market": "SH",
+  "trading_day": 20260818,
+  "runtime_mode": "prediction-only",
+  "prediction_only": true,
+  "trading_enabled": false,
+  "production_approval": false,
+  "md_source_index": [89],
+  "td_source_index": [],
+  "instrument_universe_mode": "all-decoded-sse-equities",
+  "instrument_id": [],
+  "his_amt": [],
+  "static_position": [],
+  "last_position": [],
+  "sh_orderbook_mode": "complete-orderbook-sh",
+  "model_type": "sse_hybrid_native",
+  "model_path": "/opt/sse/experimental/memory_pipeline/models/sse-hybrid-model-20260817/models/tick/ssemodl1.bin",
+  "snapshot_baseline_model_path": "/opt/sse/experimental/memory_pipeline/models/sse-hybrid-model-20260817/models/snapshot/baseline.ssegru",
+  "snapshot_baseline_scaler_path": "/opt/sse/experimental/memory_pipeline/models/sse-hybrid-model-20260817/models/snapshot/baseline.json",
+  "snapshot_auction59_model_path": "/opt/sse/experimental/memory_pipeline/models/sse-hybrid-model-20260817/models/snapshot/auction59.ssegru",
+  "snapshot_auction59_scaler_path": "/opt/sse/experimental/memory_pipeline/models/sse-hybrid-model-20260817/models/snapshot/auction59.json",
+  "sse_hybrid_routing_path": "/opt/sse/experimental/memory_pipeline/models/sse-hybrid-model-20260817/config/sse_hybrid_routing.json",
+  "sse_factor_contract": "v0.4-sse-cob-batch-end-100us",
+  "sse_inference_backend": "native-cpp",
+  "sse_live_sampling": {
+    "mode": "trailing-edge-one-shot",
+    "threshold_ns": 100000,
+    "comparison": "strict-greater-than",
+    "clock": "CLOCK_MONOTONIC",
+    "candidate_event": "CompleteOrderBookSH Level2",
+    "activity_scope": "normalized-sse-book-update",
+    "sequence_gap_policy": "fail-closed",
+    "periodic_md": false,
+    "shutdown_flush": false,
+    "standard_gate": {
+      "turnover_threshold_source": "daily-instrument-static-required",
+      "exchange_time_trigger_us": 100000000,
+      "mid_change_epsilon": 0.000001,
+      "min_volume_change": 100
+    }
+  },
+  "model_routing": {
+    "clock": "exchange-time-of-day-micros",
+    "snapshot_selected_window": "[09:30:00,09:35:00)",
+    "tick_selected_window": "[09:35:00,24:00:00)",
+    "tick_warm_before_switch": true,
+    "silent_fallback": false
+  },
+  "prediction_capture": {
+    "enabled": true,
+    "output": "/var/log/sse/experimental/memory_pipeline/predictions-20260818.jsonl",
+    "include_batch_timestamps": true,
+    "include_factors": true,
+    "include_hidden_count": true,
+    "include_model_source": true
+  },
+  "feed_health": {
+    "require_sequence_healthy": true,
+    "sample_on_gap": false,
+    "resume_after_explicit_resync": true
+  },
+  "deployment_required": [
+    "install the hybrid model directory at the configured absolute path",
+    "connect the target-host SSE decoder and frozen 50-factor adapter",
+    "load the 20260818 SSE equity universe and positive per-instrument turnover thresholds",
+    "set the market-data interface in sse_fpga_md_prediction_20260818.json",
+    "keep TD disabled"
+  ]
+}

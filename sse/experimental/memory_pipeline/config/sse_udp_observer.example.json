@@ -1,0 +1,10 @@
+{
+  "output": "/var/log/sse/experimental/memory_pipeline/udp-observer.jsonl",
+  "site": "jinqiao",
+  "channels": [
+    {"name": "snapshot_primary_jinqiao", "group": "239.35.80.5", "port": 37105},
+    {"name": "snapshot_backup_jinqiao", "group": "239.57.80.5", "port": 37105},
+    {"name": "tick_primary_jinqiao", "group": "239.35.80.9", "port": 37109},
+    {"name": "tick_backup_jinqiao", "group": "239.57.80.9", "port": 37109}
+  ]
+}
