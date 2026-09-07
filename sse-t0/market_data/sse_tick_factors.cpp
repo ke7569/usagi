@@ -1,12 +1,24 @@
 #include "sse_tick_factors.h"
+#include "sse_tick_units.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <vector>
 
 namespace sse_tick {
 namespace {
+
+// price() converts EFH raw milli-yuan to canonical yuan.  Order-book and
+// flow quantities are stored in canonical shares (see sse_tick_units.h), so
+// no further quantity scaling belongs in the factor layer.
+
+std::uint64_t factor_clock_ns() {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 
 const char* const kNames[kTickFactorCount] = {
     "factor_hermes_permille", "factor_tr_sqrt_positive", "factor_spread_permille",
@@ -326,7 +338,11 @@ FactorValidity::FactorValidity()
       has_free_share(false), has_static_metadata(false),
       static_metadata_complete(false), complete(false) {}
 
-FactorRow::FactorRow() : values(), validity(), mid_price(0.0), tick_index(0) {
+FactorRow::FactorRow()
+    : values(), validity(), mid_price(0.0), tick_index(0),
+      factor_l1_ns(0), factor_flow_ns(0), factor_depth_build_ns(0),
+      factor_depth_aggregate_ns(0), factor_finalize_ns(0), flow_event_count(0),
+      live_order_count(0), bid_level_count(0), ask_level_count(0) {
     values.fill(0.0f);
 }
 
@@ -389,6 +405,7 @@ FactorRow FactorState::build(OrderBook& book, std::uint64_t now_micros,
                              double snapshot_volume,
                              double snapshot_turnover) {
     FactorRow row;
+    const std::uint64_t l1_started = factor_clock_ns();
     Level bids[10] = {}, asks[10] = {};
     book.snapshot(bids, asks, 10U);
     for (std::size_t i = 0; i < 10; ++i) {
@@ -416,6 +433,7 @@ FactorRow FactorState::build(OrderBook& book, std::uint64_t now_micros,
     row.validity.has_free_share = have_free_share_;
     row.validity.has_static_metadata = have_static_metadata_;
     row.validity.static_metadata_complete = static_metadata_complete();
+    row.live_order_count = static_cast<std::uint64_t>(book.live_order_count());
 
     const double hermes = classic_hermes(bids, asks, 5U, mid);
     row.values[0] = mid > 0.0 ? static_cast<float>((hermes / mid - 1.0) * 1000.0) : 0.0f;
@@ -444,14 +462,19 @@ FactorRow FactorState::build(OrderBook& book, std::uint64_t now_micros,
         const double front = bq + aq;
         const double bid_delta = bp - price(previous_.bids[0]);
         const double ask_delta = ap - price(previous_.asks[0]);
-        row.values[5] = static_cast<float>(front == 0.0 ? 0.0 :
+        const double bid_change = front == 0.0 ? 0.0 :
             (bid_delta < -1e-6 ? -static_cast<double>(previous_.bids[0].quantity) / front :
              (bid_delta > 1e-6 ? (static_cast<double>(previous_.asks[0].quantity) + bq) / front :
-              (bq - static_cast<double>(previous_.bids[0].quantity)) / front)));
-        row.values[6] = static_cast<float>(front == 0.0 ? 0.0 :
+              (bq - static_cast<double>(previous_.bids[0].quantity)) / front));
+        const double ask_change = front == 0.0 ? 0.0 :
             (ask_delta < -1e-6 ? (static_cast<double>(previous_.bids[0].quantity) + aq) / front :
              (ask_delta > 1e-6 ? -static_cast<double>(previous_.asks[0].quantity) / front :
-              (aq - static_cast<double>(previous_.asks[0].quantity)) / front)));
+              (aq - static_cast<double>(previous_.asks[0].quantity)) / front));
+        // Match the reference snapshot implementation's symmetric +/-200
+        // clamp. Without this, thin-book transitions create impossible
+        // values (e.g. 493 or 621) and dominate error metrics.
+        row.values[5] = static_cast<float>(std::max(-200.0, std::min(200.0, bid_change)));
+        row.values[6] = static_cast<float>(std::max(-200.0, std::min(200.0, ask_change)));
         for (std::size_t n = 1; n <= 5; ++n)
             row.values[7 + n - 1] = static_cast<float>(weighted_return_pair(
                 previous_.bids, previous_.asks, bids, asks, n, mid));
@@ -470,13 +493,18 @@ FactorRow FactorState::build(OrderBook& book, std::uint64_t now_micros,
         (book.last_trade_price() > 0.0 ? book.last_trade_price() : mid))));
     double top5_turnover_base = 0.0;
     for (std::size_t i = 0; i < 5U; ++i)
-        top5_turnover_base += price(bids[i]) * bids[i].quantity +
-                              price(asks[i]) * asks[i].quantity;
+        // Order-book quantities are canonical shares (converted once in
+        // OrderBook::apply), so price*quantity is already model yuan and
+        // matches current_turnover's currency unit.
+        top5_turnover_base += price(bids[i]) * static_cast<double>(bids[i].quantity) +
+                              price(asks[i]) * static_cast<double>(asks[i].quantity);
     const double current_turnover = snapshot_turnover >= 0.0 ? snapshot_turnover
                                                               : book.total_trade_turnover();
     const double previous_turnover = have_previous_ ? previous_.turnover : current_turnover;
     row.values[18] = static_cast<float>(safe_div(
         current_turnover - previous_turnover, top5_turnover_base));
+
+    row.factor_l1_ns = factor_clock_ns() - l1_started;
 
     // Reconstruct the window flow using the start-of-window L1 prices, as in
     // the C++/C# reference implementation. SSE T carries both order ids and
@@ -492,13 +520,14 @@ FactorRow FactorState::build(OrderBook& book, std::uint64_t now_micros,
     if (have_previous_ && previous_.two_sided && two_sided) {
         const double current_volume = snapshot_volume >= 0.0 ? snapshot_volume
                                                               : static_cast<double>(book.total_trade_qty());
-        const double volume_delta_raw = current_volume - previous_.volume;
-        const double volume_delta = volume_delta_raw / 1000.0;
+        // All cumulative volume/turnover inputs are canonical shares/yuan;
+        // the window delta needs no further scaling.
+        const double volume_delta = current_volume - previous_.volume;
         const double free_volume = have_free_share_ ? volume_delta / free_share_ : 0.0;
         const double prior_spread = price(previous_.asks[0]) - price(previous_.bids[0]);
         if (volume_delta > 0.0 && prior_spread > 0.0) {
             const double atp = (current_turnover - previous_.turnover) /
-                               volume_delta_raw;
+                               volume_delta;
             double r = (atp - previous_.mid) / prior_spread;
             r = std::max(-0.5, std::min(0.5, r));
             row.values[1] = static_cast<float>(
@@ -506,11 +535,14 @@ FactorRow FactorState::build(OrderBook& book, std::uint64_t now_micros,
                 std::sqrt(std::max(0.0, free_volume * (0.5 - r))));
         }
     }
+    const std::uint64_t flow_started = factor_clock_ns();
+    row.flow_event_count = static_cast<std::uint64_t>(flow.events.size());
     for (std::size_t i = 0; i < flow.events.size(); ++i) {
         const FlowEvent& event = flow.events[i];
-        // EFH tick_merge quantity is 1000 times the model's share unit.
-        const double q = static_cast<double>(event.quantity) / 1000.0;
-        const double p = static_cast<double>(event.price_raw) / 1000.0;
+        // EFH tick quantity was converted to canonical shares when the event
+        // was applied to the book, so no further /1000 scaling is allowed.
+        const double q = static_cast<double>(event.quantity);
+        const double p = price_yuan(event.price_raw);
         if (event.kind == 'A') {
             if (event.side == 'B') {
                 buy_order += q;
@@ -559,11 +591,17 @@ FactorRow FactorState::build(OrderBook& book, std::uint64_t now_micros,
         const double sell_cfr = safe_div(sell_filled, sell_filled + cancel_sell + 1.0);
         row.values[31] = static_cast<float>(safe_div(buy_cfr - sell_cfr, buy_cfr + sell_cfr + 1.0));
     }
+    row.factor_flow_ns = factor_clock_ns() - flow_started;
 
+    const std::uint64_t depth_build_started = factor_clock_ns();
     book.full_depth('B', now_micros, &full_bids_);
     book.full_depth('S', now_micros, &full_asks_);
+    row.factor_depth_build_ns = factor_clock_ns() - depth_build_started;
+    row.bid_level_count = static_cast<std::uint64_t>(full_bids_.size());
+    row.ask_level_count = static_cast<std::uint64_t>(full_asks_.size());
     const bool full_valid = two_sided && !full_bids_.empty() && !full_asks_.empty();
     if (full_valid) {
+        const std::uint64_t depth_aggregate_started = factor_clock_ns();
         const double full_mid = (price(full_bids_[0]) + price(full_asks_[0])) * 0.5;
         const SideBands bid = aggregate_side(full_bids_, false, full_mid);
         const SideBands ask = aggregate_side(full_asks_, true, full_mid);
@@ -603,8 +641,10 @@ FactorRow FactorState::build(OrderBook& book, std::uint64_t now_micros,
         const double hermes = (effective_bid + effective_ask) * 0.5;
         row.values[49] = static_cast<float>(hermes > 0.0
             ? std::max(-5.0, std::min(5.0, (hermes / full_mid - 1.0) * 1000.0)) : 0.0);
+        row.factor_depth_aggregate_ns = factor_clock_ns() - depth_aggregate_started;
     }
 
+    const std::uint64_t finalize_started = factor_clock_ns();
     for (std::size_t i = 0; i < kTickFactorCount; ++i)
         row.values[i] = static_cast<float>(finite_or_zero(row.values[i]));
 
@@ -619,6 +659,7 @@ FactorRow FactorState::build(OrderBook& book, std::uint64_t now_micros,
     for (std::size_t i=0;i<10;++i) { current.bids[i]=bids[i]; current.asks[i]=asks[i]; }
     previous_ = current;
     have_previous_ = true;
+    row.factor_finalize_ns = factor_clock_ns() - finalize_started;
     return row;
 }
 

@@ -1,7 +1,7 @@
 #include "sse_tick_static_metadata.h"
 
 #include "sse_primary_decoder.h"
-#include "../../src/t0-main/json.hpp"
+#include "json.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -435,11 +435,12 @@ bool load_source_daily_config(const nlohmann::json& document,
             return false;
         }
         metadata.has_date = true;
+        // Tick factors consume HistoryAmount, FreeShare and Close. Price
+        // limits are strategy/risk metadata and are optional for replay so a
+        // reduced daily config can still drive the tick model.
         if (!json_record_number(*item, "HistoryAmount", &metadata.avg_amount, error) ||
             !json_record_number(*item, "FreeShare", &metadata.free_share, error) ||
-            !json_record_number(*item, "Close", &metadata.pre_close, error) ||
-            !json_record_number(*item, "HpUpperPrice", &metadata.limit_price, error) ||
-            !json_record_number(*item, "HpLowerPrice", &metadata.stop_price, error)) {
+            !json_record_number(*item, "Close", &metadata.pre_close, error)) {
             return false;
         }
         metadata.turnover_threshold = metadata.avg_amount / 8000.0;
@@ -453,12 +454,21 @@ bool load_source_daily_config(const nlohmann::json& document,
         metadata.has_turnover_threshold = true;
         metadata.has_free_share = true;
         metadata.has_pre_close = true;
-        metadata.has_limit_price = true;
-        metadata.has_stop_price = true;
+        nlohmann::json::const_iterator upper = item->find("HpUpperPrice");
+        if (upper != item->end()) {
+            if (!json_record_number(*item, "HpUpperPrice", &metadata.limit_price, error)) return false;
+            metadata.has_limit_price = true;
+        }
+        nlohmann::json::const_iterator lower = item->find("HpLowerPrice");
+        if (lower != item->end()) {
+            if (!json_record_number(*item, "HpLowerPrice", &metadata.stop_price, error)) return false;
+            metadata.has_stop_price = true;
+        }
         metadata.threshold_basis = "HistoryAmount/8000";
         metadata.source = "config_sse_daily";
         metadata.quality = "daily_json";
-        if (metadata.limit_price < metadata.stop_price) {
+        if (metadata.has_limit_price && metadata.has_stop_price &&
+            metadata.limit_price < metadata.stop_price) {
             fail("daily config JSON price bounds are inverted for " + security, error);
             return false;
         }
@@ -485,6 +495,13 @@ bool DailyStaticMetadata::complete() const {
            has_pre_close && pre_close > 0.0 && has_limit_price &&
            limit_price > 0.0 && has_stop_price && stop_price > 0.0 &&
            limit_price >= stop_price &&
+           (quality.empty() || (quality != "missing" && quality != "error"));
+}
+
+bool DailyStaticMetadata::usable_for_tick() const {
+    return has_date && date != 0U && has_avg_amount && avg_amount > 0.0 &&
+           has_turnover_threshold && turnover_threshold > 0.0 &&
+           has_free_share && free_share > 0.0 && has_pre_close && pre_close > 0.0 &&
            (quality.empty() || (quality != "missing" && quality != "error"));
 }
 

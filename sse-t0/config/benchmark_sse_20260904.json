@@ -1,0 +1,38 @@
+{
+  "market": "SH",
+  "trading_day": 20260904,
+  "shard_count": 8,
+  "journal_directory": "/home/zane/usagi-experiments/model_peak_20260904_1x_warm",
+  "journal_segment_bytes": 1073741824,
+  "journal_min_free_bytes": 85899345920,
+  "ingress_capacity": 65536,
+  "shard_capacity": 131072,
+  "journal_capacity": 262144,
+  "pending_snapshot_capacity": 524288,
+  "model": {
+    "tick_model": "/home/zane/sse/artifacts/tick/ssemodl1.bin",
+    "static_json": "/home/zane/sse/configs/staging/20260904/generated/config_sse_staged_20260904.json",
+    "tick_start_us": 33300000000,
+    "snapshot_enabled": true,
+    "snapshot_baseline": "/home/zane/sse/artifacts/snapshot/baseline.ssegru",
+    "snapshot_baseline_scaler": "/home/zane/sse/artifacts/snapshot/baseline.json",
+    "snapshot_auction": "/home/zane/sse/artifacts/snapshot/auction59.ssegru",
+    "snapshot_auction_scaler": "/home/zane/sse/artifacts/snapshot/auction59.json"
+  },
+  "history": {
+    "start_realtime_ns": 1788484440000000000,
+    "measure_start_realtime_ns": 1788485400000000000,
+    "stop_realtime_ns": 1788485460000000000,
+    "speed": 1.0,
+    "files": [
+      "/home/zane/sse/sessions/20260904/parsed/primary_tick/channel_2/records.bin",
+      "/home/zane/sse/sessions/20260904/parsed/primary_tick/channel_3/records.bin",
+      "/home/zane/sse/sessions/20260904/parsed/primary_tick/channel_5/records.bin",
+      "/home/zane/sse/sessions/20260904/parsed/primary_tick/channel_6/records.bin",
+      "/home/zane/sse/sessions/20260904/parsed/primary_snapshot/channel_2/records.bin",
+      "/home/zane/sse/sessions/20260904/parsed/primary_snapshot/channel_3/records.bin",
+      "/home/zane/sse/sessions/20260904/parsed/primary_snapshot/channel_5/records.bin",
+      "/home/zane/sse/sessions/20260904/parsed/primary_snapshot/channel_6/records.bin"
+    ]
+  }
+}

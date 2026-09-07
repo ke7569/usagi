@@ -39,6 +39,10 @@ struct DailyStaticMetadata {
     // daily contract is present and numerically valid.  The flags are
     // intentionally checked in addition to the values.
     bool complete() const;
+    // Minimal contract consumed by the tick factor engine.  Price-limit
+    // fields are retained for strategy/risk use but are not required to build
+    // the 50-dimensional tick feature vector.
+    bool usable_for_tick() const;
 };
 
 typedef std::map<std::string, DailyStaticMetadata> DailyStaticMetadataMap;

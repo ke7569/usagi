@@ -15,8 +15,9 @@ struct ChannelSpec {
     std::string group;
     int port;
     std::string interface_ip;
+    int receive_cpu;
 
-    ChannelSpec() : port(0), interface_ip("0.0.0.0") {}
+    ChannelSpec() : port(0), interface_ip("0.0.0.0"), receive_cpu(-1) {}
 };
 
 struct Datagram {

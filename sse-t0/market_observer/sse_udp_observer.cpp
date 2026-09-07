@@ -1,4 +1,5 @@
 #include "UdpChannelRuntime.h"
+#include "../market_data/sse_cpu_affinity.h"
 
 #include <fstream>
 #include <cerrno>
@@ -24,27 +25,17 @@ std::string hex_prefix(const unsigned char* data, std::size_t size) {
     return out.str();
 }
 
-bool bind_process_to_cpu(int cpu, std::string* error) {
-    if (cpu < 0) return true;
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    CPU_SET(cpu, &set);
-    if (::sched_setaffinity(0, sizeof(set), &set) != 0) {
-        if (error) *error = std::string("sched_setaffinity failed: ") + std::strerror(errno);
-        return false;
-    }
-    return true;
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 5) {
-        std::cerr << "usage: sse_udp_observer output.jsonl name group port [name group port ...] [--interface-ip IP] [--duration-ms N] [--cpu N]\n";
+        std::cerr << "usage: sse_udp_observer output.jsonl name group port [name group port ...] [--interface-ip IP] [--duration-ms N] [--cpu-list N,N | --cpu N]\n";
         return 2;
     }
     long duration_ms = 0;
-    int cpu = -1;
+    std::string cpu_list;
+    bool single_cpu = false;
+    bool cpu_option = false;
     std::string interface_ip = "0.0.0.0";
     int channel_argc = 2;
     while (channel_argc < argc && std::string(argv[channel_argc]).find("--") != 0U) {
@@ -58,19 +49,22 @@ int main(int argc, char** argv) {
         const std::string option = argv[i];
         if (option == "--duration-ms") duration_ms = std::atol(argv[i + 1]);
         else if (option == "--interface-ip") interface_ip = argv[i + 1];
-        else if (option == "--cpu") cpu = std::atoi(argv[i + 1]);
+        else if (option == "--cpu" || option == "--cpu-list") {
+            if (cpu_option) { std::cerr << "duplicate CPU option\n"; return 2; }
+            cpu_option = true;
+            cpu_list = argv[i + 1];
+            single_cpu = option == "--cpu";
+        }
         else {
             std::cerr << "unknown observer option: " << option << "\n";
             return 2;
         }
     }
     if (channel_argc < 5 || ((channel_argc - 2) % 3) != 0) {
-        std::cerr << "usage: sse_udp_observer output.jsonl name group port [name group port ...] [--interface-ip IP] [--duration-ms N] [--cpu N]\n";
+        std::cerr << "usage: sse_udp_observer output.jsonl name group port [name group port ...] [--interface-ip IP] [--duration-ms N] [--cpu-list N,N | --cpu N]\n";
         return 2;
     }
 
-    std::ofstream file(argv[1], std::ios::out | std::ios::app);
-    if (!file) return 3;
     std::vector<deepwin_market_data::ChannelSpec> channels;
     for (int i = 2; i < channel_argc; i += 3) {
         deepwin_market_data::ChannelSpec channel;
@@ -82,10 +76,24 @@ int main(int argc, char** argv) {
     }
 
     std::string error;
-    if (!bind_process_to_cpu(cpu, &error)) {
+    std::vector<int> requested(channels.size(), -1);
+    if (cpu_option && (!sse_cpu::parse_cpu_list(cpu_list, &requested, &error) ||
+        requested.size() != channels.size() || (single_cpu && channels.size() != 1U))) {
+        std::cerr << "sse_udp_observer: expected one distinct-L3 CPU per channel: " << error << "\n";
+        return 2;
+    }
+    sse_cpu::Lease lease;
+    if (!lease.acquire(requested, &error) || !sse_cpu::bind_current_thread(lease.cpus()[0].id, &error)) {
         std::cerr << "sse_udp_observer: " << error << "\n";
         return 4;
     }
+    for (std::size_t i = 0; i < channels.size(); ++i) {
+        channels[i].receive_cpu = lease.cpus()[i].id;
+        std::cerr << "SSE affinity channel=" << channels[i].name << " cpu=" << lease.cpus()[i].id
+                  << " l3=" << lease.cpus()[i].l3 << "\n";
+    }
+    std::ofstream file(argv[1], std::ios::out | std::ios::app);
+    if (!file) return 3;
     deepwin_market_data::UdpChannelRuntime runtime;
     std::mutex output_mutex;
     std::uint64_t buffered_datagrams = 0U;
@@ -106,8 +114,7 @@ int main(int argc, char** argv) {
             // throughput predictable.
             if (++buffered_datagrams % 1024U == 0U) file.flush();
         };
-    std::cerr << "sse_udp_observer running cpu=" << cpu
-              << " flush_batch=1024; press Ctrl-C to stop\n";
+    std::cerr << "sse_udp_observer running one_cpu_per_l3=1 flush_batch=1024; press Ctrl-C to stop\n";
     if (!runtime.run(channels, callback, duration_ms, &error)) {
         std::cerr << "sse_udp_observer: " << error << "\n";
         return 4;

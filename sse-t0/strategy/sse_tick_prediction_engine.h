@@ -8,7 +8,6 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
-#include <vector>
 
 namespace sse_tick_strategy {
 
@@ -18,26 +17,23 @@ struct PredictionRow {
     std::uint64_t tick_index;
     std::uint64_t exchange_time_micros;
     std::uint64_t factor_ns;
+    std::uint64_t factor_l1_ns;
+    std::uint64_t factor_flow_ns;
+    std::uint64_t factor_depth_build_ns;
+    std::uint64_t factor_depth_aggregate_ns;
+    std::uint64_t factor_finalize_ns;
+    std::uint64_t flow_event_count;
+    std::uint64_t live_order_count;
+    std::uint64_t bid_level_count;
+    std::uint64_t ask_level_count;
     std::uint64_t infer_ns;
+    std::array<float, sse_model::kFeatureCount> factors;
     float prediction;
     bool model_valid;
     bool factor_complete;
     bool selected;
     const char* quality;
     PredictionRow();
-};
-
-struct Level2Request {
-    std::string security_id;
-    std::uint32_t channel_no;
-    std::uint64_t exchange_time_micros;
-    std::uint64_t local_timestamp_micros;
-    std::uint64_t next_local_timestamp_micros;
-    const sse_live::Snapshot* snapshot;
-    Level2Request()
-        : security_id(), channel_no(0U), exchange_time_micros(0U),
-          local_timestamp_micros(0U), next_local_timestamp_micros(0U),
-          snapshot(0) {}
 };
 
 class PredictionEngine {
@@ -53,6 +49,10 @@ public:
                  std::uint64_t next_local_timestamp_micros,
                  PredictionRow* output,
                  std::string* error);
+    // Update the latest Level2 cumulative fields used by tick factors.  This
+    // never applies a book event and never advances the tick model state.
+    bool observe_snapshot(const sse_live::Snapshot& snapshot,
+                          std::string* error);
     // Evaluate a tick batch after the receiver's quiet-period marker.  This
     // is the only API that may advance the tick model's recurrent state.
     bool sample_tick(const sse_live::TickEvent& event,
@@ -68,19 +68,15 @@ public:
                        const sse_live::Snapshot* snapshot,
                        PredictionRow* output,
                        std::string* error);
-    // Prepare all factor rows first, then run all model inferences.  This
-    // keeps the model weights hot in cache across a batch while preserving
-    // per-security recurrent state and timing fields.
-    bool sample_level2_batch(const std::vector<Level2Request>& requests,
-                             std::vector<PredictionRow>* outputs,
-                             std::string* error);
     void reset();
 
 private:
     struct SecurityState {
         explicit SecurityState(const std::string& id)
             : book(id), factors(), model_state(), have_sample_reference(false),
-              last_sample_turnover(0.0), last_sample_mid(0.0), last_sample_volume(0) {}
+              last_sample_turnover(0.0), last_sample_mid(0.0), last_sample_volume(0),
+              have_snapshot_aux(false), snapshot_last_price(0.0),
+              snapshot_volume(0.0), snapshot_turnover(0.0), snapshot_time_micros(0) {}
         sse_tick::OrderBook book;
         sse_tick::FactorState factors;
         sse_model::State model_state;
@@ -88,6 +84,11 @@ private:
         double last_sample_turnover;
         double last_sample_mid;
         std::uint64_t last_sample_volume;
+        bool have_snapshot_aux;
+        double snapshot_last_price;
+        double snapshot_volume;
+        double snapshot_turnover;
+        std::uint64_t snapshot_time_micros;
     };
     std::unordered_map<std::string, SecurityState*> states_;
     sse_model::Model model_;

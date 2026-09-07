@@ -2,8 +2,12 @@
 #define SSE_T0_TICK_ORDER_BOOK_H
 
 #include "sse_primary_decoder.h"
+#include "sse_tick_units.h"
 
 #include <cstdint>
+#include <deque>
+#include <queue>
+#include <set>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -14,6 +18,11 @@ namespace sse_tick {
 // SSE-specific order state. Do not reuse the SZE order/cancel interpretation:
 // SSE merge records carry A/D/T/S and identify both sides of a trade by order
 // number. The order book is maintained independently for every security.
+//
+// Canonical-unit contract: quantities stored here (Level/Order/FlowEvent and
+// all FlowStats counters) are in shares; trade turnover is in yuan; price is
+// kept as EFH raw milli-yuan and converted only through price_yuan().  All
+// EFH tick quantity conversion happens in OrderBook::apply via to_shares().
 enum EventKind { kAdd = 'A', kDelete = 'D', kTrade = 'T', kStatus = 'S' };
 
 struct Order {
@@ -49,6 +58,10 @@ struct FlowStats {
     std::uint64_t sell_cancel_qty;
     std::uint64_t buy_trade_qty;
     std::uint64_t sell_trade_qty;
+    // Total exchanged trade quantity in canonical shares for this window,
+    // counted from every valid T event (authoritative even when the event
+    // order ids cannot be matched to the reconstructed book).
+    std::uint64_t trade_shares;
     std::uint64_t positive_trade_qty;
     std::uint64_t negative_trade_qty;
     std::uint64_t trade_count;
@@ -102,6 +115,23 @@ private:
     const QuantityMap& quantities(char side) const;
     CountMap& counts(char side);
     const CountMap& counts(char side) const;
+    QuantityMap& add_time_sums(char side);
+    const QuantityMap& add_time_sums(char side) const;
+    QuantityMap& young_quantities(char side);
+    const QuantityMap& young_quantities(char side) const;
+    void expire_young_orders(std::uint64_t now_micros) const;
+
+    struct RecentOrder {
+        std::uint64_t order_no;
+        std::uint32_t price_raw;
+        char side;
+        std::uint64_t add_time_micros;
+    };
+    struct RecentOrderEarlier {
+        bool operator()(const RecentOrder& left, const RecentOrder& right) const {
+            return left.add_time_micros > right.add_time_micros;
+        }
+    };
 
     std::string security_id_;
     std::unordered_map<std::uint64_t, Order> orders_;
@@ -109,9 +139,16 @@ private:
     QuantityMap ask_qty_;
     CountMap bid_count_;
     CountMap ask_count_;
+    QuantityMap bid_add_time_sum_;
+    QuantityMap ask_add_time_sum_;
+    mutable QuantityMap bid_young_qty_;
+    mutable QuantityMap ask_young_qty_;
+    mutable std::priority_queue<RecentOrder, std::vector<RecentOrder>, RecentOrderEarlier> recent_orders_;
     FlowStats flow_;
     std::uint64_t last_tick_index_;
     bool has_tick_index_;
+    std::uint64_t last_event_time_micros_;
+    std::multiset<std::uint64_t> live_add_times_;
     std::uint64_t total_trade_qty_;
     double total_trade_turnover_;
     double last_trade_price_;

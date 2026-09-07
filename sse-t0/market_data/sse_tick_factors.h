@@ -28,6 +28,18 @@ struct FactorRow {
     FactorValidity validity;
     double mid_price;
     std::uint64_t tick_index;
+    // Stage timings are populated for sampled rows.  They are intentionally
+    // kept alongside the row so the live engine can aggregate them without a
+    // second factor pass or a shared profiler lock.
+    std::uint64_t factor_l1_ns;
+    std::uint64_t factor_flow_ns;
+    std::uint64_t factor_depth_build_ns;
+    std::uint64_t factor_depth_aggregate_ns;
+    std::uint64_t factor_finalize_ns;
+    std::uint64_t flow_event_count;
+    std::uint64_t live_order_count;
+    std::uint64_t bid_level_count;
+    std::uint64_t ask_level_count;
     FactorRow();
 };
 

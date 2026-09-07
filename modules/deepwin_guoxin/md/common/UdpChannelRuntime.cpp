@@ -9,6 +9,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <sched.h>
 
 #include <atomic>
 #include <limits>
@@ -115,6 +116,21 @@ struct UdpChannelRuntime::Impl {
 
     void worker(const ChannelSpec& channel, const DatagramCallback& callback,
                 long duration_ms) {
+        if (channel.receive_cpu != -1) {
+            cpu_set_t mask;
+            CPU_ZERO(&mask);
+            if (channel.receive_cpu < 0 || channel.receive_cpu >= CPU_SETSIZE) {
+                set_error("invalid receive CPU for channel " + channel.name);
+                running.store(false);
+                return;
+            }
+            CPU_SET(channel.receive_cpu, &mask);
+            if (sched_setaffinity(0, sizeof(mask), &mask) != 0) {
+                set_error("cannot bind receive CPU for channel " + channel.name + ": " + std::strerror(errno));
+                running.store(false);
+                return;
+            }
+        }
         std::string open_error;
         const int fd = open_socket(channel, &open_error);
         if (fd < 0) {

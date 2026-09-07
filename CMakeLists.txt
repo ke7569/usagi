@@ -7,6 +7,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(SZE_MARCH_NATIVE "Compile for the build machine CPU" OFF)
 option(SZE_BUILD_TD "Build the Shenzhen ATP TD plugin" OFF)
 option(SSE_BUILD_TD "Build the Shanghai ATP TD plugin" OFF)
+option(SSE_MODEL_MARCH_NATIVE "Use the target host ISA for Shanghai model inference" OFF)
 option(SZE_BUILD_DIRECT_SHARDED_RING
   "Build the experimental direct sharded-ring tests/benchmark" OFF)
 set(SZE_TD_API_DIR "${CMAKE_CURRENT_SOURCE_DIR}/modules/deepwin_guoxin/api" CACHE PATH
@@ -234,6 +235,7 @@ set_target_properties(sze_md PROPERTIES OUTPUT_NAME sze_md
 # Shanghai SSE market-data plugin, loaded by source 89.
 add_library(sse_md SHARED
   ${SZE_MD}/MDEngineSSE.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/market_data/sse_cpu_affinity.cpp
   ${SZE_MD}/common/UdpChannelRuntime.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/market_data/sse_primary_decoder.cpp)
 target_include_directories(sse_md PRIVATE
@@ -343,6 +345,7 @@ target_include_directories(deepwin_market_data_runtime PUBLIC
 target_link_libraries(deepwin_market_data_runtime PUBLIC pthread)
 
 add_executable(sse_udp_observer
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/market_data/sse_cpu_affinity.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/market_observer/sse_udp_observer.cpp)
 target_link_libraries(sse_udp_observer PRIVATE deepwin_market_data_runtime)
 
@@ -364,6 +367,9 @@ target_include_directories(sse_model_runtime PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/model
   ${T0}/cpp_model/eigen3)
 target_compile_options(sse_model_runtime PRIVATE -ffp-contract=off)
+if(SSE_MODEL_MARCH_NATIVE)
+  target_compile_options(sse_model_runtime PRIVATE -march=native)
+endif()
 
 add_executable(sse_model_runtime_test
   ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/model/sse_model_runtime_test.cpp)
@@ -406,6 +412,63 @@ add_test(NAME sse_hybrid_model_test COMMAND sse_hybrid_model_test)
 add_executable(sse_udp_observer_test
   ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/market_observer/sse_udp_observer_test.cpp)
 add_test(NAME sse_udp_observer_test COMMAND sse_udp_observer_test)
+add_executable(sse_cpu_affinity_test
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/tests/sse_cpu_affinity_test.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/market_data/sse_cpu_affinity.cpp)
+add_test(NAME sse_cpu_affinity_test COMMAND sse_cpu_affinity_test)
+add_library(sse_event_runtime STATIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/market_data/sse_event_codec.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/market_data/sse_event_pipeline.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/market_data/sse_event_journal.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/market_data/sse_shard_plan.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/market_data/sse_cpu_affinity.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/market_data/sse_primary_decoder.cpp
+  ${SZE_MD}/SZERecoverable.cpp)
+target_link_libraries(sse_event_runtime PUBLIC pthread)
+add_library(sse_event_model_consumer STATIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/strategy/sse_model_consumer.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/strategy/sse_tick_prediction_engine.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/strategy/sse_tick_sample_gate.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/market_data/sse_tick_order_book.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/market_data/sse_tick_factors.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/market_data/sse_tick_static_metadata.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/model/snapshot36.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/model/auction59_sidecar.cpp)
+target_include_directories(sse_event_model_consumer PRIVATE ${T0})
+target_link_libraries(sse_event_model_consumer PUBLIC sse_event_runtime sse_model_runtime sse_snapshot_gru_runtime)
+add_executable(sse_event_pipeline
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/market_observer/sse_event_pipeline_main.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/market_data/sse_history_input.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/market_data/sse_tick_order_book.cpp)
+target_link_libraries(sse_event_pipeline PRIVATE sse_event_runtime sse_event_model_consumer deepwin_market_data_runtime)
+foreach(test_name sse_shard_plan sse_event_queue sse_event_journal sse_event_pipeline)
+  add_executable(${test_name}_test ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/tests/${test_name}_test.cpp)
+  target_link_libraries(${test_name}_test PRIVATE sse_event_runtime)
+  add_test(NAME ${test_name}_test COMMAND ${test_name}_test)
+endforeach()
+add_executable(sse_latency_histogram_test ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/tests/sse_latency_histogram_test.cpp)
+add_test(NAME sse_latency_histogram_test COMMAND sse_latency_histogram_test)
+add_executable(sse_event_sampling_test ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/tests/sse_event_sampling_test.cpp)
+target_link_libraries(sse_event_sampling_test PRIVATE sse_event_runtime)
+add_test(NAME sse_event_sampling_test COMMAND sse_event_sampling_test)
+add_executable(sse_model_consumer_test ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/tests/sse_model_consumer_test.cpp)
+target_link_libraries(sse_model_consumer_test PRIVATE sse_event_model_consumer)
+set(SSE_TEST_TICK_MODEL "" CACHE FILEPATH "Shanghai real-model test weights")
+set(SSE_TEST_STATIC_JSON "" CACHE FILEPATH "Shanghai real-model test daily metadata")
+set(SSE_TEST_TRADING_DAY "" CACHE STRING "Shanghai real-model test trading day")
+if(SSE_TEST_TICK_MODEL AND SSE_TEST_STATIC_JSON AND SSE_TEST_TRADING_DAY)
+  add_test(NAME sse_model_consumer_test COMMAND sse_model_consumer_test
+    ${SSE_TEST_TICK_MODEL} ${SSE_TEST_STATIC_JSON} ${SSE_TEST_TRADING_DAY})
+endif()
+find_program(SSE_AFFINITY_TEST_PYTHON NAMES python3 python3.6m python)
+add_test(NAME sse_event_pipeline_integration_test
+  COMMAND ${SSE_AFFINITY_TEST_PYTHON}
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/tests/sse_event_pipeline_integration_test.py
+  $<TARGET_FILE:sse_event_pipeline>)
+add_test(NAME sse_cpu_affinity_integration_test
+  COMMAND ${SSE_AFFINITY_TEST_PYTHON}
+  ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/tests/sse_cpu_affinity_integration_test.py
+  $<TARGET_FILE:sse_udp_observer>)
 add_test(NAME sse_udp_observer_offline_test
   COMMAND /usr/bin/python3.6m
   ${CMAKE_CURRENT_SOURCE_DIR}/sse-t0/market_observer/sse_udp_observer_offline_test.py

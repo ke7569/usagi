@@ -4,6 +4,7 @@
 #include "IMDEngine.h"
 #include "../../../sse-t0/market_data/sse_primary_decoder.h"
 #include "common/UdpChannelRuntime.h"
+#include "../../../sse-t0/market_data/sse_cpu_affinity.h"
 
 #include <atomic>
 #include <mutex>
@@ -51,6 +52,7 @@ private:
     std::mutex mutex_;
     std::unordered_set<std::string> seen_keys_;
     deepwin_market_data::UdpChannelRuntime runtime_;
+    sse_cpu::Lease cpu_lease_;
 };
 
 WC_NAMESPACE_END

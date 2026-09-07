@@ -2,18 +2,20 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --site huarun|kayuan --interface-ip IP [--output-dir DIR]" >&2
+  echo "usage: $0 --site huarun|kayuan --interface-ip IP [--output-dir DIR] [--cpu-list LIST]" >&2
   exit 2
 }
 
 SITE=""
 INTERFACE_IP=""
 OUTPUT_DIR="${SSE_CAPTURE_OUTPUT_DIR:-./capture}"
+CPU_LIST="${SSE_CAPTURE_CPU_LIST:-}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --site) SITE="${2:-}"; shift 2 ;;
     --interface-ip) INTERFACE_IP="${2:-}"; shift 2 ;;
     --output-dir) OUTPUT_DIR="${2:-}"; shift 2 ;;
+    --cpu-list) CPU_LIST="${2:?missing CPU list}"; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -46,6 +48,7 @@ else
   ARGS+=(snapshot_tick_kayuan 238.125.1.1 12002)
 fi
 ARGS+=(--interface-ip "$INTERFACE_IP")
+if [[ -n "$CPU_LIST" ]]; then ARGS+=(--cpu-list "$CPU_LIST"); fi
 
 nohup "$BIN" "${ARGS[@]}" >"$ERR" 2>&1 &
 PID=$!

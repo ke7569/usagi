@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <sstream>
+#include <sched.h>
 
 WC_NAMESPACE_START
 namespace {
@@ -14,6 +15,13 @@ std::string get_string(const json& j, const char* key, const std::string& d = st
 }
 int get_int(const json& j, const char* key, int d) {
     return j.find(key) != j.end() && j[key].is_number() ? j[key].get<int>() : d;
+}
+int receive_cpu(const json& config) {
+    const json::const_iterator cpu = config.find("cpu");
+    if (cpu == config.end()) return -1;
+    if (!cpu->is_number_integer() || *cpu < 0 || *cpu >= CPU_SETSIZE)
+        throw std::runtime_error("SSE channel cpu must be a non-negative CPU index");
+    return cpu->get<int>();
 }
 }
 
@@ -46,6 +54,7 @@ void MDEngineSSE::load(const json& config) {
             c.group = get_string(*it, "group", get_string(*it, "multicast_ip"));
             c.port = get_int(*it, "port", get_int(*it, "multicast_port", 0));
             c.interface_ip = get_string(*it, "interface_ip", get_string(*it, "iface_ip", "0.0.0.0"));
+            c.receive_cpu = receive_cpu(*it);
             if (c.group.empty() || c.port <= 0) throw std::runtime_error("invalid SSE channel");
             channels_.push_back(c);
         }
@@ -54,6 +63,7 @@ void MDEngineSSE::load(const json& config) {
         c.name = "sse"; c.group = get_string(config, "group", get_string(config, "multicast_ip"));
         c.port = get_int(config, "port", get_int(config, "multicast_port", 0));
         c.interface_ip = get_string(config, "interface_ip", get_string(config, "iface_ip", "0.0.0.0"));
+        c.receive_cpu = receive_cpu(config);
         if (c.group.empty() || c.port <= 0) throw std::runtime_error("invalid SSE channel");
         channels_.push_back(c);
     }
@@ -67,6 +77,14 @@ void MDEngineSSE::connect(long) { connected_ = !channels_.empty(); }
 void MDEngineSSE::login(long) {
     if (!connected_) connect(0);
     if (!connected_ || running_) return;
+    if (worker_.joinable()) worker_.join();
+    std::vector<int> requested;
+    for (const deepwin_market_data::ChannelSpec& channel : channels_) requested.push_back(channel.receive_cpu);
+    if (!cpu_lease_.acquire(requested, &error_)) throw std::runtime_error(error_);
+    for (std::size_t i = 0; i < channels_.size(); ++i) {
+        const sse_cpu::Cpu& cpu = cpu_lease_.cpus()[i];
+        KF_LOG_INFO(logger, "[SSE affinity] channel=" << channels_[i].name << " cpu=" << cpu.id << " l3=" << cpu.l3);
+    }
     running_ = true; logged_in_ = true;
     worker_ = std::thread(&MDEngineSSE::run, this);
 }
@@ -74,6 +92,7 @@ void MDEngineSSE::logout() {
     running_ = false;
     runtime_.stop();
     if (worker_.joinable()) worker_.join();
+    cpu_lease_.release();
     logged_in_ = false; connected_ = false;
 }
 void MDEngineSSE::release_api() { logout(); }
@@ -92,7 +111,13 @@ bool MDEngineSSE::allowed(const std::string& symbol) const {
 
 void MDEngineSSE::run() {
     std::string error;
-    runtime_.run(channels_, [this](const deepwin_market_data::Datagram& d) { on_datagram(d); }, 0, &error);
+    std::vector<deepwin_market_data::ChannelSpec> bound_channels = channels_;
+    for (std::size_t i = 0; i < bound_channels.size(); ++i) bound_channels[i].receive_cpu = cpu_lease_.cpus()[i].id;
+    if (sse_cpu::bind_current_thread(bound_channels[0].receive_cpu, &error))
+        runtime_.run(bound_channels, [this](const deepwin_market_data::Datagram& d) { on_datagram(d); }, 0, &error);
+    running_ = false;
+    logged_in_ = false;
+    if (!error.empty()) KF_LOG_ERROR(logger, "[SSE receive] " << error);
     std::lock_guard<std::mutex> lock(mutex_); error_ = error;
 }
 
