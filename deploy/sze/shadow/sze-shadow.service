@@ -1,0 +1,21 @@
+[Unit]
+Description=Shenzhen new-framework paper OMS shadow
+After=sze-capture.service
+Requisite=sze-capture.service
+PartOf=sze-capture.service
+
+[Service]
+Type=simple
+StartLimitInterval=1800
+StartLimitBurst=20
+WorkingDirectory=/home/zane/usagi-sze-oms-20260907
+ExecStartPre=/home/zane/usagi-sze-oms-20260907/deploy/sze/shadow/prepare_sze_shadow_daily.sh
+ExecStart=/home/zane/usagi-sze-oms-20260907/deploy/sze/shadow/run_sze_shadow_daily.sh
+KillSignal=SIGTERM
+TimeoutStartSec=180
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

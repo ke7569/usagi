@@ -1,0 +1,10 @@
+[Unit]
+Description=Start Shenzhen new-framework paper OMS shadow
+
+[Timer]
+OnCalendar=*-*-* 09:10:00
+Persistent=false
+Unit=sze-shadow.service
+
+[Install]
+WantedBy=timers.target
