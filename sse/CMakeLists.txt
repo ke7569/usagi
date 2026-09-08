@@ -4,6 +4,17 @@ add_library(sse_runtime_support STATIC
 target_include_directories(sse_runtime_support PUBLIC ${USAGI_ROOT})
 target_link_libraries(sse_runtime_support PUBLIC pthread)
 
+# Reuse the mature journal/SHM protocol without changing Shenzhen's build or
+# source files. The copied core retains its ABI and source-89 payloads identify
+# Shanghai transport metadata explicitly.
+add_library(sse_journal_core STATIC ${USAGI_ROOT}/common/recovery/SZERecoverable.cpp)
+target_include_directories(sse_journal_core PUBLIC ${USAGI_ROOT} ${USAGI_ROOT}/common/recovery)
+target_link_libraries(sse_journal_core PUBLIC pthread rt)
+add_executable(t0_sse_journal_capture ${USAGI_ROOT}/sse/runtime/sse_journal_capture.cpp)
+target_link_libraries(t0_sse_journal_capture PRIVATE
+  sse_journal_core sse_runtime_support deepwin_market_data_runtime)
+target_include_directories(t0_sse_journal_capture PRIVATE ${BOOST_INCLUDE})
+
 if(T0_BUILD_SSE_STREAM_PROCESSOR)
   add_library(sse_live_sampling STATIC
     ${USAGI_ROOT}/sse/sampling/sse_batch_end_sampler.cpp)
@@ -62,4 +73,8 @@ if(T0_BUILD_SSE_STREAM_PROCESSOR)
   target_link_libraries(t0_sse_runtime PRIVATE sse_strategy_session sse_runtime_support)
   add_executable(t0_sse_stream ${USAGI_ROOT}/apps/t0_market_runtime_main.cpp)
   target_link_libraries(t0_sse_stream PRIVATE t0_sse_runtime pthread)
+  add_executable(t0_sse_journal_predict ${USAGI_ROOT}/sse/runtime/sse_journal_prediction.cpp)
+  target_link_libraries(t0_sse_journal_predict PRIVATE
+    sse_journal_core sse_runtime_support sse_strategy_session)
+  target_include_directories(t0_sse_journal_predict PRIVATE ${BOOST_INCLUDE})
 endif()

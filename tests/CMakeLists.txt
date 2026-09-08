@@ -95,6 +95,15 @@ if(T0_BUILD_SZE_STREAM_PROCESSOR)
 endif()
 
 if(T0_BUILD_SSE_STREAM_PROCESSOR)
+  add_executable(sse_journal_handoff_test ${USAGI_ROOT}/tests/sse/sse_journal_handoff_test.cpp)
+  target_link_libraries(sse_journal_handoff_test PRIVATE sse_journal_core)
+  target_compile_options(sse_journal_handoff_test PRIVATE -UNDEBUG)
+  add_test(NAME sse_journal_handoff_test COMMAND sse_journal_handoff_test)
+  set_tests_properties(sse_journal_handoff_test PROPERTIES TIMEOUT 30)
+  add_executable(sse_journal_core_test ${USAGI_ROOT}/tests/sze/sze_recoverable_test.cpp)
+  target_link_libraries(sse_journal_core_test PRIVATE sse_journal_core)
+  target_compile_options(sse_journal_core_test PRIVATE -UNDEBUG)
+  add_test(NAME sse_journal_core_test COMMAND sse_journal_core_test)
   foreach(sse_support_test sse_cpu_affinity_test sse_shard_plan_test)
     add_executable(${sse_support_test} ${USAGI_ROOT}/tests/sse/${sse_support_test}.cpp)
     target_link_libraries(${sse_support_test} PRIVATE sse_runtime_support)
@@ -103,6 +112,12 @@ if(T0_BUILD_SSE_STREAM_PROCESSOR)
   endforeach()
   find_program(T0_SSE_AFFINITY_PYTHON NAMES python3 python3.6 python2.7 python2)
   if(T0_SSE_AFFINITY_PYTHON)
+    add_test(NAME sse_capture_retention_test
+      COMMAND ${T0_SSE_AFFINITY_PYTHON} -B ${USAGI_ROOT}/tests/sse/test_capture_retention.py)
+    add_test(NAME sse_journal_integration_test
+      COMMAND ${T0_SSE_AFFINITY_PYTHON} -B ${USAGI_ROOT}/tests/sse/sse_journal_integration_test.py
+        $<TARGET_FILE:t0_sse_journal_capture> $<TARGET_FILE:t0_sse_journal_predict>)
+    set_tests_properties(sse_journal_integration_test PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
     add_test(NAME sse_runtime_cpu_affinity_test
       COMMAND ${T0_SSE_AFFINITY_PYTHON} -B ${USAGI_ROOT}/tests/sse/sse_runtime_cpu_affinity_test.py
         $<TARGET_FILE:t0_sse_runtime>)
