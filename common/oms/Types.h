@@ -124,6 +124,10 @@ struct Config {
     std::string lock_directory;
     bool single_host_account = true;
     bool enabled = false;
+    // When true, a fresh start/recovery that restores working orders first
+    // cancels every restored open order and keeps the account not ready until
+    // those cancels are terminal (restart-cancel-then-trade, OMS-3).
+    bool restart_cancel_open_orders = false;
     std::map<Instrument, InstrumentRules> instruments;
     Limits limits;
 };

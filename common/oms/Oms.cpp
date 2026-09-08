@@ -189,7 +189,20 @@ struct Engine::Impl {
 
     bool ready() const {
         return config.enabled && connected && reconciled && !reconciling && !stopping &&
-            fault.empty() && journal.healthy() && orphans.empty() && now >= new_not_before && cash >= reserved;
+            fault.empty() && journal.healthy() && orphans.empty() && now >= new_not_before && cash >= reserved &&
+            !restart_open_working();
+    }
+    // Restart-cancel pending: config enabled and a restored open order is
+    // still waiting on its cancel to go terminal. Blocks new submissions and
+    // account readiness until every restored order is Filled/Canceled.
+    bool restart_open_working() const {
+        if (!config.restart_cancel_open_orders) return false;
+        for (auto it = orders.begin(); it != orders.end(); ++it) {
+            const Order& order = it->second;
+            if (order.view.owned && order.view.cancel_requested && !order.view.terminal && order.view.working > 0)
+                return true;
+        }
+        return false;
     }
     void note(const std::string& type, OrderId id, const std::string& detail = std::string()) {
         OMS_PROFILE_SCOPE(profile_note, AuditNote);
@@ -1150,8 +1163,21 @@ bool Engine::Impl::install_snapshot(const Snapshot& snapshot, bool persisted) {
     reason = reconciled ? "ready" : "snapshot retains unresolved orders or insufficient account budget";
     if (unresolved) freeze(reason);
     note("snapshot-installed", 0, reason);
-    for (auto& item : orders)
-        if (item.second.view.owned && item.second.view.cancel_requested) queue_cancel(item.second);
+    // Restart safety (OMS-3): when enabled, cancel every restored open order
+    // before trading resumes. cancel_epoch_verified and broker ids are already
+    // established for orders proven by this snapshot.
+    const bool restart_cancel = config.restart_cancel_open_orders;
+    for (auto& item : orders) {
+        Impl::Order& order = item.second;
+        if (!order.view.owned) continue;
+        if (restart_cancel && !order.view.terminal && order.view.working > 0 && !order.view.cancel_requested) {
+            order.view.cancel_requested = true;
+            order.cancel_started = now;
+            save_id(records::Kind::CancelIntent, item.first);
+            note("restart-cancel-intent", item.first);
+        }
+        if (order.view.cancel_requested) queue_cancel(order);
+    }
     return reconciled;
 }
 

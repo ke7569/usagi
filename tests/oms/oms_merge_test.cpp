@@ -41,7 +41,7 @@ struct Fixture {
     std::shared_ptr<ScriptedBackend> backend;
     std::shared_ptr<Engine> engine;
 
-    Fixture() {
+    Fixture(bool restart_cancel = false) {
         config.scope.account.broker = "paper";
         config.scope.account.account = "unit";
         config.scope.gateway = "fixture";
@@ -50,6 +50,7 @@ struct Fixture {
         config.instance = "test";
         config.enabled = true;
         config.ownership = OwnershipMode::Simulation;
+        config.restart_cancel_open_orders = restart_cancel;
         config.instruments[kSze] = rules();
         config.instruments[kSse] = rules();
         capabilities.simulated = true;
@@ -286,6 +287,134 @@ void test_atp_backend_closed_loop() {
     require(disconnects.load() == 1, "OMS connection sink received disconnect");
 }
 
+// OMS-3 restart-cancel: a fresh reconcile that restores a working order
+// cancels it first; account is not ready (and new submits are rejected) until
+// the restored order reaches terminal.
+void test_restart_cancel_open_orders() {
+    Fixture f(true);
+    f.backend->submit_hook = [&f](const Command& command) {
+        SendResult result;
+        result.disposition = SendDisposition::Submitted;
+        if (!command.cancel) {
+            f.backend->publish(f.order_report(command.id, command.intent.instrument,
+                                              command.intent.side, OrderState::Accepted, 0,
+                                              command.intent.quantity));
+        }
+        return result;
+    };
+    // First reconcile is empty and ready; place a live working order.
+    SubmitResult order = f.submit(f.intent("client", "restart-open", kSze, Side::Buy, 300));
+    require(order.accepted && f.engine->account().ready, "initial order accepted and ready");
+    // Simulate restart: new reconcile whose broker snapshot restores the same
+    // owned working order (id, owner, broker identity and state preserved).
+    require(f.engine->begin_reconcile(2, false), "restart reconcile begins");
+    Snapshot restart;
+    restart.scope = f.engine->scope();
+    restart.token = 2;
+    restart.free_cash = 1000000000000LL;
+    restart.account_success = true;
+    restart.positions_success = true;
+    restart.orders_success = true;
+    restart.trades_success = true;
+    restart.all_day_orders = true;
+    restart.all_day_trades = true;
+    SnapshotOrder restored;
+    restored.id = order.id;
+    restored.owner = "client";
+    restored.broker_id = "B" + std::to_string(order.id);
+    restored.instrument = kSze;
+    restored.side = Side::Buy;
+    restored.price = 100000;
+    restored.original = 300;
+    restored.filled = 0;
+    restored.working = 300;
+    restored.state = OrderState::Accepted;
+    restart.orders.push_back(restored);
+    SnapshotPosition position;
+    position.instrument = kSze;
+    position.total = 10000;
+    position.free_sellable = 10000;
+    restart.positions.push_back(position);
+    SnapshotPosition sse_position;
+    sse_position.instrument = kSse;
+    sse_position.total = 10000;
+    sse_position.free_sellable = 10000;
+    restart.positions.push_back(sse_position);
+    require(f.engine->complete_snapshot(restart), "restart snapshot installed");
+    require(!f.engine->account().ready, "restart-cancel keeps account not ready");
+    f.engine->advance_to(1);
+    SubmitResult blocked = f.submit(f.intent("client", "during-restart-cancel", kSse, Side::Buy, 100));
+    require(!blocked.accepted && blocked.error.category == ErrorCategory::NotReady,
+            "new orders rejected while restored order awaits cancel");
+    // Broker cancel returns terminal; only then may trading resume.
+    f.backend->publish(f.order_report(order.id, kSze, Side::Buy, OrderState::Canceled, 0, 300,
+                                      "B" + std::to_string(order.id)));
+    require(f.engine->account().ready && !f.engine->has_working_order(kSze),
+            "ready resumes after restored order is canceled");
+}
+
+// OMS-3b certified query: AtpBackend advertises complete_snapshot only when a
+// query sender is installed; query forwards to it; publish_snapshot reaches
+// the OMS snapshot sink.
+void test_atp_backend_certified_query() {
+    Config config;
+    config.scope.account.broker = "guoxin";
+    config.scope.account.account = "acc-1";
+    config.scope.gateway = "atp";
+    config.scope.day = 20260904;
+    config.scope.source = 190;
+    config.scope.epoch = 1;
+    const Scope scope = config.scope;
+    int query_calls = 0;
+    std::atomic<bool> snapshot_seen(false);
+    std::shared_ptr<AtpBackend> backend(new AtpBackend(scope,
+        [](const Command&) { SendResult r; r.disposition = SendDisposition::Submitted; return r; },
+        [&query_calls](const Scope&, std::uint64_t) { ++query_calls; return Error(); },
+        true));
+    require(backend->capabilities().complete_snapshot, "certified query advertises complete snapshots");
+    backend->bind([](const Report&) {}, [&snapshot_seen](const Snapshot&) { snapshot_seen.store(true); },
+                  [](const Scope&, bool) {});
+    Error query = backend->query(scope, 42);
+    require(!query.failed() && query_calls == 1, "certified query forwarded once");
+    Snapshot snapshot;
+    snapshot.scope = scope;
+    backend->publish_snapshot(snapshot);
+    require(snapshot_seen.load(), "broker snapshot reaches the OMS sink");
+}
+
+// OMS-3b engine reconcile: begin_reconcile with request_backend dispatches a
+// query; once the broker snapshot is published the account reconciles ready.
+void test_engine_query_then_snapshot_reconcile() {
+    Fixture f;
+    int query_calls = 0;
+    f.backend->query_hook = [&query_calls](const Scope&, std::uint64_t) { ++query_calls; return Error(); };
+    require(f.engine->begin_reconcile(2, true), "request backend reconcile begins");
+    require(query_calls == 1, "engine requested the certified broker query");
+    require(!f.engine->account().ready, "account waits for broker snapshot");
+    Snapshot broker;
+    broker.scope = f.engine->scope();
+    broker.token = 2;
+    broker.free_cash = 1000000000000LL;
+    broker.account_success = true;
+    broker.positions_success = true;
+    broker.orders_success = true;
+    broker.trades_success = true;
+    broker.all_day_orders = true;
+    broker.all_day_trades = true;
+    SnapshotPosition sze_position;
+    sze_position.instrument = kSze;
+    sze_position.total = 10000;
+    sze_position.free_sellable = 10000;
+    broker.positions.push_back(sze_position);
+    SnapshotPosition sse_position;
+    sse_position.instrument = kSse;
+    sse_position.total = 10000;
+    sse_position.free_sellable = 10000;
+    broker.positions.push_back(sse_position);
+    f.backend->publish(broker);
+    require(f.engine->account().ready, "account ready after certified broker snapshot");
+}
+
 }  // namespace
 
 int main() {
@@ -296,6 +425,9 @@ int main() {
         test_has_working_order_transitions();
         test_cancel_result_after_terminal();
         test_atp_backend_closed_loop();
+        test_restart_cancel_open_orders();
+        test_atp_backend_certified_query();
+        test_engine_query_then_snapshot_reconcile();
     } catch (const std::exception& error) {
         std::cerr << "oms_merge_test FAILED: " << error.what() << "\n";
         return 1;

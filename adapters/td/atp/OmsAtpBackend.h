@@ -10,19 +10,30 @@ namespace oms {
 class AtpBackend : public Backend {
 public:
     typedef std::function<SendResult(const Command&)> Sender;
-    AtpBackend(const Scope& scope, const Sender& sender) : scope_(scope), sender_(sender) {}
+    typedef std::function<Error(const Scope&, std::uint64_t)> QuerySender;
+    AtpBackend(const Scope& scope, const Sender& sender,
+               const QuerySender& query = QuerySender(), bool certified_snapshot = false)
+        : scope_(scope), sender_(sender), query_(query), certified_snapshot_(certified_snapshot) {}
     Capabilities capabilities() const override {
         Capabilities c; c.fills = FillCoverage::Cumulative;
-        c.complete_snapshot = false; c.trades_required_for_snapshot = true; return c;
+        // complete_snapshot is only claimed once a query sender is installed
+        // and the broker snapshot assembly (fund/positions/orders/trades with
+        // full pagination and connection replay boundary) is certified.
+        c.complete_snapshot = certified_snapshot_;
+        c.trades_required_for_snapshot = true; return c;
     }
     SendResult submit(const Command& command) override { return send(command, false); }
     SendResult cancel(const Command& command) override { return send(command, true); }
-    Error query(const Scope&, std::uint64_t) override {
+    Error query(const Scope& scope, std::uint64_t token) override {
+        if (query_) return query_(scope, token);
         Error e; e.category = ErrorCategory::Unsupported;
         e.message = "ATP recovery not certified: account cash semantics, full pagination and connection replay boundary required";
         return e;
     }
     void publish(const Report& report) { if (report.scope == scope_) emit(report); }
+    // Broker-side query aggregation publishes the certified account snapshot;
+    // the OMS Engine consumes it as complete_snapshot() through this sink.
+    void publish_snapshot(const Snapshot& snapshot) { if (snapshot.scope == scope_) emit(snapshot); }
     void disconnected() { connection(scope_, false); }
     void close() {
         { std::lock_guard<std::mutex> guard(transport_mutex_); sender_ = Sender(); }
@@ -41,6 +52,8 @@ private:
     }
     Scope scope_;
     Sender sender_;
+    QuerySender query_;
+    bool certified_snapshot_;
     std::mutex transport_mutex_;
 };
 
