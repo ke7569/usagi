@@ -14,6 +14,14 @@ foreach(oms_test_name oms_test oms_recovery_test journal_test atp_boundary_test 
   set_tests_properties(${oms_test_name} PROPERTIES TIMEOUT 30)
 endforeach()
 
+# OMS merge item regression: Engine report idempotency, has_working_order and
+# AtpBackend closed loop (see docs/oms-merge-oms1-2-20260908.md).
+add_executable(oms_merge_test ${USAGI_ROOT}/tests/oms/oms_merge_test.cpp)
+target_include_directories(oms_merge_test PRIVATE ${BOOST_INCLUDE})
+target_link_libraries(oms_merge_test PRIVATE t0_oms_core)
+add_test(NAME oms_merge_test COMMAND oms_merge_test)
+set_tests_properties(oms_merge_test PROPERTIES TIMEOUT 30)
+
 add_executable(oms_benchmark EXCLUDE_FROM_ALL ${USAGI_ROOT}/tests/oms/oms_benchmark.cpp)
 target_link_libraries(oms_benchmark PRIVATE t0_oms_core)
 
