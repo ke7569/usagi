@@ -241,7 +241,10 @@ bool Capture::open(std::string* error) {
         config_.ring.max_payload_bytes != config_.journal.max_payload_bytes ||
         config_.stream.max_datagram_bytes == 0U ||
         config_.stream.max_datagram_bytes > sse_journal::kMaxDatagram ||
-        config_.stream.idle_gap_ns != 100000U ||
+        (config_.schema_version == 1U && config_.stream.idle_gap_ns != 100000U) ||
+        (config_.schema_version == 2U &&
+         (!config_.stream.idle_gap_ns || config_.stream.idle_gap_ns > 1000000000ULL ||
+          !config_.extended_timestamps || config_.stream.hardware_timestamp_interface.empty())) ||
         !config_.journal_queue_capacity || config_.journal_queue_capacity > kMaxQueueCapacity ||
         config_.journal_queue_capacity >
             (std::numeric_limits<std::size_t>::max)() / sizeof(sse_journal::StoredEvent)) {

@@ -30,6 +30,32 @@ void request_stop(int) {
     stop_requested = 1;
 }
 
+template <class Application>
+auto poll_outputs_if_supported(Application* application, int)
+    -> decltype(application->poll_outputs(), void()) {
+    application->poll_outputs();
+}
+
+template <class Application>
+void poll_outputs_if_supported(Application*, long) {}
+
+template <class Application>
+auto finish_if_supported(Application* application, int)
+    -> decltype(application->finish(), void()) {
+    application->finish();
+}
+
+template <class Application>
+void finish_if_supported(Application*, long) {}
+
+inline void cpu_relax() {
+#if defined(__x86_64__) || defined(__i386__)
+    __asm__ volatile("pause" ::: "memory");
+#else
+    std::this_thread::yield();
+#endif
+}
+
 std::uint64_t monotonic_ns() {
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -210,6 +236,7 @@ int run(const std::string& config_path, const std::string& profile_path,
     std::uint64_t payload_bytes = 0U;
     std::uint64_t last_status_events = 0U;
     std::uint64_t last_status_ns = started_ns;
+    unsigned idle_spins = 0U;
     bool ok = true;
     std::string error;
     std::vector<unsigned char> payload(config.journal.max_payload_bytes, 0U);
@@ -229,6 +256,21 @@ int run(const std::string& config_path, const std::string& profile_path,
         const sze_recovery::ReplayReadStatus status = consumer->next(
             &canonical, payload.data(), payload.size());
         if (status == sze_recovery::kReplayReadWouldBlock) {
+            try {
+                // The pipeline owns its output callbacks on this same thread;
+                // polling here prevents a quiet journal from delaying a ready
+                // model result until the next input record.
+                poll_outputs_if_supported(application.get(), 0);
+            } catch (const std::exception& exception) {
+                ok = false;
+                error = std::string("Shanghai journal prediction output poll failed: ") +
+                        exception.what();
+                break;
+            } catch (...) {
+                ok = false;
+                error = "Shanghai journal prediction output poll failed";
+                break;
+            }
             if (now >= next_status_ns) {
                 const std::uint64_t interval_ns = now - last_status_ns;
                 const std::uint64_t delta_events = events - last_status_events;
@@ -241,7 +283,13 @@ int run(const std::string& config_path, const std::string& profile_path,
                 last_status_ns = now;
                 next_status_ns = add_ms(now, 5000L);
             }
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            ++idle_spins;
+            if (idle_spins >= 4096U) {
+                idle_spins = 0U;
+                std::this_thread::yield();
+            } else {
+                cpu_relax();
+            }
             continue;
         }
         if (status != sze_recovery::kReplayReadEvent) {
@@ -251,6 +299,8 @@ int run(const std::string& config_path, const std::string& profile_path,
                 : "Shanghai journal handoff read failed";
             break;
         }
+
+        idle_spins = 0U;
 
         try {
             deepwin_market_data::StreamEvent event = sse_journal::decode(
@@ -284,12 +334,41 @@ int run(const std::string& config_path, const std::string& profile_path,
         }
     }
 
+    bool cleanup_ok = true;
+    std::string cleanup_error;
+    try {
+        application->begin_stop();
+    } catch (const std::exception& exception) {
+        cleanup_ok = false;
+        cleanup_error = std::string("Shanghai journal prediction begin_stop failed: ") +
+                        exception.what();
+    } catch (...) {
+        cleanup_ok = false;
+        cleanup_error = "Shanghai journal prediction begin_stop failed";
+    }
+    try {
+        // A pipeline implementation drains only already-closed BatchEnds;
+        // it must not manufacture a close for the final open batch.
+        finish_if_supported(application.get(), 0);
+    } catch (const std::exception& exception) {
+        cleanup_ok = false;
+        if (cleanup_error.empty())
+            cleanup_error = std::string("Shanghai journal prediction finish failed: ") +
+                            exception.what();
+    } catch (...) {
+        cleanup_ok = false;
+        if (cleanup_error.empty())
+            cleanup_error = "Shanghai journal prediction finish failed";
+    }
+    consumer->close();
+    if (!cleanup_ok) {
+        ok = false;
+        if (error.empty()) error = cleanup_error;
+    }
     if (!error.empty()) ok = false;
     const Json result = final_status(config, *consumer, application.get(),
                                      events, payload_bytes, started_ns, ok,
                                      host_boot, error);
-    application->begin_stop();
-    consumer->close();
     std::cout << result.dump() << '\n';
     return ok ? 0 : 1;
 }

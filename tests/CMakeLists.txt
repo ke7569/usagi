@@ -1,10 +1,25 @@
 add_executable(receive_timestamps_test ${USAGI_ROOT}/tests/common/receive_timestamps_test.cpp)
 add_test(NAME receive_timestamps_test COMMAND receive_timestamps_test)
 
+add_executable(market_data_stream_wait_test
+  ${USAGI_ROOT}/tests/common/market_data_stream_wait_test.cpp)
+target_link_libraries(market_data_stream_wait_test PRIVATE deepwin_market_data_runtime)
+target_compile_options(market_data_stream_wait_test PRIVATE -UNDEBUG)
+add_test(NAME market_data_stream_wait_test COMMAND market_data_stream_wait_test)
+set_tests_properties(market_data_stream_wait_test PROPERTIES TIMEOUT 10)
+
 add_executable(sse_journal_timestamp_test ${USAGI_ROOT}/tests/sse/sse_journal_timestamp_test.cpp)
 target_link_libraries(sse_journal_timestamp_test PRIVATE sse_journal_core deepwin_market_data_runtime)
 add_test(NAME sse_journal_timestamp_test COMMAND sse_journal_timestamp_test)
 set_tests_properties(sse_journal_timestamp_test PROPERTIES TIMEOUT 30)
+
+add_executable(sse_wait_transport_contract_test
+  ${USAGI_ROOT}/tests/sse/sse_wait_transport_contract_test.cpp)
+target_link_libraries(sse_wait_transport_contract_test PRIVATE
+  sse_journal_core deepwin_market_data_runtime)
+target_compile_options(sse_wait_transport_contract_test PRIVATE -UNDEBUG)
+add_test(NAME sse_wait_transport_contract_test COMMAND sse_wait_transport_contract_test)
+set_tests_properties(sse_wait_transport_contract_test PROPERTIES TIMEOUT 10)
 
 foreach(oms_test_name oms_test oms_recovery_test journal_test atp_boundary_test async_journal_test)
   add_executable(${oms_test_name} ${USAGI_ROOT}/tests/oms/${oms_test_name}.cpp)

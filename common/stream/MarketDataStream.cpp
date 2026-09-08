@@ -67,6 +67,11 @@ std::uint64_t clock_ns(clockid_t clock) {
     return static_cast<std::uint64_t>(value.tv_sec) * 1000000000ULL + value.tv_nsec;
 }
 
+std::uint64_t add_ns(std::uint64_t start, std::uint64_t delta) {
+    const std::uint64_t maximum = (std::numeric_limits<std::uint64_t>::max)();
+    return delta > maximum - start ? maximum : start + delta;
+}
+
 std::string io_error(const char* operation) {
     return std::string(operation) + ": " + std::strerror(errno);
 }
@@ -498,16 +503,27 @@ struct MarketDataStream::Impl {
                 }
                 std::uint64_t wait = std::min<std::uint64_t>(1000000ULL, deadline - now);
                 if (idle_armed) {
-                    const std::uint64_t idle_due = last_receive + options.idle_gap_ns + 1;
+                    const std::uint64_t idle_due = add_ns(last_receive, options.idle_gap_ns);
                     wait = std::min(wait, now >= idle_due ? 0 : idle_due - now);
                 }
                 timespec timeout = {static_cast<time_t>(wait / 1000000000ULL), static_cast<long>(wait % 1000000000ULL)};
-                const int ready = ::ppoll(sockets.data(), sockets.size(), &timeout, 0);
+                int ready = ::ppoll(sockets.data(), sockets.size(), &timeout, 0);
                 if (ready < 0 && errno == EINTR) continue;
                 if (ready < 0) throw std::runtime_error(io_error("UDP ppoll"));
                 if (!ready && idle_armed) {
                     const std::uint64_t time = clock_ns(CLOCK_MONOTONIC);
-                    if (time > last_receive + options.idle_gap_ns && time < deadline) {
+                    const std::uint64_t idle_due = add_ns(last_receive, options.idle_gap_ns);
+                    if (time > idle_due && time < deadline) {
+                        // A packet can become visible between the timed poll
+                        // and this observation. Re-poll with zero timeout and
+                        // drain those ready sockets before publishing idle.
+                        const timespec zero_timeout = {0, 0};
+                        ready = ::ppoll(sockets.data(), sockets.size(),
+                                        &zero_timeout, 0);
+                        if (ready < 0 && errno == EINTR) continue;
+                        if (ready < 0) throw std::runtime_error(io_error("UDP idle drain poll"));
+                    }
+                    if (!ready && time > idle_due && time < deadline) {
                         RecordHeader idle = {};
                         idle.magic = kRecordMagic;
                         idle.kind = kIdleEvent;
@@ -633,7 +649,8 @@ std::string MarketDataStream::recording_error() const {
 }
 
 bool MarketDataStream::run(const std::vector<ChannelSpec>& channels, const StreamOptions& options,
-                           const StreamCallback& callback, long duration_ms, std::string* error) {
+                           const StreamCallback& callback, long duration_ms, std::string* error,
+                           const StreamPollCallback& owner_poll) {
     if (error) error->clear();
     impl_->stats = StreamStats();
     {
@@ -680,6 +697,17 @@ bool MarketDataStream::run(const std::vector<ChannelSpec>& channels, const Strea
             const ReceiveClockInfo* clocks = 0;
             const RecordHeader* header = ingress->front(&payload, &clocks);
             if (!header) {
+                if (owner_poll) {
+                    try {
+                        owner_poll();
+                    } catch (const std::exception& exception) {
+                        impl_->fail(std::string("stream owner poll failed: ") + exception.what());
+                        break;
+                    } catch (...) {
+                        impl_->fail("stream owner poll failed");
+                        break;
+                    }
+                }
                 if (impl_->receiver_done.load(std::memory_order_acquire) && ingress->empty()) break;
                 std::this_thread::yield();
                 continue;

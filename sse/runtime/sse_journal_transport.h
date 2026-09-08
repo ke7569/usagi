@@ -53,6 +53,7 @@ inline std::string boot_id() {
 }
 
 struct Config {
+    unsigned schema_version;
     sze_recovery::JournalConfig journal;
     sze_recovery::RingConfig ring;
     deepwin_market_data::StreamOptions stream;
@@ -63,7 +64,7 @@ struct Config {
     long duration_ms;
     std::string boot;
     bool extended_timestamps;
-    Config() : journal_queue_capacity(32768), journal_cpu(-1), prediction_cpu(-1),
+    Config() : schema_version(1), journal_queue_capacity(32768), journal_cpu(-1), prediction_cpu(-1),
                flush_interval_ms(100), duration_ms(0), extended_timestamps(false) {}
 };
 
@@ -79,9 +80,11 @@ inline Config load(const std::string& path) {
         "queue_capacity", "max_datagram_bytes", "receive_batch_size", "receive_buffer_bytes",
         "idle_gap_ns", "receive_cpu", "dispatch_cpu", "journal_cpu", "prediction_cpu",
         "flush_interval_ms", "duration_ms", "hardware_timestamp_interface", "channels"});
-    if (value.at("schema_version") != 1)
+    const std::uint64_t schema_version = stream_input::uint_value(value.at("schema_version"));
+    if (schema_version != 1U && schema_version != 2U)
         throw std::runtime_error("unsupported SSE journal transport configuration");
     Config config;
+    config.schema_version = static_cast<unsigned>(schema_version);
     const std::string payload_format = value.at("payload_format").get<std::string>();
     if (payload_format == "sse-stream-v1") {
         config.extended_timestamps = false;
@@ -109,6 +112,9 @@ inline Config load(const std::string& path) {
         "hardware_timestamp_interface", std::string());
     if (!config.extended_timestamps && !config.stream.hardware_timestamp_interface.empty())
         throw std::runtime_error("hardware timestamp interface requires sse-stream-v2");
+    if (config.schema_version == 2U &&
+        (!config.extended_timestamps || config.stream.hardware_timestamp_interface.empty()))
+        throw std::runtime_error("SSE journal schema v2 requires hardware sse-stream-v2 timestamps");
     config.journal.max_payload_bytes = stored_header_bytes(config) + kMaxDatagram;
     config.journal.segment_bytes = 256ULL << 20;
     stream_input::optional_uint(value, "segment_bytes", &config.journal.segment_bytes);
@@ -140,7 +146,10 @@ inline Config load(const std::string& path) {
     stream_input::optional_uint(value, "idle_gap_ns", &config.stream.idle_gap_ns);
     stream_input::cpu(value, "receive_cpu", &config.stream.receive_cpu);
     stream_input::cpu(value, "dispatch_cpu", &config.stream.dispatch_cpu);
-    if (config.stream.idle_gap_ns != 100000 || config.stream.max_datagram_bytes > kMaxDatagram ||
+    if ((config.schema_version == 1U && config.stream.idle_gap_ns != 100000U) ||
+        (config.schema_version == 2U &&
+         (!config.stream.idle_gap_ns || config.stream.idle_gap_ns > 1000000000ULL)) ||
+        config.stream.max_datagram_bytes > kMaxDatagram ||
         !config.stream.max_datagram_bytes || !config.ring.capacity || !config.journal_queue_capacity ||
         !config.flush_interval_ms)
         throw std::runtime_error("invalid SSE journal capacities/timing");

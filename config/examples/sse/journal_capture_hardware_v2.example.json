@@ -1,0 +1,30 @@
+{
+  "schema_version": 2,
+  "payload_format": "sse-stream-v2",
+  "trading_day": 20260908,
+  "source_id": 89,
+  "generation": 2,
+  "boot_id": "SET_CURRENT_HOST_BOOT_ID",
+  "journal_directory": "/SET_NEW_JOURNAL_DIRECTORY_V2",
+  "journal_prefix": "sse",
+  "shm_path": "/dev/shm/SET_NEW_SSE_RING_V2",
+  "segment_bytes": 268435456,
+  "min_free_bytes_after_allocate": 10737418240,
+  "ring_capacity": 65536,
+  "journal_queue_capacity": 32768,
+  "queue_capacity": 32768,
+  "max_datagram_bytes": 8192,
+  "receive_batch_size": 64,
+  "receive_buffer_bytes": 67108864,
+  "idle_gap_ns": 5000,
+  "receive_cpu": -1,
+  "dispatch_cpu": -1,
+  "journal_cpu": -1,
+  "prediction_cpu": -1,
+  "flush_interval_ms": 100,
+  "duration_ms": 0,
+  "hardware_timestamp_interface": "hqh-p1-k2",
+  "channels": [
+    {"name": "sse_tick", "group": "239.35.80.9", "port": 37109, "interface_ip": "11.11.11.11"}
+  ]
+}

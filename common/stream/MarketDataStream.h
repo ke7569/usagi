@@ -41,6 +41,7 @@ struct StreamEvent {
 };
 
 typedef std::function<void(const StreamEvent&)> StreamCallback;
+typedef std::function<void()> StreamPollCallback;
 
 struct StreamOptions {
     StreamOptions();
@@ -97,8 +98,11 @@ public:
 
     // One receive producer, one serialized application callback, one optional
     // disk writer. stop() may be called by the callback or an external thread.
+    // owner_poll runs on this serialized owner thread whenever ingress is empty;
+    // an empty callback preserves the legacy behavior.
     bool run(const std::vector<ChannelSpec>& channels, const StreamOptions& options,
-             const StreamCallback& callback, long duration_ms, std::string* error);
+             const StreamCallback& callback, long duration_ms, std::string* error,
+             const StreamPollCallback& owner_poll = StreamPollCallback());
     void stop();
     bool stopping() const;
     bool ready() const;
