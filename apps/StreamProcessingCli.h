@@ -161,6 +161,11 @@ public:
         const Json routing = Json::parse(R"json({"clock":"exchange-time-of-day-micros",
             "snapshot_selected_window":"[09:30:00,09:35:00)","tick_selected_window":"[09:35:00,24:00:00)",
             "tick_warm_before_switch":true,"silent_fallback":false})json");
+        // Reserved integration switch for the Auction59 producer package
+        // (sse/auction). Disabled by default: wiring the engine into this
+        // stream processor is deferred, so only enabled:false is accepted.
+        const Json auction59_contract = Json::parse(R"json({"enabled":false})json");
+        if (prediction.count("auction59")) subset(prediction.at("auction59"), auction59_contract);
         if (prediction.count("sampling")) subset(prediction.at("sampling"), sampling);
         if (prediction.count("routing")) subset(prediction.at("routing"), routing);
         (void)channels;

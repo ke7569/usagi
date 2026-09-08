@@ -78,3 +78,30 @@ if(T0_BUILD_SSE_STREAM_PROCESSOR)
     sse_journal_core sse_runtime_support sse_strategy_session)
   target_include_directories(t0_sse_journal_predict PRIVATE ${BOOST_INCLUDE})
 endif()
+
+if(T0_BUILD_SSE_STREAM_PROCESSOR)
+  # Auction59 opening-auction package: opening-boundary quality, per-stock
+  # static metadata (CSV) and the auction reconstruction engine, with its
+  # standalone replay/follow runner. Not yet wired into the SSE stream
+  # processor; the processing profile reserves an optional "auction59" toggle
+  # under "prediction" for that integration (see StreamProcessingCli). The
+  # library stays self-contained (no decoder.cpp dependency); the runner
+  # compiles the decoder directly.
+  add_library(sse_auction59 STATIC
+    ${USAGI_ROOT}/sse/auction/sse_opening_boundary.cpp
+    ${USAGI_ROOT}/sse/auction/auction_static_metadata.cpp
+    ${USAGI_ROOT}/sse/auction/auction59_engine.cpp)
+  target_link_libraries(sse_auction59 PUBLIC pthread)
+  add_executable(sse_auction59_live
+    ${USAGI_ROOT}/sse/auction/sse_auction59_live.cpp
+    ${USAGI_ROOT}/sse/market_data/sse_primary_decoder.cpp)
+  target_include_directories(sse_auction59_live PRIVATE ${USAGI_ROOT}/sse/market_data)
+  target_link_libraries(sse_auction59_live PRIVATE sse_auction59 pthread rt)
+  foreach(auction_test auction59_engine_test auction_static_metadata_test sse_opening_boundary_test)
+    add_executable(${auction_test} ${USAGI_ROOT}/tests/sse/${auction_test}.cpp)
+    target_link_libraries(${auction_test} PRIVATE sse_auction59)
+    target_compile_options(${auction_test} PRIVATE -UNDEBUG)
+    add_test(NAME ${auction_test} COMMAND ${auction_test})
+    set_tests_properties(${auction_test} PROPERTIES TIMEOUT 60)
+  endforeach()
+endif()
