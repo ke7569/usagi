@@ -30,24 +30,6 @@ void request_stop(int) {
     stop_requested = 1;
 }
 
-template <class Application>
-auto poll_outputs_if_supported(Application* application, int)
-    -> decltype(application->poll_outputs(), void()) {
-    application->poll_outputs();
-}
-
-template <class Application>
-void poll_outputs_if_supported(Application*, long) {}
-
-template <class Application>
-auto finish_if_supported(Application* application, int)
-    -> decltype(application->finish(), void()) {
-    application->finish();
-}
-
-template <class Application>
-void finish_if_supported(Application*, long) {}
-
 inline void cpu_relax() {
 #if defined(__x86_64__) || defined(__i386__)
     __asm__ volatile("pause" ::: "memory");
@@ -260,7 +242,7 @@ int run(const std::string& config_path, const std::string& profile_path,
                 // The pipeline owns its output callbacks on this same thread;
                 // polling here prevents a quiet journal from delaying a ready
                 // model result until the next input record.
-                poll_outputs_if_supported(application.get(), 0);
+                application->poll_outputs();
             } catch (const std::exception& exception) {
                 ok = false;
                 error = std::string("Shanghai journal prediction output poll failed: ") +
@@ -349,7 +331,7 @@ int run(const std::string& config_path, const std::string& profile_path,
     try {
         // A pipeline implementation drains only already-closed BatchEnds;
         // it must not manufacture a close for the final open batch.
-        finish_if_supported(application.get(), 0);
+        application->finish();
     } catch (const std::exception& exception) {
         cleanup_ok = false;
         if (cleanup_error.empty())

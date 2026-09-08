@@ -16,7 +16,7 @@
   "max_datagram_bytes": 8192,
   "receive_batch_size": 64,
   "receive_buffer_bytes": 67108864,
-  "idle_gap_ns": 5000,
+  "idle_gap_ns": 100000,
   "receive_cpu": -1,
   "dispatch_cpu": -1,
   "journal_cpu": -1,

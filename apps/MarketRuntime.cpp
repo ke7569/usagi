@@ -182,9 +182,11 @@ private:
             }
         } catch (const std::exception& exception) { error_ = exception.what(); succeeded_ = false; }
           catch (...) { error_ = "unknown market runtime error"; succeeded_ = false; }
+        application_->begin_stop();
 #ifdef T0_STREAM_SSE
         // Same thread as all on_event/poll_outputs callbacks, after raw input
-        // stopped. Finish only work sealed by a recorded BatchEnd; no EOF cut.
+        // stopped and new strategy intents disabled. Drain model outputs only
+        // for work sealed by a recorded BatchEnd; no EOF cut.
         try { application_->finish(); }
         catch (const std::exception& exception) {
             if (error_.empty()) error_ = exception.what();
@@ -194,7 +196,6 @@ private:
             succeeded_ = false;
         }
 #endif
-        application_->begin_stop();
         try {
             Json out;
             out["ok"] = succeeded_;
