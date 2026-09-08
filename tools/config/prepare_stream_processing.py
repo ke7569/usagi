@@ -36,13 +36,13 @@ _RECOVERY_HEADER_BYTES = 72
 _RECOVERY_TRAILER_BYTES = 16
 _RECOVERY_PAGE_BYTES = 4096
 # Match the existing config_sse_hybrid_prediction_20260818.json contract.
-_SSE_SAMPLING = {
+_SSE_HARDWARE_SAMPLING = {
     "mode": "hardware-gap-batch",
     "threshold_ns": 5000,
     "comparison": "greater-or-equal",
     "clock": "NIC_PHC",
     "candidate_event": "CompleteOrderBookSH Level2",
-    "activity_scope": "global-sse-datagram-gap",
+    "activity_scope": "per-udp-subscription-gap",
     "same_exchange_time_policy": "at-most-one-sample",
     "initial_window": "first-valid-book-at-or-after-open",
     "sequence_gap_policy": "fail-closed",
@@ -55,6 +55,12 @@ _SSE_SAMPLING = {
         "min_volume_change": 100,
     },
 }
+_SSE_SOFTWARE_SAMPLING = copy.deepcopy(_SSE_HARDWARE_SAMPLING)
+_SSE_SOFTWARE_SAMPLING.update({
+    "mode": "trailing-edge-one-shot", "threshold_ns": 100000,
+    "clock": "CLOCK_MONOTONIC", "activity_scope": "per-instrument-sse-book-update",
+    "comparison": "strict-greater-than",
+})
 _SSE_ROUTING = {
     "clock": "exchange-time-of-day-micros",
     "snapshot_selected_window": "[09:30:00,09:35:00)",
@@ -154,7 +160,7 @@ def _recovery_projection(config, recovery_input):
 
 
 def make_profile(config, factors_only=False, strategy_intents=False,
-                 recovery_input=None):
+                 recovery_input=None, sse_contract=None, pipeline=None):
     """Validate a unified config and project only stream-processing inputs."""
     if type(factors_only) is not bool:
         raise ConfigError("factors_only must be boolean")
@@ -162,6 +168,8 @@ def make_profile(config, factors_only=False, strategy_intents=False,
         raise ConfigError("strategy_intents must be boolean")
     validate(config)
     market = config["market"]
+    if market != "SH" and (sse_contract is not None or pipeline is not None):
+        raise ConfigError("SSE contract and pipeline options require market SH")
     if strategy_intents and factors_only:
         raise ConfigError("strategy intents require prediction mode")
     environment = config["environment"]
@@ -185,9 +193,42 @@ def make_profile(config, factors_only=False, strategy_intents=False,
     if market == "SH" and "model_type" in prediction and prediction["model_type"] != "sse_hybrid_native":
         raise ConfigError("SH stream processing requires model_type=sse_hybrid_native")
     if market == "SH":
-        for field, expected in (("sampling", _SSE_SAMPLING), ("routing", _SSE_ROUTING)):
+        if sse_contract not in (None, "sse-per-instrument-v2", "sse-hardware-batch-v3"):
+            raise ConfigError("unsupported SSE processing contract")
+        declaration = prediction.get("sampling", {})
+        if sse_contract is None:
+            hardware = (declaration.get("mode") == "hardware-gap-batch" or
+                        declaration.get("clock") == "NIC_PHC" or
+                        declaration.get("threshold_ns") == 5000 or
+                        declaration.get("activity_scope") == "per-udp-subscription-gap")
+            sse_contract = "sse-hardware-batch-v3" if hardware else "sse-per-instrument-v2"
+        sampling = (_SSE_HARDWARE_SAMPLING if sse_contract == "sse-hardware-batch-v3"
+                    else _SSE_SOFTWARE_SAMPLING)
+        for field, expected in (("sampling", sampling), ("routing", _SSE_ROUTING)):
             if field in prediction:
                 _require_contract_subset(prediction[field], expected, "prediction." + field)
+        if pipeline is not None:
+            if sse_contract != "sse-hardware-batch-v3" or not isinstance(pipeline, dict):
+                raise ConfigError("SSE pipeline requires hardware-batch-v3")
+            expected = {"book_cpus", "inference_cpus", "ingress_capacity",
+                        "inference_capacity", "output_capacity"}
+            if set(pipeline) != expected:
+                raise ConfigError("SSE pipeline requires exactly: " + ", ".join(sorted(expected)))
+            explicit_cpus = set()
+            for key in ("book_cpus", "inference_cpus"):
+                cpus = pipeline[key]
+                if not isinstance(cpus, list) or not 1 <= len(cpus) <= 64:
+                    raise ConfigError("SSE pipeline." + key + " requires 1..64 CPUs")
+                for cpu in cpus:
+                    if type(cpu) is not int or not -1 <= cpu <= 1048575:
+                        raise ConfigError("SSE pipeline CPU must be -1 or a CPU index")
+                    if cpu >= 0 and cpu in explicit_cpus:
+                        raise ConfigError("SSE pipeline CPUs must be distinct")
+                    if cpu >= 0:
+                        explicit_cpus.add(cpu)
+            for key in ("ingress_capacity", "inference_capacity", "output_capacity"):
+                if type(pipeline[key]) is not int or not 1 <= pipeline[key] <= 1048576:
+                    raise ConfigError("SSE pipeline capacity must be in [1,1048576]")
     required_paths = ("model_path",) + (_SNAPSHOT_PATHS if market == "SH" else ())
     if market == "SH" and not factors_only:
         required_paths += ("snapshot_auction59_factors_path",)
@@ -217,13 +258,15 @@ def make_profile(config, factors_only=False, strategy_intents=False,
         "market": market,
         "execution": "disabled",
         "processing_mode": "factors-only" if factors_only else "prediction",
-        "processing_contract": _PROCESSING_CONTRACTS[market],
+        "processing_contract": sse_contract if market == "SH" else _PROCESSING_CONTRACTS[market],
         "trading_day": trading_day,
         "processing_sha256": processing_hash(config),
         "environment": copy.deepcopy(environment),
         "prediction": copy.deepcopy(prediction),
         "instruments": instruments,
     }
+    if pipeline is not None:
+        profile["pipeline"] = copy.deepcopy(pipeline)
     recovery, input_driver = _recovery_projection(config, recovery_input)
     if recovery is not None:
         profile["recovery"] = recovery
@@ -247,10 +290,14 @@ def main(argv=None):
     parser.add_argument("--strategy-intents", action="store_true",
                         help="enable paper ZStrategy order-intent output only, without TD or simulated fills")
     parser.add_argument("--recovery-input", choices=("journal", "handoff"))
+    parser.add_argument("--sse-contract", choices=("sse-per-instrument-v2", "sse-hardware-batch-v3"),
+                        help="explicit clock/sampling contract; otherwise use the declaration or software v2")
+    parser.add_argument("--sse-pipeline", help="JSON file with book/inference CPUs and queue capacities")
     args = parser.parse_args(argv)
     profile = make_profile(load_json(args.config), factors_only=args.factors_only,
                            strategy_intents=args.strategy_intents,
-                           recovery_input=args.recovery_input)
+                           recovery_input=args.recovery_input, sse_contract=args.sse_contract,
+                           pipeline=load_json(args.sse_pipeline) if args.sse_pipeline else None)
     write_json(args.output, profile)
 
 

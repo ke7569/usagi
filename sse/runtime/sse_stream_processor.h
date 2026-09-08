@@ -13,15 +13,41 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace sse_stream {
 
+enum ProcessingContract { kSoftwarePerInstrumentV2 = 2, kHardwareBatchV3 = 3 };
+
+// Empty CPU lists select the deterministic serial implementation of v3.
+// Otherwise each worker leases and binds a distinct L3 domain.
+struct PipelineConfig {
+    ProcessingContract contract;
+    std::vector<int> book_cpus;
+    std::vector<int> inference_cpus;
+    std::size_t ingress_capacity;
+    std::size_t inference_capacity;
+    std::size_t output_capacity;
+    PipelineConfig();
+};
+
+struct PipelineStats {
+    std::uint64_t applied_ticks, accepted_samples, inferred_samples, closed_batches;
+    std::uint64_t retained_rows, retained_row_high_water;
+    std::vector<int> book_cpus, inference_cpus;
+    std::vector<std::vector<std::size_t> > channel_shard_counts;
+    PipelineStats();
+};
+
+class ComputePipeline;
+
 static const std::uint64_t kSnapshotGenerateStartMicros = 34200000000ULL;
 static const std::uint64_t kSnapshotGenerateEndMicros = 34860000000ULL;
 
 struct Provenance {
+    ProcessingContract processing_contract;
     deepwin_market_data::StreamEventKind stream_kind;
     std::uint64_t stream_sequence;
     std::uint64_t monotonic_ns;
@@ -36,6 +62,8 @@ struct Provenance {
     std::uint32_t source_ipv4;
     std::uint16_t source_port;
     std::uint16_t timestamp_flags;
+    std::uint64_t hardware_ns;
+    std::int32_t hardware_clock_index;
     std::uint64_t batch_id;
     std::uint64_t batch_emitted_ns;
     sse_live_sampling::BatchCloseReason batch_close_reason;
@@ -72,11 +100,16 @@ struct SnapshotOutput {
 
 struct BatchEndOutput {
     std::uint64_t batch_id;
+    std::uint32_t stream_channel_id;
     std::uint64_t last_hardware_ns;
     std::uint64_t emitted_monotonic_ns;
     std::uint32_t packet_count;
     std::uint32_t candidate_count;
     std::uint32_t prediction_count;
+    std::uint64_t last_stream_sequence;
+    std::uint16_t timestamp_flags;
+    std::int32_t hardware_clock_index;
+    sse_live_sampling::BatchCloseReason reason;
 
     BatchEndOutput();
 };
@@ -104,11 +137,18 @@ public:
                        const sse_hybrid_model::Model* model,
                        bool factors_only,
                        const OutputCallback& callback,
-                       const Auction59Provider& auction59_provider = Auction59Provider());
+                       const Auction59Provider& auction59_provider = Auction59Provider(),
+                       const PipelineConfig& pipeline = PipelineConfig());
+    ~SseStreamProcessor();
 
     // Processes one live or replay event. Invalid input is sticky: this method
     // throws std::runtime_error and every subsequent call throws the same error.
     void on_event(const deepwin_market_data::StreamEvent& event);
+    // Only the thread that first calls on_event/poll_outputs may dispatch
+    // callbacks. finish drains confirmed cuts; it never flushes an open batch.
+    void poll_outputs();
+    void finish();
+    PipelineStats pipeline_stats() const;
 
     bool invalid() const { return invalid_; }
     const std::string& invalid_reason() const { return invalid_reason_; }
@@ -148,10 +188,6 @@ private:
                           const deepwin_market_data::StreamEvent& event,
                           std::size_t record_offset);
     void process_closed_batch(const sse_live_sampling::BatchEnd& batch);
-    void advance_hardware_batch(const deepwin_market_data::StreamEvent& event);
-    void close_hardware_batch(std::uint64_t emitted_monotonic_ns,
-                              sse_live_sampling::BatchCloseReason reason);
-    void commit_hardware_candidate(const sse_live_sampling::Candidate& candidate);
     sse_live_sampling::TickCut book_cut(const InstrumentState& state,
                                       const sse_live::TickEvent& tick) const;
     void initialize_window(InstrumentState& state, const sse_live::TickEvent& tick);
@@ -167,14 +203,6 @@ private:
     SequenceMap channel_sequences_;
     sse_live_sampling::BatchEndSampler batch_sampler_;
     std::vector<sse_live_sampling::BatchEnd> closed_batches_;
-    bool hardware_batch_mode_;
-    bool hardware_batch_open_;
-    std::uint64_t hardware_batch_id_;
-    std::uint64_t next_hardware_batch_id_;
-    std::uint64_t last_hardware_ns_;
-    std::uint64_t last_hardware_monotonic_ns_;
-    std::uint32_t hardware_batch_packet_count_;
-    std::map<std::string, sse_live_sampling::Candidate> hardware_candidates_;
     const sse_hybrid_model::Model* model_;
     bool factors_only_;
     OutputCallback callback_;
@@ -182,6 +210,8 @@ private:
     std::map<std::string, std::vector<float> > auction59_inputs_;
     bool invalid_;
     std::string invalid_reason_;
+    std::unique_ptr<ComputePipeline> pipeline_;
+    bool finished_;
 };
 
 }  // namespace sse_stream

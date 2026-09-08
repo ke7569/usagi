@@ -44,6 +44,7 @@ endif()
 if(T0_BUILD_SSE_STREAM_PROCESSOR)
   add_library(sse_stream_processing STATIC
     ${USAGI_ROOT}/sse/runtime/sse_stream_processor.cpp
+    ${USAGI_ROOT}/sse/runtime/sse_compute_pipeline.cpp
     ${USAGI_ROOT}/sse/market_data/sse_primary_decoder.cpp
     ${USAGI_ROOT}/sse/market_data/sse_tick_order_book.cpp
     ${USAGI_ROOT}/sse/factors/sse_tick_factors.cpp
@@ -53,7 +54,7 @@ if(T0_BUILD_SSE_STREAM_PROCESSOR)
   target_include_directories(sse_stream_processing PUBLIC ${USAGI_ROOT}/sse)
   target_compile_options(sse_stream_processing PRIVATE -ffp-contract=off)
   target_link_libraries(sse_stream_processing PUBLIC
-    deepwin_market_data_runtime sse_live_sampling sse_hybrid_model_runtime)
+    deepwin_market_data_runtime sse_live_sampling sse_hybrid_model_runtime sse_runtime_support)
   add_executable(sse_fast_decode_test ${USAGI_ROOT}/tests/sse/sse_fast_decode_test.cpp)
   target_link_libraries(sse_fast_decode_test PRIVATE sse_stream_processing)
   add_test(NAME sse_fast_decode_test COMMAND sse_fast_decode_test)
@@ -69,6 +70,11 @@ if(T0_BUILD_SSE_STREAM_PROCESSOR)
   target_compile_options(sse_stream_processor_test PRIVATE -UNDEBUG)
   add_test(NAME sse_stream_processor_test COMMAND sse_stream_processor_test)
   set_tests_properties(sse_stream_processor_test PROPERTIES TIMEOUT 20)
+  add_executable(sse_compute_pipeline_test ${USAGI_ROOT}/tests/sse/sse_compute_pipeline_test.cpp)
+  target_link_libraries(sse_compute_pipeline_test PRIVATE sse_stream_processing)
+  target_compile_options(sse_compute_pipeline_test PRIVATE -UNDEBUG)
+  add_test(NAME sse_compute_pipeline_test COMMAND sse_compute_pipeline_test)
+  set_tests_properties(sse_compute_pipeline_test PROPERTIES TIMEOUT 30 RUN_SERIAL TRUE)
   add_library(sse_strategy_session STATIC ${USAGI_ROOT}/sse/runtime/sse_strategy_session.cpp)
   target_link_libraries(sse_strategy_session PUBLIC sse_stream_processing t0_strategy_core)
   add_executable(sse_strategy_session_test ${USAGI_ROOT}/tests/sse/sse_strategy_session_test.cpp)

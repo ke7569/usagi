@@ -1,0 +1,7 @@
+{
+  "book_cpus": [-1, -1],
+  "inference_cpus": [-1, -1],
+  "ingress_capacity": 65536,
+  "inference_capacity": 4096,
+  "output_capacity": 4096
+}

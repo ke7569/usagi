@@ -72,7 +72,7 @@ bool validate_config(const nlohmann::json& config, std::string* error) {
         !require_string(*sampling, "comparison", "greater-or-equal", error) ||
         !require_string(*sampling, "clock", "NIC_PHC", error) ||
         !require_string(*sampling, "candidate_event", "CompleteOrderBookSH Level2", error) ||
-        !require_string(*sampling, "activity_scope", "global-sse-datagram-gap", error) ||
+        !require_string(*sampling, "activity_scope", "per-udp-subscription-gap", error) ||
         !require_string(*sampling, "same_exchange_time_policy", "at-most-one-sample", error) ||
         !require_string(*sampling, "initial_window", "first-valid-book-at-or-after-open", error) ||
         !require_string(*sampling, "sequence_gap_policy", "fail-closed", error) ||

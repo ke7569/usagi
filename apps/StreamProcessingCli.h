@@ -76,6 +76,9 @@ public:
         std::set<std::string> fields = {"schema_version", "market", "execution", "processing_mode",
             "processing_contract", "trading_day", "processing_sha256", "environment", "prediction", "instruments"};
         if (profile_.count("strategy_runtime")) fields.insert("strategy_runtime");
+#ifndef T0_STREAM_SZE
+        if (profile_.count("pipeline")) fields.insert("pipeline");
+#endif
 #ifdef T0_STREAM_SZE
         if (input_driver_ != "raw") {
             fields.insert("input_driver"); fields.insert("recovery");
@@ -150,14 +153,53 @@ public:
             });
         }
 #else
-        if (string(profile_, "market") != "SH" || string(profile_, "processing_contract") != "sse-per-instrument-v2")
-            throw std::runtime_error("this binary requires the SSE per-instrument-v2 profile");
-        const Json sampling = Json::parse(R"json({"mode":"hardware-gap-batch","threshold_ns":5000,
+        const std::string contract = string(profile_, "processing_contract");
+        if (string(profile_, "market") != "SH" ||
+            (contract != "sse-per-instrument-v2" && contract != "sse-hardware-batch-v3"))
+            throw std::runtime_error("this binary requires an explicit SSE v2 or hardware v3 profile");
+        sse_stream::PipelineConfig pipeline;
+        pipeline.contract = contract == "sse-hardware-batch-v3" ?
+            sse_stream::kHardwareBatchV3 : sse_stream::kSoftwarePerInstrumentV2;
+        if (profile_.count("pipeline")) {
+            if (pipeline.contract != sse_stream::kHardwareBatchV3)
+                throw std::runtime_error("SSE pipeline requires hardware-batch-v3");
+            const Json& settings = profile_.at("pipeline");
+            stream_input::fields(settings, {"book_cpus", "inference_cpus", "ingress_capacity",
+                                           "inference_capacity", "output_capacity"});
+            for (const char* key : {"book_cpus", "inference_cpus"}) {
+                const Json& cpus = settings.at(key);
+                if (!cpus.is_array() || cpus.empty() || cpus.size() > 64)
+                    throw std::runtime_error("SSE pipeline requires 1..64 CPUs per worker stage");
+                std::vector<int>& values = std::string(key) == "book_cpus" ?
+                    pipeline.book_cpus : pipeline.inference_cpus;
+                for (const Json& cpu : cpus) {
+                    if (!cpu.is_number_integer() || cpu.get<long long>() < -1 || cpu.get<long long>() > 1048575)
+                        throw std::runtime_error("invalid SSE pipeline CPU");
+                    values.push_back(cpu.get<int>());
+                }
+            }
+            for (const char* key : {"ingress_capacity", "inference_capacity", "output_capacity"}) {
+                const std::uint64_t value = stream_input::uint_value(settings.at(key));
+                if (value < 1 || value > 1048576)
+                    throw std::runtime_error("SSE pipeline capacities must be in [1,1048576]");
+                if (std::string(key) == "ingress_capacity") pipeline.ingress_capacity = value;
+                else if (std::string(key) == "inference_capacity") pipeline.inference_capacity = value;
+                else pipeline.output_capacity = value;
+            }
+        }
+        Json sampling = Json::parse(R"json({"mode":"hardware-gap-batch","threshold_ns":5000,
             "comparison":"greater-or-equal","clock":"NIC_PHC","candidate_event":"CompleteOrderBookSH Level2",
-            "activity_scope":"global-sse-datagram-gap","same_exchange_time_policy":"at-most-one-sample",
+            "activity_scope":"per-udp-subscription-gap","same_exchange_time_policy":"at-most-one-sample",
             "initial_window":"first-valid-book-at-or-after-open","sequence_gap_policy":"fail-closed","periodic_md":false,
             "shutdown_flush":false,"standard_gate":{"turnover_threshold_source":"daily-instrument-static-required",
             "exchange_time_trigger_us":100000000,"mid_change_epsilon":0.000001,"min_volume_change":100}})json");
+        if (pipeline.contract == sse_stream::kSoftwarePerInstrumentV2) {
+            sampling["mode"] = "trailing-edge-one-shot";
+            sampling["threshold_ns"] = 100000;
+            sampling["clock"] = "CLOCK_MONOTONIC";
+            sampling["activity_scope"] = "per-instrument-sse-book-update";
+            sampling["comparison"] = "strict-greater-than";
+        }
         const Json routing = Json::parse(R"json({"clock":"exchange-time-of-day-micros",
             "snapshot_selected_window":"[09:30:00,09:35:00)","tick_selected_window":"[09:35:00,24:00:00)",
             "tick_warm_before_switch":true,"silent_fallback":false})json");
@@ -221,7 +263,7 @@ public:
                 if (found == auction_.end()) return false;
                 *values = found->second;
                 return true;
-            }));
+            }, pipeline));
 #endif
         initialize_strategy(healthy);
     }
@@ -231,6 +273,18 @@ public:
             processor_->on_event(event);
         }
         catch (...) { begin_stop(); throw; }
+    }
+    void poll_outputs() {
+#ifndef T0_STREAM_SZE
+        try { processor_->poll_outputs(); }
+        catch (...) { begin_stop(); throw; }
+#endif
+    }
+    void finish() {
+#ifndef T0_STREAM_SZE
+        try { processor_->finish(); }
+        catch (...) { begin_stop(); throw; }
+#endif
     }
     void begin_stop() {
         if (strategy_) strategy_->begin_stop();
@@ -296,9 +350,25 @@ public:
         result["factor_crc32"] = crc_.checksum();
         result["last_ingress_sequence"] = last_sequence_;
         result["execution"] = "disabled";
+#ifndef T0_STREAM_SZE
+        if (string(profile_, "processing_contract") == "sse-hardware-batch-v3") {
+            const sse_stream::PipelineStats pipeline = processor_->pipeline_stats();
+            result["pipeline"] = {{"applied_ticks", pipeline.applied_ticks},
+                {"accepted_samples", pipeline.accepted_samples},
+                {"inferred_samples", pipeline.inferred_samples},
+                {"closed_batches", pipeline.closed_batches},
+                {"retained_rows", pipeline.retained_rows},
+                {"retained_row_high_water", pipeline.retained_row_high_water},
+                {"book_cpus", pipeline.book_cpus}, {"inference_cpus", pipeline.inference_cpus},
+                {"channel_shard_counts", pipeline.channel_shard_counts}};
+        }
+#endif
         if (strategy_) {
             result["strategy"]["mode"] = "paper-intents";
             result["strategy"]["signals"] = strategy_->signals();
+#ifndef T0_STREAM_SZE
+            result["strategy"]["stale_signal_drops"] = strategy_->stale_signal_drops();
+#endif
             result["strategy"]["order_intents"] = order_intents_;
             result["strategy"]["cancel_intents"] = cancel_intents_;
             result["strategy"]["intent_crc32"] = intent_crc_.checksum();

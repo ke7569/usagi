@@ -19,7 +19,7 @@ double market_time(std::uint64_t micros) {
 Session::Session(const Json& legacy_config, short execution_source,
         const std::shared_ptr<StrategyExecution>& execution, const std::function<bool()>& healthy)
     : core_(), last_exchange_us_(), pending_batch_outputs_(), batch_end_mode_(false),
-      single_flight_(true) {
+      single_flight_(true), stale_signal_drops_(0) {
     Json config = legacy_config;
     if (config.at("market") != "SH") throw std::runtime_error("SSE session requires market SH");
     if (config.count("sse_test_order") && config.at("sse_test_order").value("enabled", false))
@@ -49,13 +49,13 @@ void Session::process_output(const sse_stream::Output& output) {
         flush_batch_outputs();
         return;
     }
-    const bool hardware_timestamped =
+    const bool hardware_batch =
         (output.kind == sse_stream::kTickOutput
-             ? output.tick.provenance.timestamp_flags
+             ? output.tick.provenance.processing_contract
              : output.kind == sse_stream::kSnapshotOutput
-                 ? output.snapshot.provenance.timestamp_flags : 0U) &
-        deepwin_market_data::kHardwareTimestampRequested;
-    if (batch_end_mode_ || hardware_timestamped) {
+                 ? output.snapshot.provenance.processing_contract : sse_stream::kSoftwarePerInstrumentV2) ==
+        sse_stream::kHardwareBatchV3;
+    if (batch_end_mode_ || hardware_batch) {
         batch_end_mode_ = true;
         pending_batch_outputs_.push_back(output);
         return;
@@ -84,8 +84,18 @@ void Session::process_prediction_output(const sse_stream::Output& output) {
         !std::isfinite(prediction.selected_pred)) throw std::runtime_error("invalid selected strategy signal");
     const std::map<std::string, std::uint64_t>::const_iterator previous =
         last_exchange_us_.find(code);
-    if (previous != last_exchange_us_.end() && exchange_us < previous->second)
+    if (previous != last_exchange_us_.end() && exchange_us < previous->second) {
+        const sse_stream::ProcessingContract contract = tick ?
+            output.tick.provenance.processing_contract : output.snapshot.provenance.processing_contract;
+        if (contract == sse_stream::kHardwareBatchV3) {
+            // Independent UDP subscriptions can complete cuts in a different
+            // exchange-time order. The model has already consumed every row;
+            // an obsolete selected signal must not move trading backwards.
+            ++stale_signal_drops_;
+            return;
+        }
         throw std::runtime_error("strategy exchange time moved backwards");
+    }
     if (previous != last_exchange_us_.end() && exchange_us == previous->second) return;
     MSMarketDataField fresh = {MSMarketData()};
     double* values = fresh.ms_market_data.ms_market_data.data();

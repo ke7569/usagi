@@ -22,6 +22,7 @@ public:
     bool on_trade(const LFRtnTradeField& trade, int request_id, short source, long received_ns);
     const MSMarketDataField* last_view(const std::string& instrument) const;
     std::uint64_t signals() const { return core_->signals(); }
+    std::uint64_t stale_signal_drops() const { return stale_signal_drops_; }
     std::shared_ptr<strategy_runtime::ProtectedExecution> execution() const {
         return core_->execution();
     }
@@ -40,6 +41,7 @@ private:
     // Single-flight gate: suppress a new signal while an order for the same
     // instrument is still working. Enabled by default for Shanghai.
     bool single_flight_;
+    std::uint64_t stale_signal_drops_;
 };
 
 }  // namespace sse_strategy

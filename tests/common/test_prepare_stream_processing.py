@@ -12,6 +12,33 @@ import unified_config
 
 
 class PrepareStreamProcessingTests(unittest.TestCase):
+    def test_explicit_hardware_pipeline_profile(self):
+        config = self.config("SH")
+        pipeline = {"book_cpus": [80, 88], "inference_cpus": [96, 104],
+                    "ingress_capacity": 65536, "inference_capacity": 4096, "output_capacity": 4096}
+        result = processing.make_profile(config, sse_contract="sse-hardware-batch-v3", pipeline=pipeline)
+        self.assertEqual("sse-hardware-batch-v3", result["processing_contract"])
+        self.assertEqual(pipeline, result["pipeline"])
+        with self.assertRaises(unified_config.ConfigError):
+            processing.make_profile(config, pipeline=pipeline)
+        for key, value in (("book_cpus", []), ("inference_cpus", [80]),
+                           ("ingress_capacity", 0), ("output_capacity", True)):
+            invalid = copy.deepcopy(pipeline)
+            invalid[key] = value
+            with self.subTest(key=key), self.assertRaises(unified_config.ConfigError):
+                processing.make_profile(config, sse_contract="sse-hardware-batch-v3", pipeline=invalid)
+
+    def test_software_v2_keeps_complete_original_declaration(self):
+        runtime = self.runtime("SH")
+        runtime["sse_live_sampling"] = copy.deepcopy(processing._SSE_SOFTWARE_SAMPLING)
+        config = self.config("SH", runtime)
+        result = processing.make_profile(config)
+        self.assertEqual("sse-per-instrument-v2", result["processing_contract"])
+        self.assertEqual("trailing-edge-one-shot", result["prediction"]["sampling"]["mode"])
+        self.assertEqual("strict-greater-than", result["prediction"]["sampling"]["comparison"])
+        with self.assertRaises(unified_config.ConfigError):
+            processing.make_profile(config, sse_contract="sse-hardware-batch-v3")
+
     def runtime(self, market="SZ"):
         symbol = "000001.SZ" if market == "SZ" else "600000.SH"
         result = {
@@ -319,7 +346,7 @@ class PrepareStreamProcessingTests(unittest.TestCase):
         runtime = self.runtime("SH")
         runtime["sse_live_sampling"] = canonical["sse_live_sampling"]
         runtime["model_routing"] = canonical["model_routing"]
-        self.assertEqual("global-sse-datagram-gap",
+        self.assertEqual("per-udp-subscription-gap",
                          runtime["sse_live_sampling"]["activity_scope"])
         self.assertEqual("at-most-one-sample",
                          runtime["sse_live_sampling"]["same_exchange_time_policy"])
@@ -328,14 +355,15 @@ class PrepareStreamProcessingTests(unittest.TestCase):
         config = self.config("SH", runtime)
         result = processing.make_profile(config)
         self.assertEqual(config["prediction"], result["prediction"])
+        self.assertEqual("sse-hardware-batch-v3", result["processing_contract"])
         runtime["sse_live_sampling"] = {"threshold_ns": 100000}
         runtime["model_routing"] = {"silent_fallback": False}
         result = processing.make_profile(self.config("SH", runtime))
         self.assertEqual("sse-per-instrument-v2", result["processing_contract"])
 
-    def test_sh_rejects_global_scope_repeated_exchange_time_and_preopen_window(self):
+    def test_sh_rejects_unknown_scope_repeated_exchange_time_and_preopen_window(self):
         for declaration in (
-                {"activity_scope": "per-instrument-sse-book-update"},
+                {"activity_scope": "unknown-scope"},
                 {"same_exchange_time_policy": "allow-repeated-samples"},
                 {"initial_window": "09:25:00"}):
             runtime = self.runtime("SH")
@@ -350,7 +378,7 @@ class PrepareStreamProcessingTests(unittest.TestCase):
         declarations = (
             {"threshold_ns": 200000},
             {"clock": "CLOCK_REALTIME"},
-            {"comparison": "strict-greater-than"},
+            {"comparison": "greater-or-equal"},
             {"shutdown_flush": True},
             {"periodic_md": True},
             {"unknown_sampling": 1},

@@ -59,6 +59,7 @@ sse_stream::Output tick_output(const std::string& symbol,
     output.tick.total_trade_volume = 100000U;
     output.tick.total_trade_turnover = 1000000.0;
     if (hardware_timestamped) {
+        output.tick.provenance.processing_contract = sse_stream::kHardwareBatchV3;
         output.tick.provenance.timestamp_flags = static_cast<std::uint16_t>(
             deepwin_market_data::kKernelRealtimeTimestamp |
             deepwin_market_data::kHardwareReceiveTimestamp |
@@ -224,6 +225,14 @@ void test_hardware_tick_waits_for_batch_end() {
     managed.engine->advance_to(2000000000LL);
     session.on_output(marker);
     assert(session.signals() == 1U);
+    sse_stream::Output delayed = snapshot_output("600000", 34499000000ULL,
+        100.0, 10.0, 10.1, 2U);
+    delayed.snapshot.provenance.processing_contract = sse_stream::kHardwareBatchV3;
+    session.on_output(delayed);
+    marker.batch_end.batch_id = 2;
+    session.on_output(marker);
+    assert(session.signals() == 1U);
+    assert(session.stale_signal_drops() == 1U);
 }
 
 void test_source_selection_validation() {

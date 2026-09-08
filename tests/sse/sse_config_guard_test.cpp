@@ -26,7 +26,7 @@ nlohmann::json valid_config() {
         {"comparison", "greater-or-equal"},
         {"clock", "NIC_PHC"},
         {"candidate_event", "CompleteOrderBookSH Level2"},
-        {"activity_scope", "global-sse-datagram-gap"},
+        {"activity_scope", "per-udp-subscription-gap"},
         {"same_exchange_time_policy", "at-most-one-sample"},
         {"initial_window", "first-valid-book-at-or-after-open"},
         {"sequence_gap_policy", "fail-closed"},

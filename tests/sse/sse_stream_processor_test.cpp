@@ -46,12 +46,13 @@ std::vector<unsigned char> tick(std::uint32_t sequence, std::uint64_t index,
                                 char type, char side, std::uint32_t time_raw,
                                 std::uint64_t buy_order, std::uint64_t sell_order,
                                 std::uint64_t quantity = 1000000ULL,
-                                const std::string& security = "600000") {
+                                const std::string& security = "600000",
+                                unsigned char channel = 7U) {
     std::vector<unsigned char> bytes(72U, 0U);
     bytes[8] = 0x3eU;
     put_u32(&bytes, 0U, sequence);
     put_u64(&bytes, 9U, index);
-    bytes[17] = 7U;  // wire channel number
+    bytes[17] = channel;  // wire channel number
     bytes[18] = 0U;
     put_ascii(&bytes, 21U, security, 8U);
     put_u32(&bytes, 30U, time_raw);
@@ -216,20 +217,23 @@ void test_tick_batch_and_provenance() {
 
 void test_hardware_batch_end_marker() {
     std::vector<sse_stream::Output> outputs;
+    sse_stream::PipelineConfig pipeline;
+    pipeline.contract = sse_stream::kHardwareBatchV3;
     sse_stream::SseStreamProcessor processor(
         metadata(), 0, true,
-        [&outputs](const sse_stream::Output& output) { outputs.push_back(output); });
-    std::vector<unsigned char> opening = tick(1U, 1U, 'A', 0, 9300000U, 1001U, 0U);
-    const std::vector<unsigned char> ask = tick(2U, 2U, 'A', 1, 9300000U, 0U, 2001U);
+        [&outputs](const sse_stream::Output& output) { outputs.push_back(output); },
+        sse_stream::Auction59Provider(), pipeline);
+    std::vector<unsigned char> opening = tick(1U, 1U, 'A', 0, 9300000U, 1001U, 0U, 1000000U, "600000", 1U);
+    const std::vector<unsigned char> ask = tick(2U, 2U, 'A', 1, 9300000U, 0U, 2001U, 1000000U, "600000", 1U);
     opening.insert(opening.end(), ask.begin(), ask.end());
     processor.on_event(hardware_event(opening, 1U, 1000U, 1000000ULL));
     processor.on_event(hardware_event(
-        tick(3U, 3U, 'T', 0, 9300100U, 1001U, 2001U, 100000U),
+        tick(3U, 3U, 'T', 0, 9300100U, 1001U, 2001U, 100000U, "600000", 1U),
         2U, 2000U, 1001200ULL));
     assert(outputs.empty());
 
     processor.on_event(hardware_event(
-        tick(4U, 4U, 'T', 0, 9300200U, 1001U, 2001U, 100000U),
+        tick(4U, 4U, 'T', 0, 9300200U, 1001U, 2001U, 100000U, "600000", 1U),
         3U, 3000U, 1010000ULL));
     assert(outputs.size() == 2U);
     assert(outputs[0].kind == sse_stream::kTickOutput);
