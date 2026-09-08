@@ -21,9 +21,10 @@ hardware timestamp is rejected by the hardware-v3 processor rather than
 falling back to software time.
 
 The pipeline CPU list must contain one CPU from each requested L3 domain. The
-test defaults to `112,120,128,136` and accepts `SSE_E2E_CPUS` for an isolated
-host. The verification run used `64,72,80,88` because the live capture process
-occupied the 112-119 L3 domain.
+test defaults to four automatically leased, free L3 domains and accepts
+`SSE_E2E_CPUS` to select explicit CPUs. It requires four available L3 domains.
+The initial verification run used `64,72,80,88` because another live capture
+process occupied the 112-119 L3 domain.
 
 Observed output on the integrated tree (`57e9487`) with GCC 4.8.5:
 

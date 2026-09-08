@@ -94,9 +94,14 @@ sse_stream::PipelineConfig parallel_pipeline() {
     config.contract = sse_stream::kHardwareBatchV3;
     std::vector<int> cpus;
     const char* requested = std::getenv("SSE_E2E_CPUS");
-    const std::string cpu_list = requested ? requested : "112,120,128,136";
-    std::string error;
-    assert(sse_cpu::parse_cpu_list(cpu_list, &cpus, &error) && cpus.size() == 4U);
+    if (requested) {
+        std::string error;
+        assert(sse_cpu::parse_cpu_list(requested, &cpus, &error) && cpus.size() == 4U);
+    } else {
+        // Use the production L3 lease allocator so tests do not assume a
+        // particular CPU count or reserve a live capture's hard-coded CPUs.
+        cpus.assign(4U, -1);
+    }
     config.book_cpus.assign(cpus.begin(), cpus.begin() + 2);
     config.inference_cpus.assign(cpus.begin() + 2, cpus.end());
     return config;
