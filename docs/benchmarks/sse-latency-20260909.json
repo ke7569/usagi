@@ -1,0 +1,767 @@
+{
+  "date": "2026-09-09",
+  "host": "sse-live",
+  "cpu": 56,
+  "baseline_commit": "77c8f87",
+  "implementation_commit": "6954d8b",
+  "compiler": "GCC 4.8.5; -O3 -march=x86-64 -mtune=generic -ffp-contract=off; only AVX2 model translation unit adds -mavx2",
+  "scope": "Offline real-packet decoder parity and timings; controlled synthetic single-stock book with real tick model weights. Not live end-to-end latency.",
+  "timing": "Serialized TSC, CLOCK_MONOTONIC_RAW calibration, overhead included. Downstream: 20 warmups, 200 timed rounds per case; seeding/input construction/model load excluded.",
+  "decoder": {
+    "packets": 18923,
+    "all_fields_parity_records": 344402,
+    "formal_decoder_allocations": 0,
+    "cpu": 56,
+    "tsc_cycles_per_ns": 2.7,
+    "legacy": {
+      "all_packets": {
+        "observations": 94615,
+        "min_ns": 920,
+        "p05_ns": 3530,
+        "p50_ns": 17470,
+        "p90_ns": 17490,
+        "p95_ns": 20070,
+        "p99_ns": 24290,
+        "max_ns": 629610,
+        "mean_ns": 16188.208
+      },
+      "full_1440_byte_packets": {
+        "observations": 82965,
+        "min_ns": 17430,
+        "p05_ns": 17460,
+        "p50_ns": 17470,
+        "p90_ns": 17490,
+        "p95_ns": 20380,
+        "p99_ns": 24530,
+        "max_ns": 629610,
+        "mean_ns": 17779.452
+      },
+      "sweep_ns_per_record": 897.486,
+      "sweep_ns_per_packet": 16334.406
+    },
+    "formal": {
+      "all_packets": {
+        "observations": 94615,
+        "min_ns": 90,
+        "p05_ns": 190,
+        "p50_ns": 740,
+        "p90_ns": 770,
+        "p95_ns": 770,
+        "p99_ns": 780,
+        "max_ns": 10280,
+        "mean_ns": 693.26
+      },
+      "full_1440_byte_packets": {
+        "observations": 82965,
+        "min_ns": 730,
+        "p05_ns": 730,
+        "p50_ns": 740,
+        "p90_ns": 770,
+        "p95_ns": 770,
+        "p99_ns": 780,
+        "max_ns": 10280,
+        "mean_ns": 754.139
+      },
+      "sweep_ns_per_record": 36.245,
+      "sweep_ns_per_packet": 659.671
+    },
+    "checksum": 7809374496
+  },
+  "downstream_before": {
+    "book_operation_at_10000_orders": {
+      "A": {
+        "count": 1600,
+        "max_us": 15.25,
+        "mean_us": 0.28258125,
+        "min_us": 0.25,
+        "p50_us": 0.26,
+        "p90_us": 0.29,
+        "p99_us": 0.4
+      },
+      "D": {
+        "count": 1600,
+        "max_us": 0.24,
+        "mean_us": 0.221875,
+        "min_us": 0.22,
+        "p50_us": 0.22,
+        "p90_us": 0.23,
+        "p99_us": 0.23
+      },
+      "T": {
+        "count": 800,
+        "max_us": 0.22,
+        "mean_us": 0.2060375,
+        "min_us": 0.2,
+        "p50_us": 0.21,
+        "p90_us": 0.21,
+        "p99_us": 0.21
+      }
+    },
+    "case_definition": "Synthetic one-stock book with 50 bid and 50 ask price levels, half the orders approximately younger than 30 seconds. Each five-event cycle adds a buy and sell, partially trades both, then fully cancels both residuals. Resting order count is preserved. All events must be accepted. Input construction and fixture seeding excluded.",
+    "cases": [
+      {
+        "book_updates": {
+          "count": 200,
+          "max_us": 11.59,
+          "mean_us": 4.1359,
+          "min_us": 4.08,
+          "p50_us": 4.1,
+          "p90_us": 4.11,
+          "p99_us": 4.2406
+        },
+        "combined": {
+          "count": 200,
+          "max_us": 184.102,
+          "mean_us": 176.73195,
+          "min_us": 175.252,
+          "p50_us": 175.607,
+          "p90_us": 181.916,
+          "p99_us": 183.5432
+        },
+        "factor_build": {
+          "count": 200,
+          "max_us": 66.45,
+          "mean_us": 58.2769,
+          "min_us": 57.86,
+          "p50_us": 57.95,
+          "p90_us": 58.01,
+          "p99_us": 65.0807
+        },
+        "records_before_sample": 20,
+        "resting_orders": 1000,
+        "tick_inference": {
+          "count": 200,
+          "max_us": 121.521,
+          "mean_us": 114.2448,
+          "min_us": 113.191,
+          "p50_us": 113.481,
+          "p90_us": 119.129,
+          "p99_us": 121.3213
+        },
+        "total_price_levels": 100,
+        "two_sided_full_depth_only": {
+          "count": 100,
+          "max_us": 54.52,
+          "mean_us": 47.8134,
+          "min_us": 47.45,
+          "p50_us": 47.5,
+          "p90_us": 47.53,
+          "p99_us": 53.7577
+        }
+      },
+      {
+        "book_updates": {
+          "count": 200,
+          "max_us": 115.141,
+          "mean_us": 107.8125,
+          "min_us": 106.861,
+          "p50_us": 107.176,
+          "p90_us": 112.502,
+          "p99_us": 114.8617
+        },
+        "combined": {
+          "count": 200,
+          "max_us": 308.233,
+          "mean_us": 300.2366,
+          "min_us": 297.613,
+          "p50_us": 298.323,
+          "p90_us": 305.134,
+          "p99_us": 306.9862
+        },
+        "factor_build": {
+          "count": 200,
+          "max_us": 87.381,
+          "mean_us": 78.1047,
+          "min_us": 77.431,
+          "p50_us": 77.561,
+          "p90_us": 77.762,
+          "p99_us": 85.4067
+        },
+        "records_before_sample": 520,
+        "resting_orders": 1000,
+        "tick_inference": {
+          "count": 200,
+          "max_us": 122.211,
+          "mean_us": 114.2457,
+          "min_us": 113.181,
+          "p50_us": 113.471,
+          "p90_us": 119.126,
+          "p99_us": 120.9442
+        },
+        "total_price_levels": 100,
+        "two_sided_full_depth_only": {
+          "count": 100,
+          "max_us": 54.7,
+          "mean_us": 47.7413,
+          "min_us": 47.43,
+          "p50_us": 47.49,
+          "p90_us": 47.52,
+          "p99_us": 53.9476
+        }
+      },
+      {
+        "book_updates": {
+          "count": 200,
+          "max_us": 11.71,
+          "mean_us": 4.2457,
+          "min_us": 4.09,
+          "p50_us": 4.16,
+          "p90_us": 4.23,
+          "p99_us": 4.40939999999994
+        },
+        "combined": {
+          "count": 200,
+          "max_us": 394.295,
+          "mean_us": 386.300965,
+          "min_us": 380.744,
+          "p50_us": 385.8,
+          "p90_us": 391.016,
+          "p99_us": 393.5593
+        },
+        "factor_build": {
+          "count": 200,
+          "max_us": 271.493,
+          "mean_us": 263.3944,
+          "min_us": 261.023,
+          "p50_us": 261.753,
+          "p90_us": 268.064,
+          "p99_us": 270.1536
+        },
+        "records_before_sample": 20,
+        "resting_orders": 10000,
+        "tick_inference": {
+          "count": 200,
+          "max_us": 128.251,
+          "mean_us": 118.5857,
+          "min_us": 114.971,
+          "p50_us": 117.696,
+          "p90_us": 122.787,
+          "p99_us": 127.4335
+        },
+        "total_price_levels": 100,
+        "two_sided_full_depth_only": {
+          "count": 100,
+          "max_us": 258.103,
+          "mean_us": 252.9059,
+          "min_us": 250.773,
+          "p50_us": 251.533,
+          "p90_us": 257.236,
+          "p99_us": 257.9743
+        }
+      },
+      {
+        "book_updates": {
+          "count": 200,
+          "max_us": 116.011,
+          "mean_us": 108.1045,
+          "min_us": 106.901,
+          "p50_us": 107.381,
+          "p90_us": 112.948,
+          "p99_us": 115.5818
+        },
+        "combined": {
+          "count": 200,
+          "max_us": 519.846,
+          "mean_us": 509.611,
+          "min_us": 504.036,
+          "p50_us": 510.516,
+          "p90_us": 514.248,
+          "p99_us": 518.4069
+        },
+        "factor_build": {
+          "count": 200,
+          "max_us": 290.173,
+          "mean_us": 282.76635,
+          "min_us": 280.523,
+          "p50_us": 281.093,
+          "p90_us": 287.439,
+          "p99_us": 289.2257
+        },
+        "records_before_sample": 520,
+        "resting_orders": 10000,
+        "tick_inference": {
+          "count": 200,
+          "max_us": 131.611,
+          "mean_us": 118.665,
+          "min_us": 115.781,
+          "p50_us": 117.286,
+          "p90_us": 123.515,
+          "p99_us": 130.0215
+        },
+        "total_price_levels": 100,
+        "two_sided_full_depth_only": {
+          "count": 100,
+          "max_us": 260.313,
+          "mean_us": 253.3426,
+          "min_us": 251.153,
+          "p50_us": 252.043,
+          "p90_us": 257.742,
+          "p99_us": 258.8181
+        }
+      },
+      {
+        "book_updates": {
+          "count": 200,
+          "max_us": 13.6,
+          "mean_us": 4.2386,
+          "min_us": 4.08,
+          "p50_us": 4.19,
+          "p90_us": 4.27,
+          "p99_us": 4.3704
+        },
+        "combined": {
+          "count": 200,
+          "max_us": 1327.437,
+          "mean_us": 1301.37992,
+          "min_us": 1293.806,
+          "p50_us": 1300.921,
+          "p90_us": 1307.471,
+          "p99_us": 1311.6087
+        },
+        "factor_build": {
+          "count": 200,
+          "max_us": 1197.855,
+          "mean_us": 1173.54075,
+          "min_us": 1169.435,
+          "p50_us": 1172.53,
+          "p90_us": 1178.674,
+          "p99_us": 1181.7556
+        },
+        "records_before_sample": 20,
+        "resting_orders": 50000,
+        "tick_inference": {
+          "count": 200,
+          "max_us": 133.881,
+          "mean_us": 123.52675,
+          "min_us": 118.271,
+          "p50_us": 122.666,
+          "p90_us": 127.804,
+          "p99_us": 133.121
+        },
+        "total_price_levels": 100,
+        "two_sided_full_depth_only": {
+          "count": 100,
+          "max_us": 1172.365,
+          "mean_us": 1163.6252,
+          "min_us": 1160.085,
+          "p50_us": 1162.68,
+          "p90_us": 1168.528,
+          "p99_us": 1170.1672
+        }
+      },
+      {
+        "book_updates": {
+          "count": 200,
+          "max_us": 115.491,
+          "mean_us": 108.20615,
+          "min_us": 107.001,
+          "p50_us": 107.616,
+          "p90_us": 108.646,
+          "p99_us": 114.9044
+        },
+        "combined": {
+          "count": 200,
+          "max_us": 1437.728,
+          "mean_us": 1424.4399,
+          "min_us": 1416.498,
+          "p50_us": 1423.743,
+          "p90_us": 1431.292,
+          "p99_us": 1434.7001
+        },
+        "factor_build": {
+          "count": 200,
+          "max_us": 1203.005,
+          "mean_us": 1192.80385,
+          "min_us": 1188.725,
+          "p50_us": 1192.015,
+          "p90_us": 1197.194,
+          "p99_us": 1201.4258
+        },
+        "records_before_sample": 520,
+        "resting_orders": 50000,
+        "tick_inference": {
+          "count": 200,
+          "max_us": 135.841,
+          "mean_us": 123.35505,
+          "min_us": 118.341,
+          "p50_us": 122.311,
+          "p90_us": 128.441,
+          "p99_us": 134.3884
+        },
+        "total_price_levels": 100,
+        "two_sided_full_depth_only": {
+          "count": 100,
+          "max_us": 1175.945,
+          "mean_us": 1165.6352,
+          "min_us": 1162.455,
+          "p50_us": 1164.625,
+          "p90_us": 1171.371,
+          "p99_us": 1174.6283
+        }
+      }
+    ],
+    "checksum": 71890.4863182008,
+    "cpu": 56,
+    "model_path": "/home/zane/sse/artifacts/tick/ssemodl1.bin",
+    "tsc_cycles_per_ns": 2.69996499558455
+  },
+  "downstream_after": {
+    "book_operation_at_10000_orders": {
+      "A": {
+        "count": 1600,
+        "max_us": 0.83,
+        "mean_us": 0.51975625,
+        "min_us": 0.42,
+        "p50_us": 0.43,
+        "p90_us": 0.82,
+        "p99_us": 0.82
+      },
+      "D": {
+        "count": 1600,
+        "max_us": 0.65,
+        "mean_us": 0.44853125,
+        "min_us": 0.36,
+        "p50_us": 0.41,
+        "p90_us": 0.64,
+        "p99_us": 0.65
+      },
+      "T": {
+        "count": 800,
+        "max_us": 6.17,
+        "mean_us": 0.2951125,
+        "min_us": 0.23,
+        "p50_us": 0.24,
+        "p90_us": 0.41,
+        "p99_us": 0.42
+      }
+    },
+    "case_definition": "Synthetic one-stock book with 50 bid and 50 ask price levels, half the orders approximately younger than 30 seconds. Each five-event cycle adds a buy and sell, partially trades both, then fully cancels both residuals. Resting order count is preserved. All events must be accepted. Input construction and fixture seeding excluded.",
+    "cases": [
+      {
+        "book_updates": {
+          "count": 200,
+          "max_us": 15.19,
+          "mean_us": 6.69965,
+          "min_us": 6.59,
+          "p50_us": 6.615,
+          "p90_us": 6.65,
+          "p99_us": 6.91589999999994
+        },
+        "combined": {
+          "count": 200,
+          "max_us": 115.171,
+          "mean_us": 106.54125,
+          "min_us": 105.471,
+          "p50_us": 105.716,
+          "p90_us": 112.102,
+          "p99_us": 114.3461
+        },
+        "factor_build": {
+          "count": 200,
+          "max_us": 20.52,
+          "mean_us": 13.47045,
+          "min_us": 13.35,
+          "p50_us": 13.4,
+          "p90_us": 13.43,
+          "p99_us": 13.9924999999999
+        },
+        "records_before_sample": 20,
+        "resting_orders": 1000,
+        "tick_inference": {
+          "count": 200,
+          "max_us": 95.09,
+          "mean_us": 86.28835,
+          "min_us": 85.42,
+          "p50_us": 85.61,
+          "p90_us": 85.973,
+          "p99_us": 94.2655
+        },
+        "total_price_levels": 100,
+        "two_sided_full_depth_only": {
+          "count": 100,
+          "max_us": 4.8,
+          "mean_us": 4.7916,
+          "min_us": 4.78,
+          "p50_us": 4.79,
+          "p90_us": 4.8,
+          "p99_us": 4.8
+        }
+      },
+      {
+        "book_updates": {
+          "count": 200,
+          "max_us": 178.001,
+          "mean_us": 169.80335,
+          "min_us": 168.171,
+          "p50_us": 168.651,
+          "p90_us": 175.893,
+          "p99_us": 177.5311
+        },
+        "combined": {
+          "count": 200,
+          "max_us": 296.782,
+          "mean_us": 289.1115,
+          "min_us": 286.362,
+          "p50_us": 287.082,
+          "p90_us": 295.096,
+          "p99_us": 296.4342
+        },
+        "factor_build": {
+          "count": 200,
+          "max_us": 40.88,
+          "mean_us": 32.66565,
+          "min_us": 32.31,
+          "p50_us": 32.4,
+          "p90_us": 32.511,
+          "p99_us": 40.13
+        },
+        "records_before_sample": 520,
+        "resting_orders": 1000,
+        "tick_inference": {
+          "count": 200,
+          "max_us": 95.54,
+          "mean_us": 86.5581,
+          "min_us": 85.55,
+          "p50_us": 85.87,
+          "p90_us": 86.275,
+          "p99_us": 94.8113
+        },
+        "total_price_levels": 100,
+        "two_sided_full_depth_only": {
+          "count": 100,
+          "max_us": 9.73,
+          "mean_us": 4.8432,
+          "min_us": 4.79,
+          "p50_us": 4.79,
+          "p90_us": 4.8,
+          "p99_us": 4.86910000000003
+        }
+      },
+      {
+        "book_updates": {
+          "count": 200,
+          "max_us": 13.55,
+          "mean_us": 7.0233,
+          "min_us": 6.94,
+          "p50_us": 6.95,
+          "p90_us": 7.09,
+          "p99_us": 7.2603
+        },
+        "combined": {
+          "count": 200,
+          "max_us": 115.941,
+          "mean_us": 107.03645,
+          "min_us": 105.901,
+          "p50_us": 106.236,
+          "p90_us": 112.286,
+          "p99_us": 115.0749
+        },
+        "factor_build": {
+          "count": 200,
+          "max_us": 21.57,
+          "mean_us": 13.57955,
+          "min_us": 13.36,
+          "p50_us": 13.42,
+          "p90_us": 13.621,
+          "p99_us": 20.8172
+        },
+        "records_before_sample": 20,
+        "resting_orders": 10000,
+        "tick_inference": {
+          "count": 200,
+          "max_us": 95.3,
+          "mean_us": 86.347,
+          "min_us": 85.46,
+          "p50_us": 85.69,
+          "p90_us": 86.001,
+          "p99_us": 94.6221
+        },
+        "total_price_levels": 100,
+        "two_sided_full_depth_only": {
+          "count": 100,
+          "max_us": 4.81,
+          "mean_us": 4.807,
+          "min_us": 4.8,
+          "p50_us": 4.81,
+          "p90_us": 4.81,
+          "p99_us": 4.81
+        }
+      },
+      {
+        "book_updates": {
+          "count": 200,
+          "max_us": 187.851,
+          "mean_us": 178.8467,
+          "min_us": 177.281,
+          "p50_us": 177.501,
+          "p90_us": 184.967,
+          "p99_us": 186.6351
+        },
+        "combined": {
+          "count": 200,
+          "max_us": 306.282,
+          "mean_us": 298.24265,
+          "min_us": 295.422,
+          "p50_us": 296.082,
+          "p90_us": 303.984,
+          "p99_us": 305.6226
+        },
+        "factor_build": {
+          "count": 200,
+          "max_us": 41.17,
+          "mean_us": 32.741,
+          "min_us": 32.32,
+          "p50_us": 32.45,
+          "p90_us": 32.7,
+          "p99_us": 40.0674
+        },
+        "records_before_sample": 520,
+        "resting_orders": 10000,
+        "tick_inference": {
+          "count": 200,
+          "max_us": 95.26,
+          "mean_us": 86.56955,
+          "min_us": 85.54,
+          "p50_us": 85.92,
+          "p90_us": 86.425,
+          "p99_us": 95.0421
+        },
+        "total_price_levels": 100,
+        "two_sided_full_depth_only": {
+          "count": 100,
+          "max_us": 13.1,
+          "mean_us": 4.879,
+          "min_us": 4.79,
+          "p50_us": 4.8,
+          "p90_us": 4.8,
+          "p99_us": 4.89290000000004
+        }
+      },
+      {
+        "book_updates": {
+          "count": 200,
+          "max_us": 45.81,
+          "mean_us": 7.5496,
+          "min_us": 7.18,
+          "p50_us": 7.2,
+          "p90_us": 7.251,
+          "p99_us": 14.336
+        },
+        "combined": {
+          "count": 200,
+          "max_us": 145.171,
+          "mean_us": 107.59705,
+          "min_us": 106.111,
+          "p50_us": 106.511,
+          "p90_us": 113.216,
+          "p99_us": 117.534
+        },
+        "factor_build": {
+          "count": 200,
+          "max_us": 24.56,
+          "mean_us": 13.66125,
+          "min_us": 13.36,
+          "p50_us": 13.61,
+          "p90_us": 13.72,
+          "p99_us": 13.8925
+        },
+        "records_before_sample": 20,
+        "resting_orders": 50000,
+        "tick_inference": {
+          "count": 200,
+          "max_us": 96.68,
+          "mean_us": 86.2926,
+          "min_us": 85.38,
+          "p50_us": 85.58,
+          "p90_us": 85.945,
+          "p99_us": 95.319
+        },
+        "total_price_levels": 100,
+        "two_sided_full_depth_only": {
+          "count": 100,
+          "max_us": 4.81,
+          "mean_us": 4.7995,
+          "min_us": 4.79,
+          "p50_us": 4.8,
+          "p90_us": 4.8,
+          "p99_us": 4.81
+        }
+      },
+      {
+        "book_updates": {
+          "count": 200,
+          "max_us": 193.971,
+          "mean_us": 184.8181,
+          "min_us": 183.321,
+          "p50_us": 183.641,
+          "p90_us": 189.883,
+          "p99_us": 192.5115
+        },
+        "combined": {
+          "count": 200,
+          "max_us": 312.582,
+          "mean_us": 304.04995,
+          "min_us": 301.442,
+          "p50_us": 302.152,
+          "p90_us": 308.998,
+          "p99_us": 310.8374
+        },
+        "factor_build": {
+          "count": 200,
+          "max_us": 41.23,
+          "mean_us": 32.87805,
+          "min_us": 32.33,
+          "p50_us": 32.6,
+          "p90_us": 32.721,
+          "p99_us": 40.1532
+        },
+        "records_before_sample": 520,
+        "resting_orders": 50000,
+        "tick_inference": {
+          "count": 200,
+          "max_us": 93.33,
+          "mean_us": 86.27105,
+          "min_us": 85.43,
+          "p50_us": 85.7,
+          "p90_us": 86.284,
+          "p99_us": 93.0401
+        },
+        "total_price_levels": 100,
+        "two_sided_full_depth_only": {
+          "count": 100,
+          "max_us": 11.41,
+          "mean_us": 4.8663,
+          "min_us": 4.79,
+          "p50_us": 4.8,
+          "p90_us": 4.81,
+          "p99_us": 4.87600000000003
+        }
+      }
+    ],
+    "checksum": 71890.4862931073,
+    "cpu": 56,
+    "model_path": "/home/zane/sse/artifacts/tick/ssemodl1.bin",
+    "tsc_cycles_per_ns": 2.69997416597168
+  },
+  "real_model_pipeline_parity": {
+    "fixture": "Synthetic four-stock tick/snapshot inputs and Auction59=0; actual five model/scaler artifacts from 20260908 profile",
+    "ticks": 248,
+    "accepted_model_samples": 268,
+    "serial_parallel_factors_and_predictions": "exactly equal",
+    "book_cpus": [
+      80,
+      88
+    ],
+    "inference_cpus": [
+      96,
+      104
+    ],
+    "owner_cpu": "not pinned in this correctness test; timing is not a controlled latency comparison"
+  },
+  "limitations": [
+    "Decoder source journal is a diagnostic capture near the close; historical idle encoding is not a production recovery fixture.",
+    "Downstream excludes receive, decode, routing, queues, sampling gate, output copies and strategy execution.",
+    "Incremental book updates cost more; first/backwards age query rebuilds the live-order age window.",
+    "Snapshot ensemble vectorization and live peak-load end-to-end latency remain outside these measurements."
+  ]
+}
