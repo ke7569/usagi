@@ -103,7 +103,15 @@ class StrategyStreamCliTests(unittest.TestCase):
     def live_profile(self):
         config = unified_config.migrate_runtime(self.runtime(), "PAPER-TEST")
         bound = unified_config.bind_environment(config, "live")
-        return prepare.make_profile(bound, strategy_intents=True), bound
+        return self.strategy_profile(bound), bound
+
+    def strategy_profile(self, bound):
+        profile = prepare.make_profile(bound, strategy_intents=True)
+        # Exercise repeated strategy signals while the paper order stays
+        # unfilled. The default single-flight gate suppresses those calls.
+        # Apply this fixture policy identically to capture and replay.
+        profile["strategy_runtime"]["legacy_config"]["sse_single_flight"] = False
+        return profile
 
     def stream_config(self, recording, receive_port):
         return {
@@ -187,7 +195,7 @@ class StrategyStreamCliTests(unittest.TestCase):
 
         replay_bound = unified_config.bind_environment(
             bound, "replay", recording, "t0md-v1", "recorded-receive")
-        replay_profile = prepare.make_profile(replay_bound, strategy_intents=True)
+        replay_profile = self.strategy_profile(replay_bound)
         replay_path = os.path.join(self.directory, "replay-profile.json")
         market_cli.write_json(replay_path, replay_profile)
         replay = self.invoke("replay", recording, replay_path)
