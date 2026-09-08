@@ -26,6 +26,10 @@ bool OmsStrategyExecution::read_position(short source, const std::string& code, 
                                         oms::Position* output) const {
     return source == engine_->scope().source && engine_->position(oms::Instrument{market, code}, output);
 }
+bool OmsStrategyExecution::has_working_order(const std::string& instrument) const {
+    return engine_->has_working_order(oms::Instrument{"SSE", instrument}) ||
+           engine_->has_working_order(oms::Instrument{"SZE", instrument});
+}
 int OmsStrategyExecution::submit_limit(short source, const std::string& code, const std::string& market,
                                       double price, int quantity, char direction, char offset) {
     return submit_managed(source, code, market, price, quantity, direction, offset,

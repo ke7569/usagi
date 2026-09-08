@@ -25,6 +25,7 @@ public:
     bool managed() const override { return backend_->managed(); }
     void signal_context(const std::string& signal_id) override { backend_->signal_context(signal_id); }
     bool read_position(short, const std::string&, const std::string&, oms::Position*) const override;
+    bool has_working_order(const std::string& instrument) const override;
     int submit_managed(short, const std::string&, const std::string&, double, int, char, char,
                        oms::OrderType, long long, const std::function<bool()>&) override;
     bool permits_new_orders() const override;

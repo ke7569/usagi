@@ -30,6 +30,7 @@ public:
     void drain();
 
     bool owns(const std::string& owner, OrderId id, const Instrument& instrument) const;
+    bool has_working_order(const Instrument& instrument) const;
     bool position(const Instrument& instrument, Position* output) const;
     bool order(OrderId id, OrderView* output) const;
     AccountView account() const;

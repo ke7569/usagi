@@ -20,6 +20,9 @@ public:
     virtual void signal_context(const std::string&) {}
     virtual bool owns_request(short, int, const std::string&) const { return false; }
     virtual bool read_position(short, const std::string&, const std::string&, oms::Position*) const { return false; }
+    // Single-flight query: whether an order for the instrument is still working.
+    // Defaults to false so legacy/unmanaged executors never gate on it.
+    virtual bool has_working_order(const std::string& instrument) const { return false; }
     virtual int submit_managed(short, const std::string&, const std::string&, double, int, char, char,
                                oms::OrderType, long long, const std::function<bool()>&) { return -1; }
     int submit_limit_then_cancel(short source, const std::string& instrument, const std::string& exchange,

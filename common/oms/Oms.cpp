@@ -670,6 +670,20 @@ bool Engine::order(OrderId id, OrderView* output) const {
     *output = found->second.view; return true;
 }
 
+// Single-flight support for the strategy layer: true when the instrument has
+// an order that is still working (not yet Filled/Canceled/Rejected). Used by
+// the SSE session to suppress a new signal while one order is in flight.
+bool Engine::has_working_order(const Instrument& instrument) const {
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+    for (auto it = impl_->orders.begin(); it != impl_->orders.end(); ++it) {
+        const Impl::Order& order = it->second;
+        if (order.view.command.intent.instrument == instrument && order.view.working > 0 &&
+            !terminal(order.view.state))
+            return true;
+    }
+    return false;
+}
+
 AccountView Engine::account() const {
     std::lock_guard<std::mutex> guard(impl_->mutex);
     const Impl& s = *impl_; AccountView v;

@@ -18,11 +18,12 @@ double market_time(std::uint64_t micros) {
 
 Session::Session(const Json& legacy_config, short execution_source,
         const std::shared_ptr<StrategyExecution>& execution, const std::function<bool()>& healthy)
-    : core_(), last_exchange_us_() {
+    : core_(), last_exchange_us_(), single_flight_(true) {
     Json config = legacy_config;
     if (config.at("market") != "SH") throw std::runtime_error("SSE session requires market SH");
     if (config.count("sse_test_order") && config.at("sse_test_order").value("enabled", false))
         throw std::runtime_error("stream strategy does not enable diagnostic test orders");
+    single_flight_ = !config.count("sse_single_flight") || config.at("sse_single_flight").get<bool>();
     // Routing below selects the injected executor, never a broker by itself.
     config["td_source_index"] = Json::array({execution_source});
     config["sse_order_routing"]["enabled"] = true;
@@ -95,6 +96,7 @@ void Session::process_output(const sse_stream::Output& output) {
     values[MidPriceIndex] = (values[BidPrice1Index] + values[AskPrice1Index]) * 0.5;
     if (values[LastPriceIndex] <= 0) values[LastPriceIndex] = values[MidPriceIndex];
     last_exchange_us_[code] = exchange_us;
+    if (single_flight_ && core_->execution()->has_working_order(code)) return;
     core_->on_signal(code, fresh, prediction.selected_pred,
                      core_->execution()->now_ns());
 }

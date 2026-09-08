@@ -32,6 +32,10 @@ private:
 
     std::unique_ptr<strategy_runtime::StrategySession> core_;
     std::map<std::string, std::uint64_t> last_exchange_us_;
+    // Single-flight gate: while an order for a code is still working, new
+    // signals for that code are suppressed. Enabled by default for SSE; the
+    // daily processing config may set "sse_single_flight": false to disable.
+    bool single_flight_;
 };
 
 }  // namespace sse_strategy

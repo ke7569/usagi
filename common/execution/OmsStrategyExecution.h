@@ -17,6 +17,7 @@ public:
     long long now_ns() const override;
     bool owns_request(short source, int id, const std::string& instrument) const override;
     bool read_position(short, const std::string&, const std::string&, oms::Position*) const override;
+    bool has_working_order(const std::string& instrument) const override;
     int submit_limit(short, const std::string&, const std::string&, double, int, char, char) override;
     int submit_managed(short, const std::string&, const std::string&, double, int, char, char,
                        oms::OrderType, long long, const std::function<bool()>&) override;

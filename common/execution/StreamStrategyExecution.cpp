@@ -56,6 +56,10 @@ bool ProtectedExecution::read_position(short source, const std::string& instrume
         backend_->read_position(source, instrument, exchange, output);
 }
 
+bool ProtectedExecution::has_working_order(const std::string& instrument) const {
+    return instruments_.count(instrument) && backend_->has_working_order(instrument);
+}
+
 int ProtectedExecution::cancel(short source, int request_id) {
     return source == source_ ? backend_->cancel(source, request_id) : -1;
 }
