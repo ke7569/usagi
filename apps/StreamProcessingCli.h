@@ -425,7 +425,8 @@ private:
         const Json& config = profile_.at("recovery");
         stream_input::fields(config, {"enabled", "trading_enabled", "trading_day", "source_id",
             "journal_directory", "journal_prefix", "journal_segment_mb", "journal_segment_bytes",
-            "journal_max_payload_bytes", "shm_path", "expected_generation", "allow_invalid_replay_for_analysis"});
+            "journal_max_payload_bytes", "shm_path", "expected_generation", "handoff_timeout_ms",
+            "allow_invalid_replay_for_analysis"});
         if (!config.at("enabled").is_boolean() || !config.at("enabled").get<bool>() ||
             !config.at("trading_enabled").is_boolean() || config.at("trading_enabled").get<bool>() ||
             (config.count("allow_invalid_replay_for_analysis") &&
@@ -458,6 +459,11 @@ private:
         if (config.count("expected_generation")) {
             recovery_config_.expected_generation = stream_input::uint_value(config.at("expected_generation"));
             if (!recovery_config_.expected_generation) throw std::runtime_error("recovery generation must be nonzero");
+        }
+        if (config.count("handoff_timeout_ms")) {
+            recovery_config_.handoff_timeout_ms = stream_input::uint_value(config.at("handoff_timeout_ms"));
+            if (!recovery_config_.handoff_timeout_ms || recovery_config_.handoff_timeout_ms > 3600000U)
+                throw std::runtime_error("recovery handoff timeout must be in [1,3600000] ms");
         }
         if (input_driver_ == "sze-handoff") {
             recovery_config_.shm_path = string(config, "shm_path");

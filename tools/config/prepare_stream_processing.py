@@ -29,7 +29,7 @@ _RECOVERY_FIELDS = {
     "enabled", "allow_invalid_replay_for_analysis", "trading_enabled",
     "trading_day", "source_id", "journal_directory", "journal_prefix",
     "journal_segment_mb", "journal_segment_bytes", "journal_max_payload_bytes",
-    "shm_path", "expected_generation",
+    "shm_path", "expected_generation", "handoff_timeout_ms",
 }
 _UINT64_MAX = (1 << 64) - 1
 _RECOVERY_HEADER_BYTES = 72
@@ -128,6 +128,10 @@ def _recovery_projection(config, recovery_input):
             type(recovery["expected_generation"]) is not int or
             not 0 < recovery["expected_generation"] <= _UINT64_MAX):
         raise ConfigError("recovery.expected_generation must be a positive uint64")
+    if "handoff_timeout_ms" in recovery and (
+            type(recovery["handoff_timeout_ms"]) is not int or
+            not 0 < recovery["handoff_timeout_ms"] <= 3600000):
+        raise ConfigError("recovery.handoff_timeout_ms must be in [1,3600000]")
     if "allow_invalid_replay_for_analysis" in recovery:
         if type(recovery["allow_invalid_replay_for_analysis"]) is not bool:
             raise ConfigError("recovery.allow_invalid_replay_for_analysis must be boolean")

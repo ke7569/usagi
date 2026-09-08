@@ -210,7 +210,7 @@ def validate_options(value, path):
     integers = {"threshold_ns", "catchup_gate_threshold_ms", "position_query_retry_ms",
                 "cancel_delay_ms", "trigger_after_signals", "source_id", "td_source",
                 "max_position", "max_order_volume", "state_cpu", "strategy_cpu",
-                "journal_segment_mb", "shm_capacity", "volume"}
+                "journal_segment_mb", "shm_capacity", "handoff_timeout_ms", "volume"}
     for key, item in value.items():
         name = path + "." + key
         if key in booleans and type(item) is not bool:

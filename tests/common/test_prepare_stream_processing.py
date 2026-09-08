@@ -200,10 +200,12 @@ class PrepareStreamProcessingTests(unittest.TestCase):
         self.assertEqual("disabled", profile["execution"])
 
     def test_sz_recovery_handoff_requires_live_epoch_and_rejects_analysis_flag(self):
-        config = self.recovery(self.config(), expected_generation=17)
+        config = self.recovery(
+            self.config(), expected_generation=17, handoff_timeout_ms=600000)
         profile = processing.make_profile(config, recovery_input="handoff")
         self.assertEqual("sze-handoff", profile["input_driver"])
         self.assertEqual(17, profile["recovery"]["expected_generation"])
+        self.assertEqual(600000, profile["recovery"]["handoff_timeout_ms"])
         self.assertEqual("disabled", profile["environment"]["execution"])
         for bad in (
                 self.recovery(self.config(), expected_generation=0),
@@ -235,6 +237,9 @@ class PrepareStreamProcessingTests(unittest.TestCase):
             {"journal_segment_bytes": 4096 + 72 + 16 + 128 - 1},
             {"expected_generation": 0},
             {"expected_generation": True},
+            {"handoff_timeout_ms": 0},
+            {"handoff_timeout_ms": True},
+            {"handoff_timeout_ms": 3600001},
             {"allow_invalid_replay_for_analysis": True},
         )
         for change in cases:

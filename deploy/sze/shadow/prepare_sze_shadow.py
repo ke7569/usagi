@@ -31,6 +31,7 @@ def prepare(system, daily, day, generation, account_reference):
         raise ConfigError("shadow requires the recoverable SZE market-data input")
     recovery["trading_enabled"] = False
     recovery["expected_generation"] = generation
+    recovery["handoff_timeout_ms"] = 600000
     recovery.pop("state_cpu", None)
     recovery.pop("strategy_cpu", None)
 
