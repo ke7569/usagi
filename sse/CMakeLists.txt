@@ -97,6 +97,14 @@ if(T0_BUILD_SSE_STREAM_PROCESSOR)
     ${USAGI_ROOT}/sse/market_data/sse_primary_decoder.cpp)
   target_include_directories(sse_auction59_live PRIVATE ${USAGI_ROOT}/sse/market_data)
   target_link_libraries(sse_auction59_live PRIVATE sse_auction59 pthread rt)
+  # Production pre-open gate: reconcile per-security snapshot pre_close against
+  # the daily auction static CSV; nonzero on conflict/invalid (Auction59 stays
+  # disabled until it passes). Mirrors live deploy name audit_snapshot_static_metadata.
+  add_executable(audit_snapshot_static_metadata
+    ${USAGI_ROOT}/sse/auction/audit_snapshot_static_metadata.cpp
+    ${USAGI_ROOT}/sse/market_data/sse_primary_decoder.cpp)
+  target_include_directories(audit_snapshot_static_metadata PRIVATE ${USAGI_ROOT}/sse/market_data)
+  target_link_libraries(audit_snapshot_static_metadata PRIVATE sse_auction59 pthread)
   foreach(auction_test auction59_engine_test auction_static_metadata_test sse_opening_boundary_test)
     add_executable(${auction_test} ${USAGI_ROOT}/tests/sse/${auction_test}.cpp)
     target_link_libraries(${auction_test} PRIVATE sse_auction59)

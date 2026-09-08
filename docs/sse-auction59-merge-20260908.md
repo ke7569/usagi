@@ -20,6 +20,15 @@
 `sse_opening_boundary_test`。三测全过；全量默认构建 41 项中 40 项通过，
 唯一失败 `sse_journal_integration_test` 属另一条在途 journal 工作线，与本次无关。
 
+追加（同批后续拍板）：`audit_snapshot_static_metadata` 生产门禁工具迁入
+`sse/auction/`（依赖本包的 CSV loader + reconcile_snapshot_pre_close），CMake 默认
+构建同名可执行。用法：
+`audit_snapshot_static_metadata SNAPSHOT_ROOT STATIC_CSV YYYYMMDD OUTPUT_JSON`；
+出现 pre_close 冲突/无效快照记录返回 1（Auction59 保持禁用）。
+
+未迁移（用户拍板：后续重建该流程）：`sse_extract_security`（单标的切片）、
+`events_csv_to_tick_bin.py`（scanner-CSV 回放调试链）暂不搬。
+
 ## 简化决策
 
 1. 只保留 **CSV loader**（`sse_static_YYYYMMDD.csv`，由 prepare_sse_static_metadata.sh
