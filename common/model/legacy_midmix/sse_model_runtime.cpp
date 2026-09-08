@@ -1,4 +1,5 @@
 #include "common/model/legacy_midmix/sse_model_runtime.h"
+#include "common/model/legacy_midmix/sse_model_runtime_avx2.h"
 
 #include <Eigen/Dense>
 
@@ -80,6 +81,11 @@ bool read_bytes(std::ifstream* input, void* data, std::size_t size) {
 
 struct Model::Impl {
     std::vector<std::vector<float> > tensors;
+    std::vector<std::vector<float> > avx2_tensors;
+    std::vector<std::size_t> avx2_offsets;
+    bool use_avx2;
+
+    Impl() : use_avx2(false) {}
 };
 
 State::State() : accepted_rows(0U) { reset(); }
@@ -125,7 +131,41 @@ bool Model::load(const std::string& path, std::string* error) {
         }
         tensors.push_back(std::move(values));
     }
+    std::vector<std::vector<float> > avx2_tensors;
+    const bool use_avx2 = avx2::available();
+    if (use_avx2) {
+        avx2_tensors.resize(kTensorCount);
+        std::vector<std::size_t> avx2_offsets(kTensorCount, 0U);
+        for (std::size_t i = 0U; i < kTensorCount; ++i) {
+            if (kTensorSpecs[i].cols == 1U) continue;
+            const std::size_t packed_rows =
+                ((kTensorSpecs[i].rows + 7U) / 8U) * 8U;
+            // std::vector does not guarantee 32-byte alignment. Reserve eight
+            // extra floats so the actual matrix can start at that boundary.
+            avx2_tensors[i].assign(packed_rows * kTensorSpecs[i].cols + 8U,
+                                   0.0f);
+            const std::uintptr_t address = reinterpret_cast<std::uintptr_t>(
+                avx2_tensors[i].data());
+            const std::size_t misalignment =
+                static_cast<std::size_t>(address & 31U);
+            avx2_offsets[i] = misalignment == 0U
+                ? 0U : (32U - misalignment) / sizeof(float);
+            float* packed = avx2_tensors[i].data() + avx2_offsets[i];
+            for (std::size_t row = 0U; row < kTensorSpecs[i].rows; ++row) {
+                for (std::size_t col = 0U; col < kTensorSpecs[i].cols; ++col) {
+                    packed[(row / 8U) * kTensorSpecs[i].cols * 8U +
+                           col * 8U + (row % 8U)] =
+                        tensors[i][row * kTensorSpecs[i].cols + col];
+                }
+            }
+        }
+        impl_->avx2_offsets.swap(avx2_offsets);
+    } else {
+        impl_->avx2_offsets.clear();
+    }
     impl_->tensors.swap(tensors);
+    impl_->avx2_tensors.swap(avx2_tensors);
+    impl_->use_avx2 = use_avx2;
     return true;
 }
 
@@ -135,6 +175,16 @@ bool Model::predict(const std::array<float, kFeatureCount>& factors,
                     State* state, float* prediction) const {
     if (!loaded() || state == 0 || prediction == 0) return false;
     for (float value : factors) if (!std::isfinite(value)) return false;
+
+    if (impl_->use_avx2) {
+        avx2::WeightsView weights = {};
+        for (std::size_t i = 0U; i < kTensorCount; ++i) {
+            weights.tensors[i] = kTensorSpecs[i].cols == 1U
+                ? impl_->tensors[i].data()
+                : impl_->avx2_tensors[i].data() + impl_->avx2_offsets[i];
+        }
+        return avx2::predict(factors.data(), state, prediction, weights);
+    }
 
     const std::vector<float>& proj_w = impl_->tensors[0];
     const std::vector<float>& proj_b = impl_->tensors[1];
