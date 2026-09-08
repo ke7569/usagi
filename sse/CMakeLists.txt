@@ -4,6 +4,11 @@ add_library(sse_runtime_support STATIC
 target_include_directories(sse_runtime_support PUBLIC ${USAGI_ROOT})
 target_link_libraries(sse_runtime_support PUBLIC pthread)
 
+add_executable(sse_hwstamp_ctl ${USAGI_ROOT}/tools/sse/sse_hwstamp_ctl.cpp)
+target_link_libraries(sse_hwstamp_ctl PRIVATE deepwin_market_data_runtime)
+add_executable(sse_timestamp_probe ${USAGI_ROOT}/tools/sse/sse_timestamp_probe.cpp)
+target_link_libraries(sse_timestamp_probe PRIVATE deepwin_market_data_runtime sse_runtime_support)
+
 # Reuse the mature journal/SHM protocol without changing Shenzhen's build or
 # source files. The copied core retains its ABI and source-89 payloads identify
 # Shanghai transport metadata explicitly.

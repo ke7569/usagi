@@ -3,6 +3,9 @@
 #endif
 #include "common/stream/MarketDataStream.h"
 #include "common/stream/UdpChannelRuntime.h"
+#include "common/stream/ReceiveTimestamps.h"
+#include "common/stream/HardwareTimestamping.h"
+#include <linux/net_tstamp.h>
 
 #include <boost/crc.hpp>
 #include <algorithm>
@@ -142,16 +145,17 @@ private:
 // touched once at construction; enqueue does no allocation or disk I/O.
 class Queue {
 public:
-    Queue(std::size_t capacity, std::size_t payload)
+    Queue(std::size_t capacity, std::size_t payload, bool extra_clocks = false)
         : high_water(0), capacity_(capacity), payload_(payload), headers_(capacity),
-          bytes_(capacity * payload, 0) {}
+          bytes_(capacity * payload, 0), clocks_(extra_clocks ? capacity : 0) {}
 
-    bool push(const RecordHeader& header, const unsigned char* data) {
+    bool push(const RecordHeader& header, const unsigned char* data, const ReceiveClockInfo* clocks = 0) {
         const std::uint64_t head = head_.value.load(std::memory_order_relaxed);
         const std::uint64_t tail = tail_.value.load(std::memory_order_acquire);
         if (head - tail == capacity_) return false;
         const std::size_t index = static_cast<std::size_t>(head % capacity_);
         headers_[index] = header;
+        if (!clocks_.empty()) clocks_[index] = clocks ? *clocks : ReceiveClockInfo();
         if (header.payload_bytes) std::memcpy(&bytes_[index * payload_], data, header.payload_bytes);
         const std::uint64_t size = head - tail + 1;
         if (size > high_water) high_water = size;
@@ -159,11 +163,12 @@ public:
         return true;
     }
 
-    const RecordHeader* front(const unsigned char** data) const {
+    const RecordHeader* front(const unsigned char** data, const ReceiveClockInfo** clocks = 0) const {
         const std::uint64_t tail = tail_.value.load(std::memory_order_relaxed);
         if (tail == head_.value.load(std::memory_order_acquire)) return 0;
         const std::size_t index = static_cast<std::size_t>(tail % capacity_);
         *data = &bytes_[index * payload_];
+        if (clocks) *clocks = clocks_.empty() ? 0 : &clocks_[index];
         return &headers_[index];
     }
 
@@ -185,11 +190,12 @@ private:
     std::size_t capacity_, payload_;
     std::vector<RecordHeader> headers_;
     std::vector<unsigned char> bytes_;
+    std::vector<ReceiveClockInfo> clocks_;
     Cursor head_, tail_;
 };
 
-StreamEvent view(const RecordHeader& header, const unsigned char* bytes) {
-    StreamEvent result;
+StreamEvent view(const RecordHeader& header, const unsigned char* bytes, const ReceiveClockInfo* clocks = 0) {
+    StreamEvent result = {};
     result.kind = static_cast<StreamEventKind>(header.kind);
     result.sequence = header.sequence;
     result.monotonic_ns = header.monotonic_ns;
@@ -203,6 +209,12 @@ StreamEvent view(const RecordHeader& header, const unsigned char* bytes) {
     result.timestamp_flags = header.timestamp_flags;
     result.data = header.payload_bytes ? bytes : 0;
     result.size = header.payload_bytes;
+    result.hardware_clock_index = -1;
+    if (clocks) {
+        result.hardware_ns = clocks->hardware_ns;
+        result.application_realtime_ns = clocks->application_realtime_ns;
+        result.hardware_clock_index = clocks->hardware_clock_index;
+    }
     return result;
 }
 
@@ -227,7 +239,7 @@ std::vector<ChannelHeader> channel_headers(const std::vector<ChannelSpec>& chann
     return result;
 }
 
-int udp_socket(const ChannelSpec& channel, int receive_buffer) {
+int udp_socket(const ChannelSpec& channel, int receive_buffer, bool hardware_timestamps) {
     in_addr address;
     if (::inet_pton(AF_INET, channel.group.c_str(), &address) != 1)
         throw std::runtime_error("invalid channel IPv4 address");
@@ -236,9 +248,16 @@ int udp_socket(const ChannelSpec& channel, int receive_buffer) {
     int one = 1;
     if (::setsockopt(socket.fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) ||
         ::setsockopt(socket.fd, SOL_SOCKET, SO_RCVBUF, &receive_buffer, sizeof(receive_buffer)) ||
-        ::setsockopt(socket.fd, SOL_SOCKET, SO_TIMESTAMPNS, &one, sizeof(one)) ||
         ::setsockopt(socket.fd, SOL_SOCKET, SO_RXQ_OVFL, &one, sizeof(one)))
         throw std::runtime_error(io_error("UDP socket options"));
+    if (hardware_timestamps) {
+        int timestamp_flags = SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE |
+                              SOF_TIMESTAMPING_RX_SOFTWARE | SOF_TIMESTAMPING_SOFTWARE;
+        if (::setsockopt(socket.fd, SOL_SOCKET, SO_TIMESTAMPING, &timestamp_flags, sizeof(timestamp_flags)))
+            throw std::runtime_error(io_error("enable SO_TIMESTAMPING"));
+    } else if (::setsockopt(socket.fd, SOL_SOCKET, SO_TIMESTAMPNS, &one, sizeof(one))) {
+        throw std::runtime_error(io_error("enable SO_TIMESTAMPNS"));
+    }
     sockaddr_in bind_address = {};
     bind_address.sin_family = AF_INET;
     bind_address.sin_port = htons(static_cast<std::uint16_t>(channel.port));
@@ -362,6 +381,8 @@ private:
 };
 
 void validate_options(const StreamOptions& options, std::size_t channels, long duration) {
+    if (!options.hardware_timestamp_interface.empty() && !options.recording_directory.empty())
+        throw std::runtime_error("T0MD v1 cannot record hardware timestamps; use SSE journal sse-stream-v2");
     if (options.recording_required && options.recording_directory.empty())
         throw std::runtime_error("required recording needs a non-empty directory");
     const std::uint32_t endian = kEndian;
@@ -437,12 +458,18 @@ struct MarketDataStream::Impl {
         try {
             sockets.reserve(channels.size());
             pin(options.receive_cpu);
+            const bool hardware = !options.hardware_timestamp_interface.empty();
+            std::vector<int> phc_indices;
             for (const ChannelSpec& channel : channels) {
-                pollfd socket = {udp_socket(channel, options.receive_buffer_bytes), POLLIN, 0};
+                const int phc = hardware ? timestamping::require_hardware_receive(
+                    options.hardware_timestamp_interface, channel.interface_ip) : -1;
+                phc_indices.push_back(phc);
+                pollfd socket = {udp_socket(channel, options.receive_buffer_bytes, hardware), POLLIN, 0};
                 sockets.push_back(socket);
             }
             const std::size_t count = options.receive_batch_size;
-            const std::size_t control_bytes = CMSG_SPACE(sizeof(timespec)) + CMSG_SPACE(sizeof(std::uint32_t));
+            const std::size_t control_bytes = CMSG_SPACE(3 * sizeof(timespec)) +
+                                              CMSG_SPACE(sizeof(timespec)) + CMSG_SPACE(sizeof(std::uint32_t));
             std::vector<unsigned char> packets(count * options.max_datagram_bytes, 0);
             std::vector<unsigned char> controls(count * control_bytes, 0);
             std::vector<sockaddr_in> sources(count);
@@ -526,17 +553,13 @@ struct MarketDataStream::Impl {
                         header.batch_size = received;
                         header.source_ipv4 = sources[i].sin_addr.s_addr;
                         header.source_port = ntohs(sources[i].sin_port);
-                        header.timestamp_flags = kUserspaceRealtimeTimestamp;
                         header.payload_bytes = messages[i].msg_len;
+                        const ReceiveClockInfo clocks = read_receive_timestamps(
+                            message, hardware, phc_indices[channel], realtime,
+                            &header.realtime_ns, &header.timestamp_flags);
                         for (cmsghdr* control = CMSG_FIRSTHDR(&messages[i].msg_hdr); control;
                              control = CMSG_NXTHDR(&messages[i].msg_hdr, control)) {
                             if (control->cmsg_level != SOL_SOCKET) continue;
-                            if (control->cmsg_type == SCM_TIMESTAMPNS && control->cmsg_len >= CMSG_LEN(sizeof(timespec))) {
-                                timespec timestamp;
-                                std::memcpy(&timestamp, CMSG_DATA(control), sizeof(timestamp));
-                                header.realtime_ns = static_cast<std::uint64_t>(timestamp.tv_sec) * 1000000000ULL + timestamp.tv_nsec;
-                                header.timestamp_flags = kKernelRealtimeTimestamp;
-                            }
                             if (control->cmsg_type == SO_RXQ_OVFL && control->cmsg_len >= CMSG_LEN(sizeof(std::uint32_t))) {
                                 std::uint32_t current;
                                 std::memcpy(&current, CMSG_DATA(control), sizeof(current));
@@ -549,7 +572,7 @@ struct MarketDataStream::Impl {
                             }
                         }
                         ++stats.received_datagrams;
-                        if (!ingress->push(header, &packets[static_cast<std::size_t>(i) * options.max_datagram_bytes])) {
+                        if (!ingress->push(header, &packets[static_cast<std::size_t>(i) * options.max_datagram_bytes], &clocks)) {
                             ++stats.ingress_overflows;
                             throw std::runtime_error("ingress queue overflow; stream incomplete");
                         }
@@ -634,7 +657,8 @@ bool MarketDataStream::run(const std::vector<ChannelSpec>& channels, const Strea
         if (!callback) throw std::runtime_error("stream callback required");
         const std::vector<ChannelHeader> table = channel_headers(channels);
         impl_->channels = channels;
-        ingress.reset(new Queue(options.queue_capacity, options.max_datagram_bytes));
+        ingress.reset(new Queue(options.queue_capacity, options.max_datagram_bytes,
+                                !options.hardware_timestamp_interface.empty()));
         if (!options.recording_directory.empty()) {
             recording.reset(new Queue(options.queue_capacity, options.max_datagram_bytes));
             try {
@@ -653,7 +677,8 @@ bool MarketDataStream::run(const std::vector<ChannelSpec>& channels, const Strea
         }
         while (!impl_->failed.load(std::memory_order_acquire)) {
             const unsigned char* payload;
-            const RecordHeader* header = ingress->front(&payload);
+            const ReceiveClockInfo* clocks = 0;
+            const RecordHeader* header = ingress->front(&payload, &clocks);
             if (!header) {
                 if (impl_->receiver_done.load(std::memory_order_acquire) && ingress->empty()) break;
                 std::this_thread::yield();
@@ -667,7 +692,7 @@ bool MarketDataStream::run(const std::vector<ChannelSpec>& channels, const Strea
                 impl_->writer_wakeup.notify_one();
             }
             if (impl_->failed.load(std::memory_order_acquire)) break;
-            callback(view(*header, payload));
+            callback(view(*header, payload, clocks));
             ++impl_->stats.dispatched_events;
             ingress->pop();
         }

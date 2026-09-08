@@ -14,6 +14,7 @@ namespace sse_journal {
 // It is distinct from the historical experiment's fixed 504-byte Event.
 static const std::uint32_t kPayloadMagic = 0x31534853U;
 static const std::uint16_t kPayloadVersion = 1;
+static const std::uint16_t kPayloadVersionV2 = 2;
 static const std::size_t kMaxDatagram = 8192;
 struct PayloadHeader {
     std::uint32_t magic;
@@ -24,9 +25,23 @@ struct PayloadHeader {
     std::uint32_t payload_bytes;
 };
 static_assert(sizeof(PayloadHeader) == 48, "Shanghai journal payload header ABI");
+struct PayloadHeaderV2 {
+    PayloadHeader prefix;
+    std::uint64_t hardware_ns;
+    std::uint64_t application_realtime_ns;
+    std::int32_t hardware_clock_index;
+    std::uint32_t reserved;
+    std::uint64_t reserved2;
+};
+static_assert(sizeof(PayloadHeaderV2) == 80, "Shanghai journal v2 payload header ABI");
+static const std::uint16_t kKnownTimestampFlags =
+    static_cast<std::uint16_t>(deepwin_market_data::kKernelRealtimeTimestamp |
+                               deepwin_market_data::kUserspaceRealtimeTimestamp |
+                               deepwin_market_data::kHardwareReceiveTimestamp |
+                               deepwin_market_data::kHardwareTimestampRequested);
 struct StoredEvent {
     sze_recovery::CanonicalEvent event;
-    unsigned char payload[sizeof(PayloadHeader) + kMaxDatagram];
+    unsigned char payload[sizeof(PayloadHeaderV2) + kMaxDatagram];
 };
 
 inline std::string boot_id() {
@@ -47,9 +62,14 @@ struct Config {
     unsigned flush_interval_ms;
     long duration_ms;
     std::string boot;
+    bool extended_timestamps;
     Config() : journal_queue_capacity(32768), journal_cpu(-1), prediction_cpu(-1),
-               flush_interval_ms(100), duration_ms(0) {}
+               flush_interval_ms(100), duration_ms(0), extended_timestamps(false) {}
 };
+
+inline std::size_t stored_header_bytes(const Config& config) {
+    return config.extended_timestamps ? sizeof(PayloadHeaderV2) : sizeof(PayloadHeader);
+}
 
 inline Config load(const std::string& path) {
     const nlohmann::json value = load_stream_json(path);
@@ -58,10 +78,18 @@ inline Config load(const std::string& path) {
         "segment_bytes", "min_free_bytes_after_allocate", "ring_capacity", "journal_queue_capacity",
         "queue_capacity", "max_datagram_bytes", "receive_batch_size", "receive_buffer_bytes",
         "idle_gap_ns", "receive_cpu", "dispatch_cpu", "journal_cpu", "prediction_cpu",
-        "flush_interval_ms", "duration_ms", "channels"});
-    if (value.at("schema_version") != 1 || value.at("payload_format") != "sse-stream-v1")
+        "flush_interval_ms", "duration_ms", "hardware_timestamp_interface", "channels"});
+    if (value.at("schema_version") != 1)
         throw std::runtime_error("unsupported SSE journal transport configuration");
     Config config;
+    const std::string payload_format = value.at("payload_format").get<std::string>();
+    if (payload_format == "sse-stream-v1") {
+        config.extended_timestamps = false;
+    } else if (payload_format == "sse-stream-v2") {
+        config.extended_timestamps = true;
+    } else {
+        throw std::runtime_error("unsupported SSE journal payload format");
+    }
     config.journal.trading_day = static_cast<std::uint32_t>(stream_input::uint_value(value.at("trading_day")));
     if (config.journal.trading_day < 20000101U || config.journal.trading_day > 99991231U)
         throw std::runtime_error("invalid journal trading day");
@@ -77,7 +105,11 @@ inline Config load(const std::string& path) {
     if (config.journal.directory.empty() || config.journal.directory[0] != '/' ||
         config.journal.prefix.empty() || config.journal.prefix.find('/') != std::string::npos)
         throw std::runtime_error("absolute journal directory and simple prefix required");
-    config.journal.max_payload_bytes = sizeof(PayloadHeader) + kMaxDatagram;
+    config.stream.hardware_timestamp_interface = value.value(
+        "hardware_timestamp_interface", std::string());
+    if (!config.extended_timestamps && !config.stream.hardware_timestamp_interface.empty())
+        throw std::runtime_error("hardware timestamp interface requires sse-stream-v2");
+    config.journal.max_payload_bytes = stored_header_bytes(config) + kMaxDatagram;
     config.journal.segment_bytes = 256ULL << 20;
     stream_input::optional_uint(value, "segment_bytes", &config.journal.segment_bytes);
     stream_input::optional_uint(value, "min_free_bytes_after_allocate", &config.journal.min_free_bytes_after_allocate);
@@ -134,6 +166,21 @@ inline void encode(const deepwin_market_data::StreamEvent& input, const Config& 
         (input.kind != deepwin_market_data::kDatagramEvent && input.kind != deepwin_market_data::kIdleEvent) ||
         (input.kind == deepwin_market_data::kIdleEvent && input.size))
         throw std::runtime_error("invalid Shanghai stream event for journal");
+    if (input.timestamp_flags & static_cast<std::uint16_t>(~kKnownTimestampFlags) ||
+        (input.timestamp_flags & deepwin_market_data::kHardwareReceiveTimestamp &&
+         (!(input.timestamp_flags & deepwin_market_data::kHardwareTimestampRequested) ||
+          input.hardware_ns == 0U)))
+        throw std::runtime_error("invalid Shanghai stream timestamp flags");
+    if (input.timestamp_flags & deepwin_market_data::kHardwareTimestampRequested &&
+        (input.hardware_clock_index < 0 || input.application_realtime_ns == 0U ||
+         ((input.timestamp_flags & deepwin_market_data::kHardwareReceiveTimestamp) != 0U) !=
+          (input.hardware_ns != 0U)))
+        throw std::runtime_error("invalid requested hardware timestamp fields");
+    if (!config.extended_timestamps &&
+        (!config.stream.hardware_timestamp_interface.empty() ||
+         (input.timestamp_flags & (deepwin_market_data::kHardwareReceiveTimestamp |
+                                   deepwin_market_data::kHardwareTimestampRequested))))
+        throw std::runtime_error("hardware timestamp fields require sse-stream-v2");
     output->event = sze_recovery::CanonicalEvent();
     output->event.event_id = input.sequence;
     output->event.feed_sequence = input.sequence;
@@ -144,34 +191,83 @@ inline void encode(const deepwin_market_data::StreamEvent& input, const Config& 
     output->event.channel_number = static_cast<std::uint16_t>(input.channel_id);
     output->event.record_kind = sze_recovery::kRecordMarketData;
     output->event.message_type = static_cast<std::uint8_t>(input.kind);
-    output->event.payload_size = static_cast<std::uint16_t>(sizeof(PayloadHeader) + input.size);
+    const std::size_t header_bytes = stored_header_bytes(config);
+    output->event.payload_size = static_cast<std::uint16_t>(header_bytes + input.size);
     PayloadHeader header = {};
-    header.magic = kPayloadMagic; header.version = kPayloadVersion;
+    header.magic = kPayloadMagic;
+    header.version = config.extended_timestamps ? kPayloadVersionV2 : kPayloadVersion;
     header.kind = static_cast<std::uint16_t>(input.kind);
     header.realtime_ns = input.realtime_ns; header.receive_batch = input.receive_batch;
     header.channel_id = input.channel_id; header.batch_index = input.batch_index;
     header.batch_size = input.batch_size; header.source_ipv4 = input.source_ipv4;
     header.source_port = input.source_port; header.timestamp_flags = input.timestamp_flags;
     header.payload_bytes = static_cast<std::uint32_t>(input.size);
-    std::memcpy(output->payload, &header, sizeof(header));
-    if (input.size) std::memcpy(output->payload + sizeof(header), input.data, input.size);
+    if (config.extended_timestamps) {
+        PayloadHeaderV2 extended = {};
+        extended.prefix = header;
+        extended.hardware_clock_index = -1;
+        if (input.timestamp_flags & deepwin_market_data::kHardwareTimestampRequested) {
+            extended.hardware_ns = input.hardware_ns;
+            extended.application_realtime_ns = input.application_realtime_ns;
+            extended.hardware_clock_index = input.hardware_clock_index;
+        } else {
+            extended.application_realtime_ns = input.kind == deepwin_market_data::kIdleEvent
+                ? input.realtime_ns : 0U;
+        }
+        std::memcpy(output->payload, &extended, sizeof(extended));
+    } else {
+        std::memcpy(output->payload, &header, sizeof(header));
+    }
+    if (input.size) std::memcpy(output->payload + header_bytes, input.data, input.size);
     output->event.payload_crc32 = sze_recovery::crc32(output->payload, output->event.payload_size);
 }
 
 inline deepwin_market_data::StreamEvent decode(const sze_recovery::CanonicalEvent& event,
                                                const void* payload, const Config& config) {
-    if (!payload || event.payload_size < sizeof(PayloadHeader) ||
+    const std::size_t header_bytes = stored_header_bytes(config);
+    if (!payload || event.payload_size < header_bytes ||
         event.payload_size > config.journal.max_payload_bytes || event.source_id != 89 ||
         event.trading_day != config.journal.trading_day || event.record_kind != sze_recovery::kRecordMarketData)
         throw std::runtime_error("incompatible Shanghai journal event");
     PayloadHeader header;
     std::memcpy(&header, payload, sizeof(header));
-    if (header.magic != kPayloadMagic || header.version != kPayloadVersion ||
-        header.payload_bytes + sizeof(header) != event.payload_size ||
+    const std::uint16_t expected_version = config.extended_timestamps
+        ? kPayloadVersionV2 : kPayloadVersion;
+    if (header.magic != kPayloadMagic || header.version != expected_version ||
+        header.payload_bytes > kMaxDatagram ||
+        static_cast<std::size_t>(header.payload_bytes) + header_bytes != event.payload_size ||
         header.kind != event.message_type || header.channel_id >= config.channels.size() ||
+        header.timestamp_flags & static_cast<std::uint16_t>(~kKnownTimestampFlags) ||
+        (header.timestamp_flags & deepwin_market_data::kHardwareReceiveTimestamp &&
+         !(header.timestamp_flags & deepwin_market_data::kHardwareTimestampRequested)) ||
+        (!config.extended_timestamps &&
+         (header.timestamp_flags & (deepwin_market_data::kHardwareReceiveTimestamp |
+                                    deepwin_market_data::kHardwareTimestampRequested))) ||
         (header.kind != deepwin_market_data::kDatagramEvent && header.kind != deepwin_market_data::kIdleEvent) ||
         (header.kind == deepwin_market_data::kIdleEvent && header.payload_bytes))
         throw std::runtime_error("invalid Shanghai journal payload metadata");
+    PayloadHeaderV2 extended = {};
+    if (config.extended_timestamps) {
+        std::memcpy(&extended, payload, sizeof(extended));
+        if (extended.prefix.magic != header.magic ||
+            extended.prefix.version != header.version ||
+            extended.prefix.kind != header.kind ||
+            extended.prefix.payload_bytes != header.payload_bytes ||
+            extended.reserved != 0U || extended.reserved2 != 0U)
+            throw std::runtime_error("invalid Shanghai journal v2 timestamp extension");
+        if (!(header.timestamp_flags & deepwin_market_data::kHardwareTimestampRequested) &&
+            (extended.hardware_ns != 0U || extended.hardware_clock_index != -1 ||
+             extended.application_realtime_ns !=
+                 (header.kind == deepwin_market_data::kIdleEvent
+                      ? header.realtime_ns : 0U)))
+            throw std::runtime_error("unrequested hardware timestamp fields are populated");
+        if (header.timestamp_flags & deepwin_market_data::kHardwareTimestampRequested) {
+            if (extended.hardware_clock_index < 0 || extended.application_realtime_ns == 0U ||
+                (((header.timestamp_flags & deepwin_market_data::kHardwareReceiveTimestamp) != 0U) !=
+                 (extended.hardware_ns != 0U)))
+                throw std::runtime_error("requested hardware timestamp fields are inconsistent");
+        }
+    }
     deepwin_market_data::StreamEvent output = {};
     output.kind = static_cast<deepwin_market_data::StreamEventKind>(header.kind);
     output.sequence = event.event_id; output.monotonic_ns = event.receive_mono_ns;
@@ -180,7 +276,13 @@ inline deepwin_market_data::StreamEvent decode(const sze_recovery::CanonicalEven
     output.batch_size = header.batch_size; output.source_ipv4 = header.source_ipv4;
     output.source_port = header.source_port; output.timestamp_flags = header.timestamp_flags;
     output.size = header.payload_bytes;
-    output.data = output.size ? static_cast<const unsigned char*>(payload) + sizeof(header) : 0;
+    output.hardware_clock_index = -1;
+    if (config.extended_timestamps) {
+        output.hardware_ns = extended.hardware_ns;
+        output.application_realtime_ns = extended.application_realtime_ns;
+        output.hardware_clock_index = extended.hardware_clock_index;
+    }
+    output.data = output.size ? static_cast<const unsigned char*>(payload) + header_bytes : 0;
     return output;
 }
 }  // namespace sse_journal

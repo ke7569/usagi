@@ -12,7 +12,10 @@
 namespace deepwin_market_data {
 
 enum StreamEventKind { kDatagramEvent = 1, kIdleEvent = 2 };
-enum StreamTimestampFlags { kKernelRealtimeTimestamp = 1, kUserspaceRealtimeTimestamp = 2 };
+enum StreamTimestampFlags {
+    kKernelRealtimeTimestamp = 1, kUserspaceRealtimeTimestamp = 2,
+    kHardwareReceiveTimestamp = 4, kHardwareTimestampRequested = 8
+};
 
 // Borrowed bytes are valid only during the callback. Channel IDs index the
 // supplied channel vector. receive_batch is a syscall boundary, not a sample.
@@ -30,6 +33,11 @@ struct StreamEvent {
     std::uint16_t timestamp_flags;
     const unsigned char* data;
     std::size_t size;
+    // Valid only with kHardwareTimestampRequested. The NIC PHC clock is not
+    // assumed synchronized to CLOCK_REALTIME. Zero hardware_ns means absent.
+    std::uint64_t hardware_ns;
+    std::uint64_t application_realtime_ns;
+    std::int32_t hardware_clock_index;
 };
 
 typedef std::function<void(const StreamEvent&)> StreamCallback;
@@ -48,6 +56,10 @@ struct StreamOptions {
     int writer_cpu;
     std::string recording_directory;
     bool recording_required;
+    // Empty preserves SO_TIMESTAMPNS. Nonempty requests hardware + software
+    // timestamps from a separately configured interface. T0MD v1 cannot store
+    // these extra clocks; use the SSE journal v2 transport when enabled.
+    std::string hardware_timestamp_interface;
 };
 
 struct StreamHealth {

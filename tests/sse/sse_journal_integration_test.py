@@ -70,7 +70,7 @@ def put_ascii(record, offset, value, width):
 
 
 def raw_tick(wire_sequence, tick_index, kind, buy_order, sell_order,
-             quantity=1000, security='600000'):
+             quantity=200000, security='600000'):
     record = bytearray(72)
     put_u32(record, 0, wire_sequence)
     put_u32(record, 4, 99)  # Reserved bytes must be ignored by the decoder.
@@ -78,7 +78,8 @@ def raw_tick(wire_sequence, tick_index, kind, buy_order, sell_order,
     put_u64(record, 9, tick_index)
     put_u16(record, 17, 7)  # Exchange channel number, independent of UDP id.
     put_ascii(record, 21, security, 8)
-    put_u32(record, 30, 9300000)  # 09:30:00.00, HHMMSScc.
+    # Distinct exchange seconds let an accepted quiet cut advance the window.
+    put_u32(record, 30, 9300000 + tick_index * 100)  # HHMMSScc; fixture stays within this minute.
     record[34] = byte_value(kind)
     put_u64(record, 35, buy_order)
     put_u64(record, 43, sell_order)
@@ -285,13 +286,13 @@ def parse_segment(path):
     if len(data) < JOURNAL_HEADER_BYTES:
         return [], None
     try:
-        header = struct.unpack_from('<8s6I7Q2I', data, 0)
+        header = struct.unpack_from('<8s6I8Q2I', data, 0)
     except struct.error:
         return [], None
     journal_magic = b'SZEJRNL1' if sys.version_info[0] >= 3 else 'SZEJRNL1'
     if header[0] != journal_magic:
         return [], None
-    published = header[12]
+    published = header[13]
     segment_bytes = header[7]
     if published < JOURNAL_HEADER_BYTES or published > segment_bytes or published > len(data):
         return [], None
@@ -320,7 +321,7 @@ def parse_segment(path):
                     offset + JOURNAL_RECORD_HEADER_BYTES + payload_bytes]
         records.append((event_id, body))
         offset += total
-    return records, header[14]
+    return records, header[15]
 
 
 def journal_snapshot(directory):
@@ -374,7 +375,8 @@ def send_round(port, state, include_snapshot):
     packets.append(raw_tick(wire, tick_index, 'A', 0, sell_order))
     wire += 1
     tick_index += 1
-    packets.append(raw_tick(wire, tick_index, 'T', buy_order, sell_order, 100))
+    # Wire volume uses 1/1000 shares: 100000 = 100 shares, 1000 currency at price 10.
+    packets.append(raw_tick(wire, tick_index, 'T', buy_order, sell_order, 100000))
     wire += 1
     tick_index += 1
     sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -459,7 +461,11 @@ def run(capture_binary, predictor_binary):
             require_alive(capture[0], 0.1, capture[4], 'capture')
         check(glob.glob(os.path.join(config['journal_directory'], 'sse_*.szej')),
               'capture did not create a journal segment')
-        time.sleep(0.15)
+        ready_deadline = time.time() + 10.0
+        while 'Shanghai journal capture ready' not in read_text(capture[4]):
+            check(time.time() < ready_deadline,
+                  'capture sockets did not become ready: %s' % read_text(capture[4]))
+            require_alive(capture[0], 0.02, capture[4], 'capture')
 
         state = {'round': 0, 'wire_sequence': 1, 'tick_index': 1}
         sent = []

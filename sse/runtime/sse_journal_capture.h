@@ -18,7 +18,8 @@ struct Status {
     Status()
         : accepting(false), stop_requested(false), failed(false), journal_degraded(false),
           journal_closed(false), journal_ready(false),
-          datagrams(0), idle_events(0), payload_bytes(0), last_receive_ns(0),
+          datagrams(0), hardware_timestamps(0), missing_hardware_timestamps(0),
+          software_timestamp_fallbacks(0), idle_events(0), payload_bytes(0), last_receive_ns(0),
           accepted_events(0), journal_events(0), journal_errors(0), journal_overflows(0),
           queue_size(0), queue_high_water(0), latest_event_id(0), latest_feed_sequence(0),
           journal_published_offset(0), journal_flushed_offset(0), flush_count(0) {}
@@ -30,6 +31,7 @@ struct Status {
     bool journal_closed;
     bool journal_ready;
     std::uint64_t datagrams;
+    std::uint64_t hardware_timestamps, missing_hardware_timestamps, software_timestamp_fallbacks;
     std::uint64_t idle_events;
     std::uint64_t payload_bytes;
     std::uint64_t last_receive_ns;
@@ -112,6 +114,7 @@ private:
     std::atomic<int> failure_reason_;
 
     std::atomic<std::uint64_t> datagrams_;
+    std::atomic<std::uint64_t> hardware_timestamps_, missing_hardware_timestamps_, software_timestamp_fallbacks_;
     std::atomic<std::uint64_t> idle_events_;
     std::atomic<std::uint64_t> payload_bytes_;
     std::atomic<std::uint64_t> last_receive_ns_;

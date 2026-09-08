@@ -106,6 +106,9 @@ private:
                 line["event"] = "capture_status";
                 line["ready"] = stream_->ready() && status.journal_ready && !status.failed;
                 line["datagrams"] = status.datagrams;
+                line["hardware_timestamps"] = status.hardware_timestamps;
+                line["missing_hardware_timestamps"] = status.missing_hardware_timestamps;
+                line["software_timestamp_fallbacks"] = status.software_timestamp_fallbacks;
                 line["payload_bytes"] = status.payload_bytes;
                 line["last_receive_ns"] = status.last_receive_ns;
                 line["accepted_events"] = status.accepted_events;
@@ -206,7 +209,8 @@ Capture::Capture(const sse_journal::Config& config)
       journal_degraded_(false), journal_ready_(false), journal_start_failed_(false),
       clean_shutdown_requested_(false), journal_closed_(false),
       failure_reason_(static_cast<int>(sze_recovery::kInvalidNone)),
-      datagrams_(0), idle_events_(0), payload_bytes_(0), last_receive_ns_(0),
+      datagrams_(0), hardware_timestamps_(0), missing_hardware_timestamps_(0),
+      software_timestamp_fallbacks_(0), idle_events_(0), payload_bytes_(0), last_receive_ns_(0),
       accepted_events_(0), journal_events_(0), journal_errors_(0), journal_overflows_(0),
       latest_event_id_(0), latest_feed_sequence_(0), journal_published_offset_(0),
       journal_flushed_offset_(0), flush_count_(0), error_mutex_(), error_() {
@@ -233,7 +237,7 @@ bool Capture::open(std::string* error) {
         if (error) *error = "Shanghai journal source/day/generation identity is invalid";
         return false;
     }
-    if (config_.journal.max_payload_bytes != sizeof(sse_journal::PayloadHeader) + sse_journal::kMaxDatagram ||
+    if (config_.journal.max_payload_bytes != sse_journal::stored_header_bytes(config_) + sse_journal::kMaxDatagram ||
         config_.ring.max_payload_bytes != config_.journal.max_payload_bytes ||
         config_.stream.max_datagram_bytes == 0U ||
         config_.stream.max_datagram_bytes > sse_journal::kMaxDatagram ||
@@ -266,6 +270,9 @@ bool Capture::open(std::string* error) {
     journal_closed_.store(false, std::memory_order_release);
     failure_reason_.store(static_cast<int>(sze_recovery::kInvalidNone), std::memory_order_release);
     datagrams_.store(0, std::memory_order_relaxed);
+    hardware_timestamps_.store(0, std::memory_order_relaxed);
+    missing_hardware_timestamps_.store(0, std::memory_order_relaxed);
+    software_timestamp_fallbacks_.store(0, std::memory_order_relaxed);
     idle_events_.store(0, std::memory_order_relaxed);
     payload_bytes_.store(0, std::memory_order_relaxed);
     last_receive_ns_.store(0, std::memory_order_relaxed);
@@ -363,6 +370,12 @@ bool Capture::on_event(const deepwin_market_data::StreamEvent& event, std::strin
     }
     if (event.kind == deepwin_market_data::kDatagramEvent) {
         datagrams_.fetch_add(1U, std::memory_order_relaxed);
+        if (event.timestamp_flags & deepwin_market_data::kHardwareReceiveTimestamp)
+            hardware_timestamps_.fetch_add(1U, std::memory_order_relaxed);
+        else if (event.timestamp_flags & deepwin_market_data::kHardwareTimestampRequested)
+            missing_hardware_timestamps_.fetch_add(1U, std::memory_order_relaxed);
+        if (event.timestamp_flags & deepwin_market_data::kUserspaceRealtimeTimestamp)
+            software_timestamp_fallbacks_.fetch_add(1U, std::memory_order_relaxed);
         payload_bytes_.fetch_add(static_cast<std::uint64_t>(event.size), std::memory_order_relaxed);
         last_receive_ns_.store(event.monotonic_ns, std::memory_order_relaxed);
     } else if (event.kind == deepwin_market_data::kIdleEvent) {
@@ -586,6 +599,9 @@ Status Capture::status() const {
     result.journal_closed = journal_closed_.load(std::memory_order_acquire);
     result.journal_ready = journal_ready_.load(std::memory_order_acquire);
     result.datagrams = datagrams_.load(std::memory_order_relaxed);
+    result.hardware_timestamps = hardware_timestamps_.load(std::memory_order_relaxed);
+    result.missing_hardware_timestamps = missing_hardware_timestamps_.load(std::memory_order_relaxed);
+    result.software_timestamp_fallbacks = software_timestamp_fallbacks_.load(std::memory_order_relaxed);
     result.idle_events = idle_events_.load(std::memory_order_relaxed);
     result.payload_bytes = payload_bytes_.load(std::memory_order_relaxed);
     result.last_receive_ns = last_receive_ns_.load(std::memory_order_relaxed);
@@ -616,6 +632,15 @@ std::string Capture::error() const {
 int run_cli(const std::string& config_path) {
     try {
         sse_journal::Config config = sse_journal::load(config_path);
+        // Journal workers are created by Capture::open before StopSignals.
+        // Block termination first so every worker inherits the mask and only
+        // the signal waiter initiates a clean drain, including SIGTERM.
+        sigset_t stop_set;
+        sigemptyset(&stop_set);
+        sigaddset(&stop_set, SIGINT);
+        sigaddset(&stop_set, SIGTERM);
+        if (pthread_sigmask(SIG_BLOCK, &stop_set, 0) != 0)
+            throw std::runtime_error("cannot block capture stop signals");
         deepwin_market_data::MarketDataStream stream;
         Capture capture(config);
         std::string error;
@@ -655,6 +680,9 @@ int run_cli(const std::string& config_path) {
         Json output;
         output["ok"] = stream_ok && capture_ok && clean;
         output["datagrams"] = capture_status.datagrams;
+        output["hardware_timestamps"] = capture_status.hardware_timestamps;
+        output["missing_hardware_timestamps"] = capture_status.missing_hardware_timestamps;
+        output["software_timestamp_fallbacks"] = capture_status.software_timestamp_fallbacks;
         output["idle_events"] = capture_status.idle_events;
         output["payload_bytes"] = capture_status.payload_bytes;
         output["accepted_events"] = capture_status.accepted_events;

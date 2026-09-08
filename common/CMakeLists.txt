@@ -22,6 +22,7 @@ target_link_libraries(t0_strategy_core PUBLIC t0_oms_core pthread)
 
 add_library(deepwin_market_data_runtime STATIC
   ${USAGI_ROOT}/common/stream/UdpChannelRuntime.cpp
+  ${USAGI_ROOT}/common/stream/HardwareTimestamping.cpp
   ${USAGI_ROOT}/common/stream/MarketDataStream.cpp)
 target_include_directories(deepwin_market_data_runtime PUBLIC
   ${USAGI_ROOT}/common/stream)
