@@ -575,6 +575,60 @@ void test_validation_and_callback_failure() {
     assert(threw);
 }
 
+void test_deferred_market_order_cancel_is_consumed() {
+    mix153060::Runtime runtime(inputs("000001"));
+    mix153060::SampleBuffer samples;
+    const std::int64_t time = 34200000000LL;
+
+    mix153060::OrderEvent market;
+    market.app_sequence = 1;
+    market.exchange_time_us = time;
+    market.local_time_us = time;
+    market.price = 0.0;
+    market.volume = 100;
+    market.buy = true;
+    market.kind = mix153060::OrderKind::kMarket;
+    runtime.on_order(market, &samples);
+    assert(runtime.available() && samples.count == 0);
+
+    mix153060::TradeEvent cancel;
+    cancel.app_sequence = 2;
+    cancel.exchange_time_us = time + 1;
+    cancel.local_time_us = time + 1;
+    cancel.price = 0.0;
+    cancel.volume = 100;
+    cancel.buy_order_id = 1;
+    cancel.sell_order_id = 0;
+    cancel.kind = mix153060::TradeKind::kCancel;
+    runtime.on_trade(cancel, &samples);
+    assert(runtime.available() && samples.count == 0);
+
+    mix153060::OrderEvent bid = market;
+    bid.app_sequence = 3;
+    bid.exchange_time_us = time + 2;
+    bid.local_time_us = time + 2;
+    bid.price = 10.0;
+    bid.kind = mix153060::OrderKind::kLimit;
+    runtime.on_order(bid, &samples);
+    mix153060::OrderEvent ask = bid;
+    ask.app_sequence = 4;
+    ask.exchange_time_us = time + 3;
+    ask.local_time_us = time + 3;
+    ask.price = 10.01;
+    ask.buy = false;
+    runtime.on_order(ask, &samples);
+    mix153060::TradeEvent fill = cancel;
+    fill.app_sequence = 5;
+    fill.exchange_time_us = time + 4;
+    fill.local_time_us = time + 4;
+    fill.price = 10.0;
+    fill.buy_order_id = 3;
+    fill.sell_order_id = 4;
+    fill.kind = mix153060::TradeKind::kFill;
+    runtime.on_trade(fill, &samples);
+    assert(runtime.available());
+}
+
 }  // namespace
 
 int main() {
@@ -586,6 +640,7 @@ int main() {
     test_duplicate_and_gap();
     test_model_omission_is_explicit();
     test_validation_and_callback_failure();
+    test_deferred_market_order_cancel_is_consumed();
     std::cout << "sze_stream_processor_test: PASS\n";
     return 0;
 }

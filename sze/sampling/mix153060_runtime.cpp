@@ -1165,6 +1165,27 @@ struct Runtime::Impl {
                    ? trade.buy_order_id == deferred_market.app_sequence
                    : trade.sell_order_id == deferred_market.app_sequence;
     }
+    bool consume_deferred_market_cancel(const TradeEvent& trade) {
+        if (!deferred_market_order || trade.kind != TradeKind::kCancel ||
+            std::max(trade.buy_order_id, trade.sell_order_id) !=
+                deferred_market.app_sequence) {
+            return false;
+        }
+        if (trade.app_sequence <= last_ingress_sequence ||
+            trade.exchange_time_us < last_ingress_time_us ||
+            trade.local_time_us <= 0 || trade.volume <= 0 ||
+            !std::isfinite(trade.price)) {
+            return false;
+        }
+        deferred_market_order = false;
+        deferred_market = OrderEvent();
+        deferred_market_fill_volume = 0;
+        deferred_market_last_fill_price = 0.0;
+        deferred_market_fills.clear();
+        last_ingress_sequence = trade.app_sequence;
+        last_ingress_time_us = trade.exchange_time_us;
+        return true;
+    }
 
     void remember_resolved_market_order(const OrderEvent& order, bool from_linked_fill) {
         has_resolved_market_order = true;
@@ -1868,6 +1889,17 @@ void Runtime::on_trade(const TradeEvent& event,
                     impl_->deferred_market_last_fill_price, timing, true)) {
                 impl_->fail(event.app_sequence, "deferred market fill replay rejected");
                 output->clear();
+            }
+            finish_event_timing(timing, total_begin);
+            return;
+        }
+
+        if (event.kind == TradeKind::kCancel &&
+            std::max(event.buy_order_id, event.sell_order_id) ==
+                impl_->deferred_market.app_sequence) {
+            if (!impl_->consume_deferred_market_cancel(event)) {
+                impl_->fail(event.app_sequence,
+                            "deferred market cancel rejected");
             }
             finish_event_timing(timing, total_begin);
             return;
