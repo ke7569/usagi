@@ -37,12 +37,12 @@ _RECOVERY_TRAILER_BYTES = 16
 _RECOVERY_PAGE_BYTES = 4096
 # Match the existing config_sse_hybrid_prediction_20260818.json contract.
 _SSE_SAMPLING = {
-    "mode": "trailing-edge-one-shot",
-    "threshold_ns": 100000,
-    "comparison": "strict-greater-than",
-    "clock": "CLOCK_MONOTONIC",
+    "mode": "hardware-gap-batch",
+    "threshold_ns": 5000,
+    "comparison": "greater-or-equal",
+    "clock": "NIC_PHC",
     "candidate_event": "CompleteOrderBookSH Level2",
-    "activity_scope": "per-instrument-sse-book-update",
+    "activity_scope": "global-sse-datagram-gap",
     "same_exchange_time_policy": "at-most-one-sample",
     "initial_window": "first-valid-book-at-or-after-open",
     "sequence_gap_policy": "fail-closed",

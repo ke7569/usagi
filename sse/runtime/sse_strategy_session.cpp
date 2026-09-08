@@ -18,7 +18,8 @@ double market_time(std::uint64_t micros) {
 
 Session::Session(const Json& legacy_config, short execution_source,
         const std::shared_ptr<StrategyExecution>& execution, const std::function<bool()>& healthy)
-    : core_(), last_exchange_us_(), single_flight_(true) {
+    : core_(), last_exchange_us_(), pending_batch_outputs_(), batch_end_mode_(false),
+      single_flight_(true) {
     Json config = legacy_config;
     if (config.at("market") != "SH") throw std::runtime_error("SSE session requires market SH");
     if (config.count("sse_test_order") && config.at("sse_test_order").value("enabled", false))
@@ -43,6 +44,34 @@ void Session::on_output(const sse_stream::Output& output) {
 }
 
 void Session::process_output(const sse_stream::Output& output) {
+    if (output.kind == sse_stream::kBatchEndOutput) {
+        batch_end_mode_ = true;
+        flush_batch_outputs();
+        return;
+    }
+    const bool hardware_timestamped =
+        (output.kind == sse_stream::kTickOutput
+             ? output.tick.provenance.timestamp_flags
+             : output.kind == sse_stream::kSnapshotOutput
+                 ? output.snapshot.provenance.timestamp_flags : 0U) &
+        deepwin_market_data::kHardwareTimestampRequested;
+    if (batch_end_mode_ || hardware_timestamped) {
+        batch_end_mode_ = true;
+        pending_batch_outputs_.push_back(output);
+        return;
+    }
+    process_prediction_output(output);
+}
+
+void Session::flush_batch_outputs() {
+    const std::vector<sse_stream::Output> pending = pending_batch_outputs_;
+    pending_batch_outputs_.clear();
+    for (std::vector<sse_stream::Output>::const_iterator it = pending.begin();
+         it != pending.end(); ++it)
+        process_prediction_output(*it);
+}
+
+void Session::process_prediction_output(const sse_stream::Output& output) {
     const bool tick = output.kind == sse_stream::kTickOutput;
     if (!tick && output.kind != sse_stream::kSnapshotOutput) throw std::runtime_error("unknown strategy output kind");
     const sse_hybrid_model::Prediction& prediction = tick ? output.tick.prediction : output.snapshot.prediction;

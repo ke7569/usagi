@@ -319,7 +319,7 @@ class PrepareStreamProcessingTests(unittest.TestCase):
         runtime = self.runtime("SH")
         runtime["sse_live_sampling"] = canonical["sse_live_sampling"]
         runtime["model_routing"] = canonical["model_routing"]
-        self.assertEqual("per-instrument-sse-book-update",
+        self.assertEqual("global-sse-datagram-gap",
                          runtime["sse_live_sampling"]["activity_scope"])
         self.assertEqual("at-most-one-sample",
                          runtime["sse_live_sampling"]["same_exchange_time_policy"])
@@ -335,7 +335,7 @@ class PrepareStreamProcessingTests(unittest.TestCase):
 
     def test_sh_rejects_global_scope_repeated_exchange_time_and_preopen_window(self):
         for declaration in (
-                {"activity_scope": "normalized-sse-book-update"},
+                {"activity_scope": "per-instrument-sse-book-update"},
                 {"same_exchange_time_policy": "allow-repeated-samples"},
                 {"initial_window": "09:25:00"}):
             runtime = self.runtime("SH")
@@ -350,7 +350,7 @@ class PrepareStreamProcessingTests(unittest.TestCase):
         declarations = (
             {"threshold_ns": 200000},
             {"clock": "CLOCK_REALTIME"},
-            {"comparison": "greater-or-equal"},
+            {"comparison": "strict-greater-than"},
             {"shutdown_flush": True},
             {"periodic_md": True},
             {"unknown_sampling": 1},

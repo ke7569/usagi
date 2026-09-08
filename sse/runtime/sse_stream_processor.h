@@ -70,12 +70,24 @@ struct SnapshotOutput {
     SnapshotOutput();
 };
 
-enum OutputKind { kTickOutput = 1, kSnapshotOutput = 2 };
+struct BatchEndOutput {
+    std::uint64_t batch_id;
+    std::uint64_t last_hardware_ns;
+    std::uint64_t emitted_monotonic_ns;
+    std::uint32_t packet_count;
+    std::uint32_t candidate_count;
+    std::uint32_t prediction_count;
+
+    BatchEndOutput();
+};
+
+enum OutputKind { kTickOutput = 1, kSnapshotOutput = 2, kBatchEndOutput = 3 };
 
 struct Output {
     OutputKind kind;
     TickOutput tick;
     SnapshotOutput snapshot;
+    BatchEndOutput batch_end;
 
     Output();
 };
@@ -136,6 +148,10 @@ private:
                           const deepwin_market_data::StreamEvent& event,
                           std::size_t record_offset);
     void process_closed_batch(const sse_live_sampling::BatchEnd& batch);
+    void advance_hardware_batch(const deepwin_market_data::StreamEvent& event);
+    void close_hardware_batch(std::uint64_t emitted_monotonic_ns,
+                              sse_live_sampling::BatchCloseReason reason);
+    void commit_hardware_candidate(const sse_live_sampling::Candidate& candidate);
     sse_live_sampling::TickCut book_cut(const InstrumentState& state,
                                       const sse_live::TickEvent& tick) const;
     void initialize_window(InstrumentState& state, const sse_live::TickEvent& tick);
@@ -151,6 +167,14 @@ private:
     SequenceMap channel_sequences_;
     sse_live_sampling::BatchEndSampler batch_sampler_;
     std::vector<sse_live_sampling::BatchEnd> closed_batches_;
+    bool hardware_batch_mode_;
+    bool hardware_batch_open_;
+    std::uint64_t hardware_batch_id_;
+    std::uint64_t next_hardware_batch_id_;
+    std::uint64_t last_hardware_ns_;
+    std::uint64_t last_hardware_monotonic_ns_;
+    std::uint32_t hardware_batch_packet_count_;
+    std::map<std::string, sse_live_sampling::Candidate> hardware_candidates_;
     const sse_hybrid_model::Model* model_;
     bool factors_only_;
     OutputCallback callback_;

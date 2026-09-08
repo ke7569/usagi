@@ -68,11 +68,11 @@ bool validate_config(const nlohmann::json& config, std::string* error) {
     nlohmann::json::const_iterator sampling = config.find("sse_live_sampling");
     if (sampling == config.end() || !sampling->is_object())
         return reject("SSE config requires sse_live_sampling object", error);
-    if (!require_string(*sampling, "mode", "trailing-edge-one-shot", error) ||
-        !require_string(*sampling, "comparison", "strict-greater-than", error) ||
-        !require_string(*sampling, "clock", "CLOCK_MONOTONIC", error) ||
+    if (!require_string(*sampling, "mode", "hardware-gap-batch", error) ||
+        !require_string(*sampling, "comparison", "greater-or-equal", error) ||
+        !require_string(*sampling, "clock", "NIC_PHC", error) ||
         !require_string(*sampling, "candidate_event", "CompleteOrderBookSH Level2", error) ||
-        !require_string(*sampling, "activity_scope", "per-instrument-sse-book-update", error) ||
+        !require_string(*sampling, "activity_scope", "global-sse-datagram-gap", error) ||
         !require_string(*sampling, "same_exchange_time_policy", "at-most-one-sample", error) ||
         !require_string(*sampling, "initial_window", "first-valid-book-at-or-after-open", error) ||
         !require_string(*sampling, "sequence_gap_policy", "fail-closed", error) ||
@@ -80,8 +80,8 @@ bool validate_config(const nlohmann::json& config, std::string* error) {
         !require_false(*sampling, "shutdown_flush", error)) return false;
     nlohmann::json::const_iterator threshold = sampling->find("threshold_ns");
     if (threshold == sampling->end() || !threshold->is_number_integer() ||
-        threshold->get<long long>() != 100000LL)
-        return reject("SSE config requires sse_live_sampling.threshold_ns=100000", error);
+        threshold->get<long long>() != 5000LL)
+        return reject("SSE config requires sse_live_sampling.threshold_ns=5000", error);
 
     nlohmann::json::const_iterator prediction_only = config.find("prediction_only");
     if (prediction_only == config.end() || !prediction_only->is_boolean() ||

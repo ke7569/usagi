@@ -6,6 +6,7 @@
 
 #include <map>
 #include <memory>
+#include <vector>
 
 namespace sse_strategy {
 
@@ -29,12 +30,15 @@ public:
 
 private:
     void process_output(const sse_stream::Output& output);
+    void process_prediction_output(const sse_stream::Output& output);
+    void flush_batch_outputs();
 
     std::unique_ptr<strategy_runtime::StrategySession> core_;
     std::map<std::string, std::uint64_t> last_exchange_us_;
-    // Single-flight gate: while an order for a code is still working, new
-    // signals for that code are suppressed. Enabled by default for SSE; the
-    // daily processing config may set "sse_single_flight": false to disable.
+    std::vector<sse_stream::Output> pending_batch_outputs_;
+    bool batch_end_mode_;
+    // Single-flight gate: suppress a new signal while an order for the same
+    // instrument is still working. Enabled by default for Shanghai.
     bool single_flight_;
 };
 

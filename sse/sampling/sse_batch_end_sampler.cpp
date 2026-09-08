@@ -20,7 +20,8 @@ std::uint64_t deadline(std::uint64_t start, std::uint64_t threshold) {
 Candidate::Candidate()
     : cut_index(0), source_sequence(0), exchange_time_of_day_micros(0), local_receive_ns(0) {}
 BatchEnd::BatchEnd()
-    : batch_id(0), last_activity_ns(0), emitted_ns(0), inactivity_ns(0), reason(kBatchNotClosed) {}
+    : batch_id(0), last_activity_ns(0), emitted_ns(0), inactivity_ns(0), packet_count(0),
+      reason(kBatchNotClosed) {}
 SamplerStats::SamplerStats()
     : committed_events(0), closed_batches(0), emitted_candidates(0), empty_batches(0),
       duplicate_candidates(0), stale_timer_observations(0), health_failures(0) {}

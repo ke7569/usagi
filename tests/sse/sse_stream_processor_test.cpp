@@ -125,6 +125,21 @@ deepwin_market_data::StreamEvent idle(std::uint64_t sequence,
     return value;
 }
 
+deepwin_market_data::StreamEvent hardware_event(
+    const std::vector<unsigned char>& bytes, std::uint64_t sequence,
+    std::uint64_t monotonic_ns, std::uint64_t hardware_ns) {
+    deepwin_market_data::StreamEvent value = event(
+        bytes, sequence, monotonic_ns, sequence, 0U, 1U);
+    value.timestamp_flags = static_cast<std::uint16_t>(
+        deepwin_market_data::kKernelRealtimeTimestamp |
+        deepwin_market_data::kHardwareReceiveTimestamp |
+        deepwin_market_data::kHardwareTimestampRequested);
+    value.hardware_ns = hardware_ns;
+    value.application_realtime_ns = value.realtime_ns;
+    value.hardware_clock_index = 0;
+    return value;
+}
+
 sse_tick::DailyStaticMetadataMap metadata() {
     sse_tick::DailyStaticMetadata value;
     value.date = 20260818U;
@@ -197,6 +212,37 @@ void test_tick_batch_and_provenance() {
     assert(output.tick.bid_levels.size() == 10U);
     assert(output.tick.ask_levels.size() == 10U);
     assert(output.tick.factors.values.size() == 50U);
+}
+
+void test_hardware_batch_end_marker() {
+    std::vector<sse_stream::Output> outputs;
+    sse_stream::SseStreamProcessor processor(
+        metadata(), 0, true,
+        [&outputs](const sse_stream::Output& output) { outputs.push_back(output); });
+    std::vector<unsigned char> opening = tick(1U, 1U, 'A', 0, 9300000U, 1001U, 0U);
+    const std::vector<unsigned char> ask = tick(2U, 2U, 'A', 1, 9300000U, 0U, 2001U);
+    opening.insert(opening.end(), ask.begin(), ask.end());
+    processor.on_event(hardware_event(opening, 1U, 1000U, 1000000ULL));
+    processor.on_event(hardware_event(
+        tick(3U, 3U, 'T', 0, 9300100U, 1001U, 2001U, 100000U),
+        2U, 2000U, 1001200ULL));
+    assert(outputs.empty());
+
+    processor.on_event(hardware_event(
+        tick(4U, 4U, 'T', 0, 9300200U, 1001U, 2001U, 100000U),
+        3U, 3000U, 1010000ULL));
+    assert(outputs.size() == 2U);
+    assert(outputs[0].kind == sse_stream::kTickOutput);
+    assert(outputs[1].kind == sse_stream::kBatchEndOutput);
+    assert(outputs[1].batch_end.packet_count == 2U);
+    assert(outputs[1].batch_end.candidate_count == 1U);
+    assert(outputs[1].batch_end.prediction_count == 0U);
+    assert(outputs[0].tick.provenance.batch_id == outputs[1].batch_end.batch_id);
+
+    processor.on_event(idle(4U, 100000U));
+    assert(outputs.size() == 4U);
+    assert(outputs[3].kind == sse_stream::kBatchEndOutput);
+    assert(outputs[2].tick.provenance.batch_id == outputs[3].batch_end.batch_id);
 }
 
 void test_duplicate_and_gap_are_distinct() {
@@ -649,6 +695,7 @@ void test_market_data_stream_live_replay_parity() {
 
 int main() {
     test_tick_batch_and_provenance();
+    test_hardware_batch_end_marker();
     test_duplicate_and_gap_are_distinct();
     test_unconfigured_market_records_count_for_sequence_only();
     test_per_instrument_quiet_stock_closes_while_other_updates();

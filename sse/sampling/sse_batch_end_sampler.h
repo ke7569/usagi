@@ -19,6 +19,7 @@ struct Candidate {
 };
 struct BatchEnd {
     std::uint64_t batch_id, last_activity_ns, emitted_ns, inactivity_ns;
+    std::uint32_t packet_count;
     BatchCloseReason reason;
     std::vector<Candidate> candidates;
     BatchEnd();

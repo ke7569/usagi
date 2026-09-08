@@ -9,6 +9,7 @@ namespace {
 
 const std::uint64_t kContinuousTradingStartMicros = 34200000000ULL;
 const std::uint64_t kDayEndMicros = 86400000000ULL;
+const std::uint64_t kHardwareBatchGapNanoseconds = 5000ULL;
 
 std::string error_text(const char* prefix, const std::string& detail) {
     return std::string(prefix) + (detail.empty() ? std::string() : ": " + detail);
@@ -46,7 +47,11 @@ SnapshotOutput::SnapshotOutput()
     : snapshot(), snapshot36(), auction59(), prediction(), prediction_valid(false),
       provenance() {}
 
-Output::Output() : kind(kTickOutput), tick(), snapshot() {}
+BatchEndOutput::BatchEndOutput()
+    : batch_id(0ULL), last_hardware_ns(0ULL), emitted_monotonic_ns(0ULL),
+      packet_count(0U), candidate_count(0U), prediction_count(0U) {}
+
+Output::Output() : kind(kTickOutput), tick(), snapshot(), batch_end() {}
 
 SseStreamProcessor::InstrumentState::InstrumentState(
     const std::string& code, const sse_tick::DailyStaticMetadata& metadata)
@@ -65,6 +70,10 @@ SseStreamProcessor::SseStreamProcessor(
     : states_(), channel_sequences_(), batch_sampler_(instrument_ids(metadata)), model_(model),
       factors_only_(factors_only), callback_(callback),
       auction59_provider_(auction59_provider), auction59_inputs_(),
+      hardware_batch_mode_(false), hardware_batch_open_(false), hardware_batch_id_(0ULL),
+      next_hardware_batch_id_(1ULL), last_hardware_ns_(0ULL),
+      last_hardware_monotonic_ns_(0ULL), hardware_batch_packet_count_(0U),
+      hardware_candidates_(),
       invalid_(false), invalid_reason_() {
     if (!callback_) throw std::runtime_error("SSE stream processor callback required");
     if (factors_only_ && model_ != 0)
@@ -166,10 +175,15 @@ void SseStreamProcessor::on_event(const deepwin_market_data::StreamEvent& event)
         if (event.kind == deepwin_market_data::kIdleEvent) {
             on_idle(event);
         } else if (event.kind == deepwin_market_data::kDatagramEvent) {
-            std::string error;
-            if (!batch_sampler_.advance_to_event(event.monotonic_ns, &closed_batches_, &error))
-                fail(error_text("SSE sampler advance failure", error));
-            for (const auto& batch : closed_batches_) process_closed_batch(batch);
+            if (event.hardware_ns != 0ULL) hardware_batch_mode_ = true;
+            if (hardware_batch_mode_) {
+                advance_hardware_batch(event);
+            } else {
+                std::string error;
+                if (!batch_sampler_.advance_to_event(event.monotonic_ns, &closed_batches_, &error))
+                    fail(error_text("SSE sampler advance failure", error));
+                for (const auto& batch : closed_batches_) process_closed_batch(batch);
+            }
             on_datagram(event);
         } else {
             fail("unknown SSE stream event kind");
@@ -187,10 +201,65 @@ void SseStreamProcessor::on_event(const deepwin_market_data::StreamEvent& event)
 void SseStreamProcessor::on_idle(const deepwin_market_data::StreamEvent& event) {
     if (event.data != 0 || event.size != 0U)
         fail("SSE idle event carries payload");
-    std::string error;
-    if (!batch_sampler_.on_timer(event.monotonic_ns, &closed_batches_, &error))
-        fail(error_text("SSE idle sampler failure", error));
-    for (const auto& batch : closed_batches_) process_closed_batch(batch);
+    if (hardware_batch_mode_) {
+        if (hardware_batch_open_)
+            close_hardware_batch(event.monotonic_ns, sse_live_sampling::kBatchClosedByTimer);
+    } else {
+        std::string error;
+        if (!batch_sampler_.on_timer(event.monotonic_ns, &closed_batches_, &error))
+            fail(error_text("SSE idle sampler failure", error));
+        for (const auto& batch : closed_batches_) process_closed_batch(batch);
+    }
+}
+
+void SseStreamProcessor::advance_hardware_batch(
+    const deepwin_market_data::StreamEvent& event) {
+    const std::uint64_t timestamp = event.hardware_ns != 0ULL
+        ? event.hardware_ns : event.monotonic_ns;
+    if (!hardware_batch_open_) {
+        hardware_batch_open_ = true;
+        hardware_batch_id_ = next_hardware_batch_id_++;
+        hardware_batch_packet_count_ = 0U;
+        hardware_candidates_.clear();
+    } else {
+        if (timestamp < last_hardware_ns_)
+            fail("SSE hardware receive timestamp moved backwards");
+        if (timestamp - last_hardware_ns_ >= kHardwareBatchGapNanoseconds) {
+            close_hardware_batch(event.monotonic_ns,
+                                 sse_live_sampling::kBatchClosedByNextEvent);
+            hardware_batch_open_ = true;
+            hardware_batch_id_ = next_hardware_batch_id_++;
+            hardware_batch_packet_count_ = 0U;
+            hardware_candidates_.clear();
+        }
+    }
+    last_hardware_ns_ = timestamp;
+    last_hardware_monotonic_ns_ = event.monotonic_ns;
+    ++hardware_batch_packet_count_;
+}
+
+void SseStreamProcessor::close_hardware_batch(
+    std::uint64_t emitted_monotonic_ns,
+    sse_live_sampling::BatchCloseReason reason) {
+    if (!hardware_batch_open_) return;
+    sse_live_sampling::BatchEnd batch;
+    batch.batch_id = hardware_batch_id_;
+    batch.last_activity_ns = last_hardware_ns_;
+    batch.emitted_ns = emitted_monotonic_ns;
+    batch.packet_count = hardware_batch_packet_count_;
+    batch.reason = reason;
+    for (std::map<std::string, sse_live_sampling::Candidate>::const_iterator it =
+             hardware_candidates_.begin(); it != hardware_candidates_.end(); ++it)
+        batch.candidates.push_back(it->second);
+    hardware_batch_open_ = false;
+    hardware_batch_packet_count_ = 0U;
+    hardware_candidates_.clear();
+    process_closed_batch(batch);
+}
+
+void SseStreamProcessor::commit_hardware_candidate(
+    const sse_live_sampling::Candidate& candidate) {
+    hardware_candidates_[candidate.instrument_id] = candidate;
 }
 
 void SseStreamProcessor::on_datagram(
@@ -250,8 +319,10 @@ void SseStreamProcessor::process_tick(
                                                record_offset);
         state->have_pending_tick = true;
     }
-    if (!batch_sampler_.commit_applied_event(tick.security_id, candidate_ptr,
-                                             applied.sequence_healthy, &error))
+    if (hardware_batch_mode_) {
+        if (candidate_ptr) commit_hardware_candidate(*candidate_ptr);
+    } else if (!batch_sampler_.commit_applied_event(tick.security_id, candidate_ptr,
+                                                   applied.sequence_healthy, &error))
         fail(error_text("SSE batch sampler commit failure", error));
 }
 
@@ -286,6 +357,7 @@ void SseStreamProcessor::initialize_window(InstrumentState& state, const sse_liv
 
 void SseStreamProcessor::process_closed_batch(
     const sse_live_sampling::BatchEnd& batch) {
+    std::uint32_t prediction_count = 0U;
     for (std::vector<sse_live_sampling::Candidate>::const_iterator it =
              batch.candidates.begin(); it != batch.candidates.end(); ++it) {
         InstrumentState* state = state_for(it->instrument_id);
@@ -334,8 +406,20 @@ void SseStreamProcessor::process_closed_batch(
                 output.tick.prediction.selected_source = sse_hybrid_model::kNoSource;
                 output.tick.prediction.selected_pred = 0.0f;
             }
+            if (output.tick.prediction_valid) ++prediction_count;
         }
         callback_(output);
+    }
+    if (hardware_batch_mode_) {
+        Output marker;
+        marker.kind = kBatchEndOutput;
+        marker.batch_end.batch_id = batch.batch_id;
+        marker.batch_end.last_hardware_ns = batch.last_activity_ns;
+        marker.batch_end.emitted_monotonic_ns = batch.emitted_ns;
+        marker.batch_end.packet_count = batch.packet_count;
+        marker.batch_end.candidate_count = static_cast<std::uint32_t>(batch.candidates.size());
+        marker.batch_end.prediction_count = prediction_count;
+        callback_(marker);
     }
 }
 

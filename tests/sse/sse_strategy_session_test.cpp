@@ -40,7 +40,8 @@ sse_stream::Output tick_output(const std::string& symbol,
                                float selected_prediction,
                                std::int64_t bid_price_raw,
                                std::int64_t ask_price_raw,
-                               std::uint64_t tick_index) {
+                               std::uint64_t tick_index,
+                               bool hardware_timestamped = false) {
     sse_stream::Output output;
     output.kind = sse_stream::kTickOutput;
     output.tick.event.security_id = symbol;
@@ -57,6 +58,12 @@ sse_stream::Output tick_output(const std::string& symbol,
         (static_cast<double>(bid_price_raw) + ask_price_raw) / 2000.0;
     output.tick.total_trade_volume = 100000U;
     output.tick.total_trade_turnover = 1000000.0;
+    if (hardware_timestamped) {
+        output.tick.provenance.timestamp_flags = static_cast<std::uint16_t>(
+            deepwin_market_data::kKernelRealtimeTimestamp |
+            deepwin_market_data::kHardwareReceiveTimestamp |
+            deepwin_market_data::kHardwareTimestampRequested);
+    }
     return output;
 }
 
@@ -199,6 +206,26 @@ void test_paper_cancel_deadline() {
     assert(cancel_count > 0U);
 }
 
+void test_hardware_tick_waits_for_batch_end() {
+    bool healthy = true;
+    oms_test::ManagedFixture managed(session_config(), "SH", 28, "sse-batch-end");
+    sse_strategy::Session session(
+        session_config(), 28, managed.execution, [&healthy]() { return healthy; });
+    session.set_ready(true, true, true);
+    managed.engine->advance_to(1000000000LL);
+    session.on_output(tick_output("600000", 34500000000ULL, 100.0,
+                                  10000, 10100, 1U, true));
+    assert(session.signals() == 0U);
+    sse_stream::Output marker;
+    marker.kind = sse_stream::kBatchEndOutput;
+    marker.batch_end.batch_id = 1U;
+    marker.batch_end.packet_count = 1U;
+    marker.batch_end.candidate_count = 1U;
+    managed.engine->advance_to(2000000000LL);
+    session.on_output(marker);
+    assert(session.signals() == 1U);
+}
+
 void test_source_selection_validation() {
     bool healthy = true;
     oms_test::ManagedFixture managed(session_config(), "SH", 28, "sse-source");
@@ -228,6 +255,7 @@ void test_source_selection_validation() {
 int main() {
     test_session_processing_and_protection();
     test_paper_cancel_deadline();
+    test_hardware_tick_waits_for_batch_end();
     test_source_selection_validation();
     std::cout << "sse_strategy_session_test: PASS" << std::endl;
     return 0;

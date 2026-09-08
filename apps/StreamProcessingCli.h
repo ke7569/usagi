@@ -152,9 +152,9 @@ public:
 #else
         if (string(profile_, "market") != "SH" || string(profile_, "processing_contract") != "sse-per-instrument-v2")
             throw std::runtime_error("this binary requires the SSE per-instrument-v2 profile");
-        const Json sampling = Json::parse(R"json({"mode":"trailing-edge-one-shot","threshold_ns":100000,
-            "comparison":"strict-greater-than","clock":"CLOCK_MONOTONIC","candidate_event":"CompleteOrderBookSH Level2",
-            "activity_scope":"per-instrument-sse-book-update","same_exchange_time_policy":"at-most-one-sample",
+        const Json sampling = Json::parse(R"json({"mode":"hardware-gap-batch","threshold_ns":5000,
+            "comparison":"greater-or-equal","clock":"NIC_PHC","candidate_event":"CompleteOrderBookSH Level2",
+            "activity_scope":"global-sse-datagram-gap","same_exchange_time_policy":"at-most-one-sample",
             "initial_window":"first-valid-book-at-or-after-open","sequence_gap_policy":"fail-closed","periodic_md":false,
             "shutdown_flush":false,"standard_gate":{"turnover_threshold_source":"daily-instrument-static-required",
             "exchange_time_trigger_us":100000000,"mid_change_epsilon":0.000001,"min_volume_change":100}})json");
@@ -204,12 +204,13 @@ public:
         }
         processor_.reset(new sse_stream::SseStreamProcessor(metadata, factors_only ? 0 : &model_, factors_only,
             [&](const sse_stream::Output& output) {
-                ++rows_;
                 if (output.kind == sse_stream::kTickOutput) {
+                    ++rows_;
                     if (output.tick.prediction_valid) ++predictions_;
                     last_sequence_ = output.tick.provenance.stream_sequence;
                     crc_.process_bytes(output.tick.factors.values.data(), sizeof(float) * output.tick.factors.values.size());
-                } else {
+                } else if (output.kind == sse_stream::kSnapshotOutput) {
+                    ++rows_;
                     if (output.snapshot.prediction_valid) ++predictions_;
                     last_sequence_ = output.snapshot.provenance.stream_sequence;
                     crc_.process_bytes(output.snapshot.snapshot36.data(), sizeof(float) * output.snapshot.snapshot36.size());
