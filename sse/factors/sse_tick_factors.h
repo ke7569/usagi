@@ -84,6 +84,9 @@ private:
     bool have_free_share_;
     DailyStaticMetadata static_metadata_;
     bool have_static_metadata_;
+    // Reused by build() so taking a flow window does not allocate a fresh
+    // event vector for every accepted sample.
+    FlowStats flow_window_;
     // Reused between samples to avoid allocating two full-depth vectors on
     // every batch-end factor build.
     std::vector<Level> full_bids_;

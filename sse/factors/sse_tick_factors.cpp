@@ -336,9 +336,11 @@ const char* tick_factor_name(std::size_t index) {
 
 FactorState::FactorState() : have_previous_(false), previous_(), free_share_(0.0),
                              have_free_share_(false), static_metadata_(),
-                             have_static_metadata_(false), full_bids_(), full_asks_() {
+                             have_static_metadata_(false), flow_window_(),
+                             full_bids_(), full_asks_() {
     std::fill(previous_.bids, previous_.bids + 10, Level{0, 0, 0, 0, 0});
     std::fill(previous_.asks, previous_.asks + 10, Level{0, 0, 0, 0, 0});
+    flow_window_.events.reserve(256);
 }
 
 void FactorState::reset() {
@@ -347,6 +349,7 @@ void FactorState::reset() {
     free_share_ = 0.0;
     static_metadata_ = DailyStaticMetadata();
     have_static_metadata_ = false;
+    flow_window_.clear_window();
     previous_ = BookPoint();
     full_bids_.clear();
     full_asks_.clear();
@@ -407,7 +410,8 @@ FactorRow FactorState::build(OrderBook& book, std::uint64_t now_micros,
     const double spread = two_sided ? ap - bp : 0.0;
     const double bq = static_cast<double>(bids[0].quantity);
     const double aq = static_cast<double>(asks[0].quantity);
-    const FlowStats flow = book.take_flow_window();
+    book.take_flow_window(&flow_window_);
+    const FlowStats& flow = flow_window_;
     row.mid_price = mid;
     row.tick_index = book.last_tick_index();
     row.validity.has_two_sided_book = two_sided;
