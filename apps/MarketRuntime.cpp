@@ -162,7 +162,16 @@ private:
                     } else ++idles_;
                     application_->on_event(event);
                 };
-                if (action_ == "capture") succeeded_ = stream_.run(channels_, options_, callback, duration_, &error_);
+                if (action_ == "capture") {
+#ifdef T0_STREAM_SSE
+                    // run dispatches on this owner thread. Model completions
+                    // must also be drained while the ingress queue is empty.
+                    succeeded_ = stream_.run(channels_, options_, callback, duration_, &error_,
+                        [this]() { application_->poll_outputs(); });
+#else
+                    succeeded_ = stream_.run(channels_, options_, callback, duration_, &error_);
+#endif
+                }
                 else {
 #ifdef T0_STREAM_SSE
                     succeeded_ = stream_.replay(input_, callback, &error_, 100000);
@@ -173,6 +182,18 @@ private:
             }
         } catch (const std::exception& exception) { error_ = exception.what(); succeeded_ = false; }
           catch (...) { error_ = "unknown market runtime error"; succeeded_ = false; }
+#ifdef T0_STREAM_SSE
+        // Same thread as all on_event/poll_outputs callbacks, after raw input
+        // stopped. Finish only work sealed by a recorded BatchEnd; no EOF cut.
+        try { application_->finish(); }
+        catch (const std::exception& exception) {
+            if (error_.empty()) error_ = exception.what();
+            succeeded_ = false;
+        } catch (...) {
+            if (error_.empty()) error_ = "unknown SSE processing drain error";
+            succeeded_ = false;
+        }
+#endif
         application_->begin_stop();
         try {
             Json out;
