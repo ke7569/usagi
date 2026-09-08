@@ -203,8 +203,11 @@ bool OrderBook::delete_order(std::uint64_t order_no,
                                      order.price_raw ? order.price_raw : event_price_raw,
                                      quantity});
     if (remove_order) {
-        live_order_times_.erase(LiveOrderKey{order.add_time_micros, order.order_no});
-        young_orders_.erase(LiveOrderKey{order.add_time_micros, order.order_no});
+        const LiveOrderKey key = {order.add_time_micros, order.order_no};
+        live_order_times_.erase(key);
+        if (young_cache_initialized_ &&
+            is_young(young_cache_time_micros_, order.add_time_micros))
+            young_orders_.erase(key);
         orders_.erase(it);
     } else {
         it->second.remaining_qty -= quantity;
@@ -224,8 +227,11 @@ bool OrderBook::trade_order(std::uint64_t order_no, std::uint64_t quantity,
     else flow_.sell_trade_qty += used;
     if (applied) *applied = used;
     if (remove_order) {
-        live_order_times_.erase(LiveOrderKey{order.add_time_micros, order.order_no});
-        young_orders_.erase(LiveOrderKey{order.add_time_micros, order.order_no});
+        const LiveOrderKey key = {order.add_time_micros, order.order_no};
+        live_order_times_.erase(key);
+        if (young_cache_initialized_ &&
+            is_young(young_cache_time_micros_, order.add_time_micros))
+            young_orders_.erase(key);
         orders_.erase(it);
     } else {
         it->second.remaining_qty -= used;
@@ -241,9 +247,10 @@ void OrderBook::remove_order_quantity(const Order& order,
     if (li != side_levels.end()) {
         LevelAggregate& level = li->second;
         level.quantity = level.quantity > quantity ? level.quantity - quantity : 0ULL;
-        const LiveOrderKey key = {order.add_time_micros, order.order_no};
+        // The active-young set is maintained as the exact live-order predicate
+        // at young_cache_time_micros_. Avoid a tree lookup on every fill/cancel.
         const bool young = young_cache_initialized_ &&
-                           young_orders_.find(key) != young_orders_.end();
+                           is_young(young_cache_time_micros_, order.add_time_micros);
         if (young) {
             level.young_quantity = level.young_quantity > quantity
                 ? level.young_quantity - quantity : 0ULL;

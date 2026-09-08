@@ -202,6 +202,12 @@ int main() {
         !compare_depth(&fast, slow, t0 + 70000000ULL, "future timestamp at boundary") ||
         !compare_depth(&fast, slow, t0 + 70000001ULL, "future timestamp expired") ||
         !compare_depth(&fast, slow, t0 + 40000000ULL, "clock rollback")) return 1;
+    // Removing an order outside the current young window must update the
+    // aggregate book without requiring an active-young tree entry.
+    if (!apply_both(&fast, &slow, event('A', 0, 105, 0, 9970, 777, t0), "old order add") ||
+        !compare_depth(&fast, slow, t0 + 40000000ULL, "old order not young") ||
+        !apply_both(&fast, &slow, event('D', 0, 105, 0, 0, 0, t0 + 40000001ULL), "old order removal") ||
+        !compare_depth(&fast, slow, t0 + 40000001ULL, "after old order removal")) return 1;
 
     // A direct POD handoff follows the same path without constructing a
     // TickEvent string.

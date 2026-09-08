@@ -26,6 +26,9 @@ not changed.
   temporary `std::string`/`TickEvent` conversion. The legacy overload remains.
 - `take_flow_window(FlowStats*)` allows the factor state to retain the flow
   event vector. The return-by-value overload remains for existing callers.
+- The hot cancel/fill path tests the cached young predicate directly; it does
+  not search the active-young tree for every quantity update, and only erases a
+  tree key when the order is actually young at the cached query time.
 
 ## Correctness checks
 
@@ -62,12 +65,12 @@ Median microseconds (`old -> new`):
 
 | Resting orders | Records | Book update | Factor build | B/S full-depth only |
 |---:|---:|---:|---:|---:|
-| 1,000 | 20 | 4.15 -> 7.24 | 57.49 -> 13.37 | 46.94 -> 4.79 |
-| 1,000 | 520 | 107.62 -> 184.69 | 77.18 -> 32.17 | 46.96 -> 4.78 |
-| 10,000 | 20 | 4.24 -> 7.93 | 256.76 -> 13.37 | 246.58 -> 4.79 |
-| 10,000 | 520 | 108.41 -> 202.55 | 276.64 -> 32.19 | 246.15 -> 4.79 |
-| 50,000 | 20 | 4.34 -> 8.46 | 1,152.55 -> 13.56 | 1,141.44 -> 4.78 |
-| 50,000 | 520 | 108.13 -> 215.24 | 1,174.98 -> 32.40 | 1,144.28 -> 4.78 |
+| 1,000 | 20 | 4.15 -> 6.62 | 57.49 -> 13.39 | 46.94 -> 4.73 |
+| 1,000 | 520 | 107.62 -> 168.72 | 77.18 -> 32.22 | 46.96 -> 4.73 |
+| 10,000 | 20 | 4.24 -> 6.95 | 256.76 -> 13.40 | 246.58 -> 4.74 |
+| 10,000 | 520 | 108.41 -> 177.04 | 276.64 -> 32.16 | 246.15 -> 4.73 |
+| 50,000 | 20 | 4.34 -> 7.24 | 1,152.55 -> 13.58 | 1,141.44 -> 4.74 |
+| 50,000 | 520 | 108.13 -> 183.62 | 1,174.98 -> 32.39 | 1,144.28 -> 4.74 |
 
 The update increase is the cost of maintaining the exact ordered live-time
 index and per-level aggregates. The benchmark is a controlled component test,
