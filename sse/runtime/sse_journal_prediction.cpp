@@ -342,7 +342,6 @@ int run(const std::string& config_path, const std::string& profile_path,
         if (cleanup_error.empty())
             cleanup_error = "Shanghai journal prediction finish failed";
     }
-    consumer->close();
     if (!cleanup_ok) {
         ok = false;
         if (error.empty()) error = cleanup_error;
@@ -351,6 +350,9 @@ int run(const std::string& config_path, const std::string& profile_path,
     const Json result = final_status(config, *consumer, application.get(),
                                      events, payload_bytes, started_ns, ok,
                                      host_boot, error);
+    // close() resets the attached ring identity and replay mode. Preserve the
+    // last observed handoff status before releasing those resources.
+    consumer->close();
     std::cout << result.dump() << '\n';
     return ok ? 0 : 1;
 }
