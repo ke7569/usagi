@@ -58,3 +58,11 @@ AVX2 模型验证覆盖完整递归状态序列，旧路径与新路径最大绝
 `sse_decoder_benchmark JOURNAL CPU` 读取硬件 journal 的 UDP 载荷，比较旧、新解析字段并输出包耗时与分配数。它只用于解析基准，不承担 journal 完整性审核或恢复功能；20260908 收盘样本的载荷可以使用，但其历史实验版 idle 编码不能作为生产恢复输入。
 
 `sse_downstream_benchmark PROFILE CPU` 使用 processing profile 中的真实模型路径，输出组件分位数和总耗时。`sse_compute_pipeline_test` 默认使用非零合成模型验证状态顺序；设置 `SSE_PIPELINE_REAL_PROFILE` 可改用真实模型，`SSE_PIPELINE_TEST_CPUS` 指定四个不同 L3 域的 CPU 启用两个订单簿和两个推理工作线程验证。
+
+## 集成验证
+
+完整构建成功，上海服务器注册的 50 项 CTest 全部通过，包含深圳兼容性、上海处理器、策略、收包、时间戳、CPU 分配、journal 恢复与新增的硬件批末并行衔接测试。
+
+在已有 Python 3.6 的 research 服务器复制独立构建产物进行 CLI 验证：行情处理 10/10、运行接口 11/11、配置生成 31/31、策略 capture/replay 5/5，通过共 57 项。多次策略信号的测试显式关闭 single-flight；生产默认保护保持开启。capture 和 replay 均产生 6 个样本、5 次策略调用、1 次订单意图和 1 次撤单意图，意图 CRC 相同。
+
+新增 `sse_pipeline_journal_handoff_test` 从 journal 消费首包，切至 SHM 消费尚未落 journal 的下一包，再补写 journal。异步计算只输出已经封闭的一批，缺失硬件时间戳被拒绝，末尾未封批不会在 `finish()` 时补出预测。其线缆字节和时间戳为合成测试数据，不是实际 NIC 采样。
