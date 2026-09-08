@@ -15,6 +15,12 @@ not changed.
   query-time expiry. Expiry is strict: age exactly 30,000,000 microseconds is
   young, and age 30,000,001 is not. A query-clock rollback rebuilds from the
   live time index so future-dated orders remain excluded by `now >= add_time`.
+- With the normal nondecreasing query clock, young-cache maintenance visits
+  only newly eligible and newly expired live-time entries (plus the ordered
+  price levels emitted by `full_depth()`). The first query when no cache exists,
+  or any query-clock rollback, intentionally has an O(N_live) rebuild over the
+  bounded live-time index to preserve exact arbitrary-query behavior; this is
+  an exceptional fallback, not a claim that every query avoids all-order work.
 - `apply(const sse_live::DecodedTick&)` shares the existing event logic through
   a private template, so the fixed-layout POD reaches the book without a
   temporary `std::string`/`TickEvent` conversion. The legacy overload remains.

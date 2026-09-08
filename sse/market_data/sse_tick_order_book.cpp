@@ -25,7 +25,12 @@ bool security_matches(const std::string& security_id,
 
 bool security_matches(const std::string& security_id,
                       const sse_live::DecodedTick& event) {
-    if (security_id.size() > sizeof(event.security_id)) return false;
+    std::size_t encoded_size = 0;
+    while (encoded_size < sizeof(event.security_id) &&
+           event.security_id[encoded_size] != '\0')
+        ++encoded_size;
+    if (encoded_size == sizeof(event.security_id) ||
+        encoded_size != security_id.size()) return false;
     for (std::size_t i = 0; i < security_id.size(); ++i)
         if (event.security_id[i] != security_id[i]) return false;
     return true;

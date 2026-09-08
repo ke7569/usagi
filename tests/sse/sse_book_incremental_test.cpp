@@ -220,6 +220,21 @@ int main() {
         std::cerr << "DecodedTick direct apply failed\n";
         return 1;
     }
+    sse_tick::OrderBook short_security_book("60000");
+    if (short_security_book.apply(decoded).accepted) {
+        std::cerr << "DecodedTick security length was not checked\n";
+        return 1;
+    }
+    sse_live::DecodedTick unterminated = decoded;
+    unterminated.security_id[6] = '0';
+    unterminated.security_id[7] = '0';
+    unterminated.tick_index = 2;
+    unterminated.provider_sequence = 2;
+    unterminated.app_seq_num = 2;
+    if (decoded_book.apply(unterminated).accepted) {
+        std::cerr << "Unterminated DecodedTick security was accepted\n";
+        return 1;
+    }
 
     sse_tick::FlowStats window;
     window.events.reserve(32);
