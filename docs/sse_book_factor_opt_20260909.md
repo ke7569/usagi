@@ -165,6 +165,12 @@ recurrent-state drift over a long sequence. Neither is enabled in the runtime.
 The FMA and fixed-kernel measurements are recorded in
 `docs/benchmarks/sse-model-fma-20260909.json`.
 
+An independent AVX512 VNNI prototype reaches 8.86µs for the nine matrix
+products alone and about 30.2µs for complete recurrent inference. It requires
+the installed GCC11 toolchain and changes the arithmetic more aggressively;
+the prototype is therefore kept out of the default GCC4.8 runtime. Its result
+is recorded in `docs/benchmarks/sse-model-vnni-prototype-20260909.json`.
+
 ## CMake integration fragment
 
 The focused test was intentionally left out of the shared CMake file to avoid

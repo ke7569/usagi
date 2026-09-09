@@ -1,0 +1,14 @@
+{
+  "date": "2026-09-09",
+  "host": "sse-live",
+  "cpu": 56,
+  "compiler": "/opt/rh/devtoolset-11/root/usr/bin/g++ 11.2.1",
+  "scope": "Standalone prototype only; not linked into the production runtime.",
+  "model": "/home/zane/sse/artifacts/tick/ssemodl1.bin",
+  "quantization": "symmetric int8 weights and dynamic int8 inputs with per-tensor scales, AVX512 VNNI dpbusd",
+  "matrix_only_cycles": 23900,
+  "matrix_only_us_at_2_7ghz": 8.86,
+  "full_inference_cycles": 81700,
+  "full_inference_us_at_2_7ghz": 30.2,
+  "conclusion": "The VNNI matrix kernel reaches the requested 10us scale for GEMM only, but complete recurrent inference remains about 30us after quantization, dequantization, activation, GRU state update, and LayerNorm."
+}
