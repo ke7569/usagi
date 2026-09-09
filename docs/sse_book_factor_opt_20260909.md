@@ -10,25 +10,23 @@ not changed.
   quantity, live order count, add-time sum, and young quantity on add, cancel,
   and trade. `full_depth()` now emits that aggregate directly and does not
   scan `orders_` or build a per-call price index.
-- A live `(add_time_micros, order_no)` index is exact-erased when an order is
-  fully canceled or filled. A second bounded active-young set handles forward
-  query-time expiry. Expiry is strict: age exactly 30,000,000 microseconds is
-  young, and age 30,000,001 is not. A query-clock rollback rebuilds from the
-  live time index so future-dated orders remain excluded by `now >= add_time`.
-- With the normal nondecreasing query clock, young-cache maintenance visits
-  only newly eligible and newly expired live-time entries (plus the ordered
-  price levels emitted by `full_depth()`). The first query when no cache exists,
-  or any query-clock rollback, intentionally has an O(N_live) rebuild over the
-  bounded live-time index to preserve exact arbitrary-query behavior; this is
-  an exceptional fallback, not a claim that every query avoids all-order work.
+- Order age is stored in exchange seconds. The wire time is only `HHMMSScc`,
+  so this deliberately removes false microsecond precision; the aggregate
+  factor interface still exposes the historical microsecond field in multiples
+  of one second. Exact age 30 seconds remains young and age 31 seconds is not.
+- A compact append-only age queue replaces the live-time and active-young
+  red-black trees. Cancel/fill leaves a cheap stale reference; a batch-end or
+  full-depth query advances activation and expiry cursors and skips references
+  whose order was already removed. Periodic prefix compaction bounds memory.
+  A query-clock rollback rebuilds young quantities by scanning live orders and
+  resets the cursors, preserving the existing exceptional O(N_live) fallback.
 - `apply(const sse_live::DecodedTick&)` shares the existing event logic through
   a private template, so the fixed-layout POD reaches the book without a
   temporary `std::string`/`TickEvent` conversion. The legacy overload remains.
 - `take_flow_window(FlowStats*)` allows the factor state to retain the flow
   event vector. The return-by-value overload remains for existing callers.
-- The hot cancel/fill path tests the cached young predicate directly; it does
-  not search the active-young tree for every quantity update, and only erases a
-  tree key when the order is actually young at the cached query time.
+- The hot cancel/fill path tests the cached young predicate directly and does
+  not touch an age tree for every quantity update.
 
 ## Correctness checks
 
@@ -72,10 +70,35 @@ Median microseconds (`old -> new`):
 | 50,000 | 20 | 4.34 -> 7.24 | 1,152.55 -> 13.58 | 1,141.44 -> 4.74 |
 | 50,000 | 520 | 108.13 -> 183.62 | 1,174.98 -> 32.39 | 1,144.28 -> 4.74 |
 
-The update increase is the cost of maintaining the exact ordered live-time
-index and per-level aggregates. The benchmark is a controlled component test,
+The original update increase was largely the cost of maintaining the exact
+ordered live-time index and per-level aggregates. The seconds/expiry-queue
+implementation below must be measured separately. The benchmark is a controlled component test,
 not raw decode, socket/SHM, routing, queue, model, full-history replay, or
 full-day live throughput; these numbers do not establish production latency.
+
+## Seconds and expiry-queue follow-up
+
+The follow-up keeps the public `Level.add_time_sum_micros` field for
+compatibility, but stores order age internally as exchange seconds. The input
+wire time is `HHMMSScc`, so this does not discard precision present in the
+Shanghai source. The two per-order time trees were replaced by an append-only
+age queue with lazy stale-reference removal and periodic prefix compaction.
+
+The same CPU56 controlled fixture was rerun after the change. Median
+microseconds for 50,000 resting orders and 520 records were:
+
+| Component | Before seconds change | Seconds queue |
+|---|---:|---:|
+| Order-book updates | 183.62 | 106.89 |
+| Factor build | 32.39 | 31.95 |
+| Tick inference | 85.70 | 85.82 |
+| Combined measured path | 302.56 | 224.86 |
+
+The combined measurement is taken around the complete component path and is
+not the sum of component percentiles. The old/new real-model fixture checksum
+changed from `71890.4863` to `71890.9273`, a relative difference of about
+`0.00061%`; serial and parallel pipeline outputs remained exactly equal. The
+seconds boundary test and all 50 integrated CTest targets passed.
 
 ## CMake integration fragment
 

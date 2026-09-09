@@ -80,9 +80,11 @@ public:
             level.price_raw = static_cast<std::int64_t>(order.price_raw);
             level.quantity += order.quantity;
             level.order_count += 1;
-            level.add_time_sum_micros += order.add_time_micros;
-            if (now_micros >= order.add_time_micros &&
-                now_micros - order.add_time_micros <= 30000000ULL)
+            const std::uint64_t add_time_seconds = order.add_time_micros / 1000000ULL;
+            const std::uint64_t now_seconds = now_micros / 1000000ULL;
+            level.add_time_sum_micros += add_time_seconds * 1000000ULL;
+            if (now_seconds >= add_time_seconds &&
+                now_seconds - add_time_seconds <= 30ULL)
                 level.young_quantity += order.quantity;
         }
         std::vector<sse_tick::Level> result;
@@ -183,10 +185,11 @@ int main() {
         !apply_both(&fast, &slow, event('A', 1, 202, 0, 10020, 700, t0 + 1000), "add ask 2") ||
         !compare_depth(&fast, slow, t0 + 1000, "initial depth")) return 1;
 
-    // The exact 30-second boundary is still young; one microsecond later it is
-    // still young until the age is strictly greater than 30 seconds.
+    // The exact 30-second boundary is still young. The book now maintains
+    // exchange time at one-second precision, so advance a full second before
+    // checking expiry.
     if (!compare_depth(&fast, slow, t0 + 30000000ULL, "young at 30 seconds") ||
-        !compare_depth(&fast, slow, t0 + 30000001ULL, "young at 30 seconds plus one")) return 1;
+        !compare_depth(&fast, slow, t0 + 31000000ULL, "young at 31 seconds")) return 1;
 
     if (!apply_both(&fast, &slow, event('D', 0, 101, 0, 0, 400, t0 + 30000002ULL), "partial cancel") ||
         !compare_depth(&fast, slow, t0 + 30000002ULL, "after partial cancel") ||
@@ -200,7 +203,7 @@ int main() {
     if (!apply_both(&fast, &slow, event('A', 0, 104, 0, 9980, 900, t0 + 40000000ULL), "future-timestamp add") ||
         !compare_depth(&fast, slow, t0 + 39999999ULL, "before future timestamp") ||
         !compare_depth(&fast, slow, t0 + 70000000ULL, "future timestamp at boundary") ||
-        !compare_depth(&fast, slow, t0 + 70000001ULL, "future timestamp expired") ||
+        !compare_depth(&fast, slow, t0 + 71000000ULL, "future timestamp expired") ||
         !compare_depth(&fast, slow, t0 + 40000000ULL, "clock rollback")) return 1;
     // Removing an order outside the current young window must update the
     // aggregate book without requiring an active-young tree entry.

@@ -6,7 +6,6 @@
 
 #include <cstdint>
 #include <map>
-#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -23,8 +22,10 @@ struct Order {
     std::uint32_t price_raw;
     std::uint64_t remaining_qty;
     char side;
-    std::uint64_t add_tick_index;
-    std::uint64_t add_time_micros;
+    // The exchange wire time is HHMMSScc. Seconds are sufficient for the
+    // age features and make the per-order record smaller than a microsecond
+    // timestamp.
+    std::uint32_t add_time_seconds;
 };
 
 struct Level {
@@ -104,19 +105,10 @@ private:
     };
     typedef std::map<std::uint32_t, LevelAggregate> LevelMap;
 
-    struct LiveOrderKey {
-        std::uint64_t add_time_micros;
+    struct AgeEntry {
+        std::uint32_t add_time_seconds;
         std::uint64_t order_no;
     };
-    struct LiveOrderKeyLess {
-        bool operator()(const LiveOrderKey& left,
-                        const LiveOrderKey& right) const {
-            if (left.add_time_micros != right.add_time_micros)
-                return left.add_time_micros < right.add_time_micros;
-            return left.order_no < right.order_no;
-        }
-    };
-    typedef std::set<LiveOrderKey, LiveOrderKeyLess> LiveOrderSet;
 
     bool add_order(std::uint64_t order_no, std::uint32_t price_raw,
                    std::uint64_t quantity, char side, std::uint64_t tick,
@@ -131,10 +123,11 @@ private:
     const LevelMap& levels(char side) const;
     void refresh_young(std::uint64_t now_micros) const;
     void rebuild_young(std::uint64_t now_micros) const;
-    static bool is_young(std::uint64_t now_micros,
-                         std::uint64_t add_time_micros);
-    static bool is_expired(std::uint64_t now_micros,
-                           std::uint64_t add_time_micros);
+    static bool is_young(std::uint32_t now_seconds,
+                         std::uint32_t add_time_seconds);
+    static bool is_expired(std::uint32_t now_seconds,
+                           std::uint32_t add_time_seconds);
+    void compact_age_entries() const;
 
     template <typename Event>
     ApplyResult apply_impl(const Event& event);
@@ -143,12 +136,14 @@ private:
     std::unordered_map<std::uint64_t, Order> orders_;
     LevelMap bid_levels_;
     LevelMap ask_levels_;
-    // Unlike a lazy priority queue, this index removes a key when its order
-    // is canceled or filled, so stale entries cannot grow without a bound.
-    LiveOrderSet live_order_times_;
-    mutable LiveOrderSet young_orders_;
+    // Entries are appended in exchange-time order. Canceled/filled orders
+    // remain as cheap stale references until the expiry cursor passes them;
+    // this removes two balanced-tree mutations from every hot update.
+    mutable std::vector<AgeEntry> age_entries_;
+    mutable std::size_t age_activate_index_;
+    mutable std::size_t age_expire_index_;
     mutable bool young_cache_initialized_;
-    mutable std::uint64_t young_cache_time_micros_;
+    mutable std::uint32_t young_cache_time_seconds_;
     FlowStats flow_;
     std::uint64_t last_tick_index_;
     bool has_tick_index_;

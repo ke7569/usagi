@@ -7,7 +7,7 @@
 namespace sse_tick {
 namespace {
 
-static const std::uint64_t kYoungWindowMicros = 30000000ULL;
+static const std::uint32_t kYoungWindowSeconds = 30U;
 
 template <typename Event>
 char sse_side_for_order(const Event& event) {
@@ -57,11 +57,12 @@ ApplyResult::ApplyResult()
 
 OrderBook::OrderBook(const std::string& security_id)
     : security_id_(security_id), orders_(), bid_levels_(), ask_levels_(),
-      live_order_times_(), young_orders_(), young_cache_initialized_(false),
-      young_cache_time_micros_(0), flow_(), last_tick_index_(0),
+      age_entries_(), age_activate_index_(0), age_expire_index_(0),
+      young_cache_initialized_(false), young_cache_time_seconds_(0), flow_(), last_tick_index_(0),
       has_tick_index_(false), total_trade_qty_(0), total_trade_turnover_(0.0),
       last_trade_price_(0.0) {
     flow_.events.reserve(256);
+    age_entries_.reserve(4096);
 }
 
 OrderBook::LevelMap& OrderBook::levels(char side) {
@@ -72,56 +73,63 @@ const OrderBook::LevelMap& OrderBook::levels(char side) const {
     return side == 'B' ? bid_levels_ : ask_levels_;
 }
 
-bool OrderBook::is_young(std::uint64_t now_micros,
-                         std::uint64_t add_time_micros) {
-    return now_micros >= add_time_micros &&
-           now_micros - add_time_micros <= kYoungWindowMicros;
+bool OrderBook::is_young(std::uint32_t now_seconds,
+                         std::uint32_t add_time_seconds) {
+    return now_seconds >= add_time_seconds &&
+           now_seconds - add_time_seconds <= kYoungWindowSeconds;
 }
 
-bool OrderBook::is_expired(std::uint64_t now_micros,
-                           std::uint64_t add_time_micros) {
+bool OrderBook::is_expired(std::uint32_t now_seconds,
+                           std::uint32_t add_time_seconds) {
     // The 30-second boundary remains young. An order expires only once its
     // age is strictly greater than the configured window.
-    return now_micros > kYoungWindowMicros &&
-           add_time_micros < now_micros - kYoungWindowMicros;
+    return now_seconds > kYoungWindowSeconds &&
+           add_time_seconds < now_seconds - kYoungWindowSeconds;
 }
 
 void OrderBook::refresh_young(std::uint64_t now_micros) const {
+    const std::uint32_t now_seconds =
+        static_cast<std::uint32_t>(now_micros / 1000000ULL);
     if (!young_cache_initialized_) {
         rebuild_young(now_micros);
         return;
     }
-    if (now_micros < young_cache_time_micros_) {
-        // A replay/query clock can move backwards. Rebuild from the exact live
-        // order-time index so the now >= add_time half of the contract remains
-        // true without walking the unordered order table.
+    if (now_seconds < young_cache_time_seconds_) {
+        // A replay/query clock can move backwards. Rebuild from the compact
+        // live order table; this is the exceptional recovery path.
         rebuild_young(now_micros);
         return;
     }
-    if (now_micros == young_cache_time_micros_) return;
+    if (now_seconds == young_cache_time_seconds_) return;
 
-    LiveOrderSet::const_iterator it = live_order_times_.upper_bound(
-        LiveOrderKey{young_cache_time_micros_,
-                     std::numeric_limits<std::uint64_t>::max()});
-    for (; it != live_order_times_.end(); ++it) {
-        if (it->add_time_micros > now_micros) break;
-        if (!is_young(now_micros, it->add_time_micros)) continue;
+    const std::uint32_t old_seconds = young_cache_time_seconds_;
+    while (age_activate_index_ < age_entries_.size() &&
+           age_entries_[age_activate_index_].add_time_seconds <= now_seconds) {
+        const AgeEntry& entry = age_entries_[age_activate_index_++];
+        if (entry.add_time_seconds <= old_seconds ||
+            !is_young(now_seconds, entry.add_time_seconds)) continue;
         const std::unordered_map<std::uint64_t, Order>::const_iterator oi =
-            orders_.find(it->order_no);
+            orders_.find(entry.order_no);
         if (oi == orders_.end()) continue;
+        if (oi->second.add_time_seconds != entry.add_time_seconds) continue;
         const LevelMap& side_levels = levels(oi->second.side);
         LevelMap::const_iterator li = side_levels.find(oi->second.price_raw);
         if (li == side_levels.end()) continue;
         li->second.young_quantity += oi->second.remaining_qty;
-        young_orders_.insert(*it);
     }
 
-    while (!young_orders_.empty() &&
-           is_expired(now_micros, young_orders_.begin()->add_time_micros)) {
-        const LiveOrderKey key = *young_orders_.begin();
+    const std::uint32_t cutoff = is_expired(now_seconds, 0U)
+        ? now_seconds - kYoungWindowSeconds : 0U;
+    while (age_expire_index_ < age_activate_index_ &&
+           age_entries_[age_expire_index_].add_time_seconds < cutoff) {
+        const AgeEntry& entry = age_entries_[age_expire_index_++];
+        // Entries added after the previous query were not counted in the
+        // young aggregate yet, so they must not be subtracted here.
+        if (entry.add_time_seconds > old_seconds) continue;
         const std::unordered_map<std::uint64_t, Order>::const_iterator oi =
-            orders_.find(key.order_no);
-        if (oi != orders_.end()) {
+            orders_.find(entry.order_no);
+        if (oi != orders_.end() &&
+            oi->second.add_time_seconds == entry.add_time_seconds) {
             const LevelMap& side_levels = levels(oi->second.side);
             LevelMap::const_iterator li = side_levels.find(oi->second.price_raw);
             if (li != side_levels.end()) {
@@ -131,33 +139,50 @@ void OrderBook::refresh_young(std::uint64_t now_micros) const {
                         : 0ULL;
             }
         }
-        young_orders_.erase(young_orders_.begin());
     }
-    young_cache_time_micros_ = now_micros;
+    young_cache_time_seconds_ = now_seconds;
+    compact_age_entries();
 }
 
 void OrderBook::rebuild_young(std::uint64_t now_micros) const {
+    const std::uint32_t now_seconds =
+        static_cast<std::uint32_t>(now_micros / 1000000ULL);
     for (LevelMap::const_iterator it = bid_levels_.begin();
          it != bid_levels_.end(); ++it)
         it->second.young_quantity = 0;
     for (LevelMap::const_iterator it = ask_levels_.begin();
          it != ask_levels_.end(); ++it)
         it->second.young_quantity = 0;
-    young_orders_.clear();
-    for (LiveOrderSet::const_iterator it = live_order_times_.begin();
-         it != live_order_times_.end(); ++it) {
-        if (!is_young(now_micros, it->add_time_micros)) continue;
-        const std::unordered_map<std::uint64_t, Order>::const_iterator oi =
-            orders_.find(it->order_no);
-        if (oi == orders_.end()) continue;
+    for (std::unordered_map<std::uint64_t, Order>::const_iterator oi = orders_.begin();
+         oi != orders_.end(); ++oi) {
+        if (!is_young(now_seconds, oi->second.add_time_seconds)) continue;
         const LevelMap& side_levels = levels(oi->second.side);
         LevelMap::const_iterator li = side_levels.find(oi->second.price_raw);
         if (li == side_levels.end()) continue;
         li->second.young_quantity += oi->second.remaining_qty;
-        young_orders_.insert(*it);
     }
-    young_cache_time_micros_ = now_micros;
+    age_activate_index_ = 0;
+    while (age_activate_index_ < age_entries_.size() &&
+           age_entries_[age_activate_index_].add_time_seconds <= now_seconds)
+        ++age_activate_index_;
+    const std::uint32_t cutoff = is_expired(now_seconds, 0U)
+        ? now_seconds - kYoungWindowSeconds : 0U;
+    age_expire_index_ = 0;
+    while (age_expire_index_ < age_activate_index_ &&
+           age_entries_[age_expire_index_].add_time_seconds < cutoff)
+        ++age_expire_index_;
+    young_cache_time_seconds_ = now_seconds;
     young_cache_initialized_ = true;
+    compact_age_entries();
+}
+
+void OrderBook::compact_age_entries() const {
+    if (age_expire_index_ < 65536U ||
+        age_expire_index_ * 2U <= age_entries_.size()) return;
+    const std::size_t removed = age_expire_index_;
+    age_entries_.erase(age_entries_.begin(), age_entries_.begin() + removed);
+    age_activate_index_ -= removed;
+    age_expire_index_ = 0;
 }
 
 bool OrderBook::add_order(std::uint64_t order_no, std::uint32_t price,
@@ -165,21 +190,25 @@ bool OrderBook::add_order(std::uint64_t order_no, std::uint32_t price,
                           std::uint64_t tick, std::uint64_t time_micros) {
     if (order_no == 0 || quantity == 0 || (side != 'B' && side != 'S')) return false;
     if (orders_.find(order_no) != orders_.end()) return false;
-    Order order = {order_no, price, quantity, side, tick, time_micros};
+    (void)tick;
+    const std::uint32_t add_time_seconds =
+        static_cast<std::uint32_t>(time_micros / 1000000ULL);
+    Order order = {order_no, price, quantity, side, add_time_seconds};
     orders_[order_no] = order;
     LevelAggregate& level = levels(side)[price];
     level.quantity += quantity;
     level.order_count += 1;
-    level.add_time_sum_micros += time_micros;
-    const LiveOrderKey key = {time_micros, order_no};
-    live_order_times_.insert(key);
+    level.add_time_sum_micros += static_cast<std::uint64_t>(add_time_seconds) * 1000000ULL;
+    age_entries_.push_back(AgeEntry{add_time_seconds, order_no});
     if (!young_cache_initialized_) {
         young_cache_initialized_ = true;
-        young_cache_time_micros_ = time_micros;
+        young_cache_time_seconds_ = add_time_seconds;
     }
-    if (is_young(young_cache_time_micros_, time_micros)) {
+    if (is_young(young_cache_time_seconds_, add_time_seconds)) {
         level.young_quantity += quantity;
-        young_orders_.insert(key);
+        // The entry is already reflected in the aggregate. Mark it as
+        // activated so the next forward refresh does not add it twice.
+        age_activate_index_ = age_entries_.size();
     }
     if (side == 'B') flow_.buy_add_qty += quantity;
     else flow_.sell_add_qty += quantity;
@@ -203,11 +232,6 @@ bool OrderBook::delete_order(std::uint64_t order_no,
                                      order.price_raw ? order.price_raw : event_price_raw,
                                      quantity});
     if (remove_order) {
-        const LiveOrderKey key = {order.add_time_micros, order.order_no};
-        live_order_times_.erase(key);
-        if (young_cache_initialized_ &&
-            is_young(young_cache_time_micros_, order.add_time_micros))
-            young_orders_.erase(key);
         orders_.erase(it);
     } else {
         it->second.remaining_qty -= quantity;
@@ -227,11 +251,6 @@ bool OrderBook::trade_order(std::uint64_t order_no, std::uint64_t quantity,
     else flow_.sell_trade_qty += used;
     if (applied) *applied = used;
     if (remove_order) {
-        const LiveOrderKey key = {order.add_time_micros, order.order_no};
-        live_order_times_.erase(key);
-        if (young_cache_initialized_ &&
-            is_young(young_cache_time_micros_, order.add_time_micros))
-            young_orders_.erase(key);
         orders_.erase(it);
     } else {
         it->second.remaining_qty -= used;
@@ -247,19 +266,22 @@ void OrderBook::remove_order_quantity(const Order& order,
     if (li != side_levels.end()) {
         LevelAggregate& level = li->second;
         level.quantity = level.quantity > quantity ? level.quantity - quantity : 0ULL;
-        // The active-young set is maintained as the exact live-order predicate
-        // at young_cache_time_micros_. Avoid a tree lookup on every fill/cancel.
+        // The young aggregate is maintained as the cached live-order
+        // predicate at young_cache_time_seconds_. Avoid a tree lookup on every
+        // fill/cancel.
         const bool young = young_cache_initialized_ &&
-                           is_young(young_cache_time_micros_, order.add_time_micros);
+                           is_young(young_cache_time_seconds_, order.add_time_seconds);
         if (young) {
             level.young_quantity = level.young_quantity > quantity
                 ? level.young_quantity - quantity : 0ULL;
         }
         if (remove_order) {
             if (level.order_count > 0) --level.order_count;
+            const std::uint64_t add_time_micros =
+                static_cast<std::uint64_t>(order.add_time_seconds) * 1000000ULL;
             level.add_time_sum_micros =
-                level.add_time_sum_micros > order.add_time_micros
-                    ? level.add_time_sum_micros - order.add_time_micros : 0ULL;
+                level.add_time_sum_micros > add_time_micros
+                    ? level.add_time_sum_micros - add_time_micros : 0ULL;
             if (level.order_count == 0 || level.quantity == 0)
                 side_levels.erase(li);
         }
