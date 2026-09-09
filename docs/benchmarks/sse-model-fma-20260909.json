@@ -10,6 +10,8 @@
     "original_avx2_single_accumulator": 234817,
     "float_four_accumulators": 200131,
     "float_four_accumulators_fma": 157943,
+    "fixed_eigen_avx2_gcc4_8": 140292,
+    "fixed_eigen_avx2_gcc11_native": 92082,
     "experimental_fp16_weights": 368260,
     "experimental_int8_weights": 304101
   },
@@ -17,18 +19,21 @@
     "original_avx2_single_accumulator": 87.0,
     "float_four_accumulators": 74.1,
     "float_four_accumulators_fma": 58.5,
+    "fixed_eigen_avx2_gcc4_8": 52.0,
+    "fixed_eigen_avx2_gcc11_native": 34.1,
     "experimental_fp16_weights": 136.4,
     "experimental_int8_weights": 112.6
   },
   "downstream_50000_orders_520_records_p50_us": {
     "book_updates": 119.2,
     "factor_build": 9.34,
-    "tick_inference": 58.6,
-    "combined": 187.5
+    "tick_inference": 51.4,
+    "combined": 180.1
   },
   "checksum": 71890.9272122383,
   "notes": [
-    "The committed path uses float32 weights with four independent AVX2 accumulators and explicit FMA; it preserves the original model architecture and activation functions.",
+    "The committed path uses fixed-dimension Eigen AVX2 matrix products over float32 weights; the prior four-accumulator FMA kernel remains the fallback implementation.",
+    "The GCC4.8 build measured about 52us per model row; the same source built with the installed GCC11 and native tuning measured about 34us.",
     "FP16 conversion overhead was slower than float32 on this CPU.",
     "The experimental AVX2 INT8 path was slower and accumulated materially different recurrent outputs, so it is not enabled by the committed path."
   ]

@@ -147,18 +147,22 @@ The measured JSON is in
 
 The model runtime was profiled separately from factor construction. The large
 512-to-256 projection was limited by a long single accumulator chain and the
-model's packed weights were already resident in the AVX2 path. Four independent
-accumulators plus explicit FMA reduce the model-only median from about 234.8k
-to 157.9k TSC cycles per row, or approximately 87.0µs to 58.5µs at the
-measured 2.7GHz rate. The model topology, float32 activations, recurrent state,
-and sigmoid/tanh functions remain unchanged; the checksum difference is below
-the displayed precision (`71890.9272122383` versus `71890.9272733331`).
+model's packed weights were already resident in the AVX2 path. The committed
+path now uses fixed-dimension Eigen AVX2 matrix products over the original
+float32 weights; on the GCC4.8 build it measures about 140.3k TSC cycles per
+row, or approximately 52µs at 2.7GHz. The preceding four-accumulator FMA
+kernel measured 157.9k cycles (58.5µs) and remains available as the fallback
+implementation. Building the same fixed kernel with the installed GCC11 and
+native tuning measures about 92.1k cycles (34µs). The model topology, float32
+activations, recurrent state, and sigmoid/tanh functions remain unchanged.
+The checksum difference is below the displayed precision
+(`71890.9272626638` versus `71890.9272733331`).
 
 Lower precision experiments were measured before being discarded. FP16 weight
 conversion took about 136µs per row because F16C conversion cost exceeded the
 cache benefit. The AVX2 INT8 path took about 113µs and produced substantial
 recurrent-state drift over a long sequence. Neither is enabled in the runtime.
-The FMA benchmark is recorded in
+The FMA and fixed-kernel measurements are recorded in
 `docs/benchmarks/sse-model-fma-20260909.json`.
 
 ## CMake integration fragment

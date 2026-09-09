@@ -1,5 +1,6 @@
 #include "common/model/legacy_midmix/sse_model_runtime.h"
 #include "common/model/legacy_midmix/sse_model_runtime_avx2.h"
+#include "common/model/legacy_midmix/sse_model_runtime_eigen_avx2.h"
 
 #include <Eigen/Dense>
 
@@ -12,6 +13,8 @@
 
 namespace sse_model {
 namespace {
+
+typedef std::vector<float, Eigen::aligned_allocator<float> > Tensor;
 
 const std::uint32_t kArtifactVersion = 1U;
 const unsigned char kFactorHash[32] = {
@@ -35,7 +38,7 @@ const TensorSpec kTensorSpecs[] = {
 };
 const std::size_t kTensorCount = sizeof(kTensorSpecs) / sizeof(kTensorSpecs[0]);
 
-bool finite_vector(const std::vector<float>& values) {
+bool finite_vector(const Tensor& values) {
     for (float value : values) if (!std::isfinite(value)) return false;
     return true;
 }
@@ -53,7 +56,7 @@ float sigmoid(float value) {
     return e / (1.0f + e);
 }
 
-void matvec(const std::vector<float>& weights, std::size_t rows,
+void matvec(const Tensor& weights, std::size_t rows,
             std::size_t cols, const float* input, const float* bias,
             float* output) {
     typedef Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic,
@@ -80,7 +83,7 @@ bool read_bytes(std::ifstream* input, void* data, std::size_t size) {
 }  // namespace
 
 struct Model::Impl {
-    std::vector<std::vector<float> > tensors;
+    std::vector<Tensor> tensors;
     std::vector<std::vector<float> > avx2_tensors;
     std::vector<std::size_t> avx2_offsets;
     bool use_avx2;
@@ -118,12 +121,12 @@ bool Model::load(const std::string& path, std::string* error) {
         if (error) *error = "SSE native model artifact header/version/factor contract mismatch";
         return false;
     }
-    std::vector<std::vector<float> > tensors;
+    std::vector<Tensor> tensors;
     tensors.reserve(kTensorCount);
     for (std::size_t i = 0; i < kTensorCount; ++i) {
         const std::size_t count = kTensorSpecs[i].rows *
                                   (kTensorSpecs[i].cols == 1U ? 1U : kTensorSpecs[i].cols);
-        std::vector<float> values(count, 0.0f);
+        Tensor values(count, 0.0f);
         if (!read_bytes(&input, values.data(), count * sizeof(float)) ||
             !finite_vector(values)) {
             if (error) *error = "SSE native model artifact tensor read/finite check failed";
@@ -177,35 +180,33 @@ bool Model::predict(const std::array<float, kFeatureCount>& factors,
     for (float value : factors) if (!std::isfinite(value)) return false;
 
     if (impl_->use_avx2) {
-        avx2::WeightsView weights = {};
-        for (std::size_t i = 0U; i < kTensorCount; ++i) {
-            weights.tensors[i] = kTensorSpecs[i].cols == 1U
-                ? impl_->tensors[i].data()
-                : impl_->avx2_tensors[i].data() + impl_->avx2_offsets[i];
-        }
-        return avx2::predict(factors.data(), state, prediction, weights);
+        eigen_avx2::WeightsView eigen_weights = {};
+        for (std::size_t i = 0U; i < kTensorCount; ++i)
+            eigen_weights.tensors[i] = impl_->tensors[i].data();
+        return eigen_avx2::predict(factors.data(), state, prediction,
+                                   eigen_weights);
     }
 
-    const std::vector<float>& proj_w = impl_->tensors[0];
-    const std::vector<float>& proj_b = impl_->tensors[1];
-    const std::vector<float>& f0_w = impl_->tensors[2];
-    const std::vector<float>& f0_b = impl_->tensors[3];
-    const std::vector<float>& f1_w = impl_->tensors[4];
-    const std::vector<float>& f1_b = impl_->tensors[5];
-    const std::vector<float>& f2_w = impl_->tensors[6];
-    const std::vector<float>& f2_b = impl_->tensors[7];
-    const std::vector<float>& gru_ih = impl_->tensors[8];
-    const std::vector<float>& gru_hh = impl_->tensors[9];
-    const std::vector<float>& gru_bih = impl_->tensors[10];
-    const std::vector<float>& gru_bhh = impl_->tensors[11];
-    const std::vector<float>& residual_w = impl_->tensors[12];
-    const std::vector<float>& residual_b = impl_->tensors[13];
-    const std::vector<float>& ln_w = impl_->tensors[14];
-    const std::vector<float>& ln_b = impl_->tensors[15];
-    const std::vector<float>& head0_w = impl_->tensors[16];
-    const std::vector<float>& head0_b = impl_->tensors[17];
-    const std::vector<float>& head2_w = impl_->tensors[18];
-    const std::vector<float>& head2_b = impl_->tensors[19];
+    const Tensor& proj_w = impl_->tensors[0];
+    const Tensor& proj_b = impl_->tensors[1];
+    const Tensor& f0_w = impl_->tensors[2];
+    const Tensor& f0_b = impl_->tensors[3];
+    const Tensor& f1_w = impl_->tensors[4];
+    const Tensor& f1_b = impl_->tensors[5];
+    const Tensor& f2_w = impl_->tensors[6];
+    const Tensor& f2_b = impl_->tensors[7];
+    const Tensor& gru_ih = impl_->tensors[8];
+    const Tensor& gru_hh = impl_->tensors[9];
+    const Tensor& gru_bih = impl_->tensors[10];
+    const Tensor& gru_bhh = impl_->tensors[11];
+    const Tensor& residual_w = impl_->tensors[12];
+    const Tensor& residual_b = impl_->tensors[13];
+    const Tensor& ln_w = impl_->tensors[14];
+    const Tensor& ln_b = impl_->tensors[15];
+    const Tensor& head0_w = impl_->tensors[16];
+    const Tensor& head0_b = impl_->tensors[17];
+    const Tensor& head2_w = impl_->tensors[18];
+    const Tensor& head2_b = impl_->tensors[19];
 
     std::array<float, 128> projected;
     std::array<float, 512> layer0;
