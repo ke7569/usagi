@@ -26,6 +26,7 @@ struct Order {
     // age features and make the per-order record smaller than a microsecond
     // timestamp.
     std::uint32_t add_time_seconds;
+    std::uint32_t age_generation;
 };
 
 struct Level {
@@ -107,6 +108,7 @@ private:
 
     struct AgeEntry {
         std::uint32_t add_time_seconds;
+        std::uint32_t age_generation;
         std::uint64_t order_no;
     };
 
@@ -142,6 +144,7 @@ private:
     mutable std::vector<AgeEntry> age_entries_;
     mutable std::size_t age_activate_index_;
     mutable std::size_t age_expire_index_;
+    std::uint32_t next_age_generation_;
     mutable bool young_cache_initialized_;
     mutable std::uint32_t young_cache_time_seconds_;
     FlowStats flow_;

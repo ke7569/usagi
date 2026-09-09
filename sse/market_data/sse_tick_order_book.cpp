@@ -58,6 +58,7 @@ ApplyResult::ApplyResult()
 OrderBook::OrderBook(const std::string& security_id)
     : security_id_(security_id), orders_(), bid_levels_(), ask_levels_(),
       age_entries_(), age_activate_index_(0), age_expire_index_(0),
+      next_age_generation_(0),
       young_cache_initialized_(false), young_cache_time_seconds_(0), flow_(), last_tick_index_(0),
       has_tick_index_(false), total_trade_qty_(0), total_trade_turnover_(0.0),
       last_trade_price_(0.0) {
@@ -111,7 +112,8 @@ void OrderBook::refresh_young(std::uint64_t now_micros) const {
         const std::unordered_map<std::uint64_t, Order>::const_iterator oi =
             orders_.find(entry.order_no);
         if (oi == orders_.end()) continue;
-        if (oi->second.add_time_seconds != entry.add_time_seconds) continue;
+        if (oi->second.add_time_seconds != entry.add_time_seconds ||
+            oi->second.age_generation != entry.age_generation) continue;
         const LevelMap& side_levels = levels(oi->second.side);
         LevelMap::const_iterator li = side_levels.find(oi->second.price_raw);
         if (li == side_levels.end()) continue;
@@ -129,7 +131,8 @@ void OrderBook::refresh_young(std::uint64_t now_micros) const {
         const std::unordered_map<std::uint64_t, Order>::const_iterator oi =
             orders_.find(entry.order_no);
         if (oi != orders_.end() &&
-            oi->second.add_time_seconds == entry.add_time_seconds) {
+            oi->second.add_time_seconds == entry.add_time_seconds &&
+            oi->second.age_generation == entry.age_generation) {
             const LevelMap& side_levels = levels(oi->second.side);
             LevelMap::const_iterator li = side_levels.find(oi->second.price_raw);
             if (li != side_levels.end()) {
@@ -193,13 +196,15 @@ bool OrderBook::add_order(std::uint64_t order_no, std::uint32_t price,
     (void)tick;
     const std::uint32_t add_time_seconds =
         static_cast<std::uint32_t>(time_micros / 1000000ULL);
-    Order order = {order_no, price, quantity, side, add_time_seconds};
+    if (++next_age_generation_ == 0U) ++next_age_generation_;
+    Order order = {order_no, price, quantity, side, add_time_seconds,
+                   next_age_generation_};
     orders_[order_no] = order;
     LevelAggregate& level = levels(side)[price];
     level.quantity += quantity;
     level.order_count += 1;
     level.add_time_sum_micros += static_cast<std::uint64_t>(add_time_seconds) * 1000000ULL;
-    age_entries_.push_back(AgeEntry{add_time_seconds, order_no});
+    age_entries_.push_back(AgeEntry{add_time_seconds, next_age_generation_, order_no});
     if (!young_cache_initialized_) {
         young_cache_initialized_ = true;
         young_cache_time_seconds_ = add_time_seconds;
