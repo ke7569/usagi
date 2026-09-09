@@ -151,8 +151,8 @@ model's packed weights were already resident in the AVX2 path. The committed
 path now uses fixed-dimension Eigen AVX2 matrix products over the original
 float32 weights; on the GCC4.8 build it measures about 140.3k TSC cycles per
 row, or approximately 52µs at 2.7GHz. The preceding four-accumulator FMA
-kernel measured 157.9k cycles (58.5µs) and remains available as the fallback
-implementation. Building the same fixed kernel with the installed GCC11 and
+kernel measured 157.9k cycles (58.5µs) and remains in the library for
+controlled comparison. Building the same fixed kernel with the installed GCC11 and
 native tuning measures about 92.1k cycles (34µs). The model topology, float32
 activations, recurrent state, and sigmoid/tanh functions remain unchanged.
 The checksum difference is below the displayed precision

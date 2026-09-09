@@ -32,7 +32,7 @@
   },
   "checksum": 71890.9272122383,
   "notes": [
-    "The committed path uses fixed-dimension Eigen AVX2 matrix products over float32 weights; the prior four-accumulator FMA kernel remains the fallback implementation.",
+    "The committed path uses fixed-dimension Eigen AVX2 matrix products over float32 weights; the prior four-accumulator FMA kernel remains in the library for controlled comparison.",
     "The GCC4.8 build measured about 52us per model row; the same source built with the installed GCC11 and native tuning measured about 34us.",
     "FP16 conversion overhead was slower than float32 on this CPU.",
     "The experimental AVX2 INT8 path was slower and accumulated materially different recurrent outputs, so it is not enabled by the committed path."
