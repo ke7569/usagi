@@ -99,13 +99,25 @@ class PrepareStreamProcessingTests(unittest.TestCase):
             with self.subTest(factors_only=mode), self.assertRaises(unified_config.ConfigError):
                 processing.make_profile(config, factors_only=mode)
 
-    def test_sh_prediction_requires_auction_inputs_but_factors_only_does_not(self):
+    def test_sh_prediction_uses_live_auction_without_csv(self):
         runtime = self.runtime("SH")
         del runtime["snapshot_auction59_factors_path"]
         config = self.config("SH", runtime=runtime)
-        with self.assertRaises(unified_config.ConfigError):
-            processing.make_profile(config)
+        profile = processing.make_profile(config)
+        self.assertEqual("prediction", profile["processing_mode"])
+        self.assertNotIn("snapshot_auction59_factors_path", profile["prediction"])
         self.assertEqual("factors-only", processing.make_profile(config, factors_only=True)["processing_mode"])
+
+    def test_sh_optional_listing_metadata_preserved_and_checked(self):
+        runtime = self.runtime("SH")
+        values = runtime["ins_params"]["600000.SH"]
+        values.update({"listing_date": 20260904, "is_ipo_first_day": True})
+        profile = processing.make_profile(self.config("SH", runtime))
+        self.assertEqual(20260904, profile["instruments"][0]["listing_date"])
+        self.assertIs(True, profile["instruments"][0]["is_ipo_first_day"])
+        values["is_ipo_first_day"] = False
+        with self.assertRaises(unified_config.ConfigError):
+            self.config("SH", runtime)
 
     def test_strategy_intents_export_original_configuration_without_changing_base_profile(self):
         runtime = self.runtime("SH")
@@ -319,7 +331,7 @@ class PrepareStreamProcessingTests(unittest.TestCase):
         runtime = self.runtime("SH")
         runtime["sse_live_sampling"] = canonical["sse_live_sampling"]
         runtime["model_routing"] = canonical["model_routing"]
-        self.assertEqual("global-sse-datagram-gap",
+        self.assertEqual("per-subscription-sse-datagram-gap",
                          runtime["sse_live_sampling"]["activity_scope"])
         self.assertEqual("at-most-one-sample",
                          runtime["sse_live_sampling"]["same_exchange_time_policy"])
@@ -328,7 +340,7 @@ class PrepareStreamProcessingTests(unittest.TestCase):
         config = self.config("SH", runtime)
         result = processing.make_profile(config)
         self.assertEqual(config["prediction"], result["prediction"])
-        runtime["sse_live_sampling"] = {"threshold_ns": 100000}
+        runtime["sse_live_sampling"] = {"threshold_ns": 5000}
         runtime["model_routing"] = {"silent_fallback": False}
         result = processing.make_profile(self.config("SH", runtime))
         self.assertEqual("sse-per-instrument-v2", result["processing_contract"])

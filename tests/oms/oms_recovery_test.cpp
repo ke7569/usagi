@@ -221,6 +221,39 @@ void test_unknown_send_is_not_replayed() {
     require(!second->account().ready, "unknown send keeps account closed");
 }
 
+void test_query_tokens_restart_in_new_epoch() {
+    TempDir temp;
+    const Config settings = config(temp);
+    Snapshot previous;
+    for (std::uint64_t epoch = 1; epoch <= 3; ++epoch) {
+        std::shared_ptr<ScriptedBackend> backend(new ScriptedBackend(capabilities()));
+        auto engine = create(settings, backend, epoch);
+        // The live entry point begins at token 1 on each process start.
+        require(engine->begin_reconcile(1, false), "new epoch permits first query token after journal replay");
+        if (epoch > 1) {
+            require(!engine->complete_snapshot(previous), "old epoch cannot satisfy the reused query token");
+            require(!engine->account().ready, "old epoch leaves reconciliation closed");
+        }
+        previous = snapshot_for(engine, 1);
+        require(engine->complete_snapshot(previous), "new epoch query completes");
+        require(engine->account().ready, "new epoch reconciles after restart");
+        require(!engine->begin_reconcile(1, false), "same epoch rejects repeated query token");
+        reconcile(engine, backend, 2);
+        require(!engine->begin_reconcile(1, false), "same epoch rejects regressed query token");
+    }
+    // Also retain the reset if a process stops after starting a new epoch,
+    // before it has persisted that epoch's first query.
+    {
+        std::shared_ptr<ScriptedBackend> backend(new ScriptedBackend(capabilities()));
+        auto engine = create(settings, backend, 4);
+    }
+    std::shared_ptr<ScriptedBackend> backend(new ScriptedBackend(capabilities()));
+    auto recovered = Engine::create(settings, backend);
+    require(recovered->scope().epoch == 4, "journal restored latest epoch");
+    require(recovered->set_connected(recovered->scope(), true), "restore test connection");
+    require(recovered->begin_reconcile(1, false), "journal epoch resets earlier query tokens");
+}
+
 void test_external_order_is_read_only_and_self_crosses() {
     TempDir temp;
     Config value = config(temp);
@@ -371,6 +404,7 @@ int main() {
     try {
         test_durable_active_order_recovery();
         test_unknown_send_is_not_replayed();
+        test_query_tokens_restart_in_new_epoch();
         test_external_order_is_read_only_and_self_crosses();
         test_incomplete_query_and_overlapping_report_close_gate();
         test_journal_failure_and_corrupt_tail_close_gate();

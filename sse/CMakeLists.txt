@@ -53,7 +53,7 @@ if(T0_BUILD_SSE_STREAM_PROCESSOR)
   target_include_directories(sse_stream_processing PUBLIC ${USAGI_ROOT}/sse)
   target_compile_options(sse_stream_processing PRIVATE -ffp-contract=off)
   target_link_libraries(sse_stream_processing PUBLIC
-    deepwin_market_data_runtime sse_live_sampling sse_hybrid_model_runtime)
+    deepwin_market_data_runtime sse_live_sampling sse_hybrid_model_runtime sse_auction59)
   add_executable(sse_stream_processor_test ${USAGI_ROOT}/tests/sse/sse_stream_processor_test.cpp)
   target_link_libraries(sse_stream_processor_test PRIVATE sse_stream_processing)
   target_compile_options(sse_stream_processor_test PRIVATE -UNDEBUG)
@@ -82,20 +82,21 @@ if(T0_BUILD_SSE_STREAM_PROCESSOR)
   target_link_libraries(t0_sse_journal_predict PRIVATE
     sse_journal_core sse_runtime_support sse_strategy_session)
   target_include_directories(t0_sse_journal_predict PRIVATE ${BOOST_INCLUDE})
+  add_executable(sse_auction59_cli_test ${USAGI_ROOT}/tests/sse/sse_auction59_cli_test.cpp)
+  target_include_directories(sse_auction59_cli_test PRIVATE ${BOOST_INCLUDE})
+  target_link_libraries(sse_auction59_cli_test PRIVATE sse_strategy_session sse_runtime_support)
+  target_compile_options(sse_auction59_cli_test PRIVATE -UNDEBUG)
+  add_test(NAME sse_auction59_cli_test COMMAND sse_auction59_cli_test)
 endif()
 
 if(T0_BUILD_SSE_STREAM_PROCESSOR)
-  # Auction59 opening-auction package: opening-boundary quality, per-stock
-  # static metadata (CSV) and the auction reconstruction engine, with its
-  # standalone replay/follow runner. Not yet wired into the SSE stream
-  # processor; the processing profile reserves an optional "auction59" toggle
-  # under "prediction" for that integration (see StreamProcessingCli). The
-  # library stays self-contained (no decoder.cpp dependency); the runner
-  # compiles the decoder directly.
+  # The stream processor feeds decoded ticks and snapshots to this in-memory
+  # Auction59 session. The standalone CSV runner remains an offline tool.
   add_library(sse_auction59 STATIC
     ${USAGI_ROOT}/sse/auction/sse_opening_boundary.cpp
     ${USAGI_ROOT}/sse/auction/auction_static_metadata.cpp
-    ${USAGI_ROOT}/sse/auction/auction59_engine.cpp)
+    ${USAGI_ROOT}/sse/auction/auction59_engine.cpp
+    ${USAGI_ROOT}/sse/auction/auction59_session.cpp)
   target_link_libraries(sse_auction59 PUBLIC pthread)
   add_executable(sse_auction59_live
     ${USAGI_ROOT}/sse/auction/sse_auction59_live.cpp
@@ -110,7 +111,7 @@ if(T0_BUILD_SSE_STREAM_PROCESSOR)
     ${USAGI_ROOT}/sse/market_data/sse_primary_decoder.cpp)
   target_include_directories(audit_snapshot_static_metadata PRIVATE ${USAGI_ROOT}/sse/market_data)
   target_link_libraries(audit_snapshot_static_metadata PRIVATE sse_auction59 pthread)
-  foreach(auction_test auction59_engine_test auction_static_metadata_test sse_opening_boundary_test)
+  foreach(auction_test auction59_engine_test auction_static_metadata_test sse_opening_boundary_test auction59_session_test)
     add_executable(${auction_test} ${USAGI_ROOT}/tests/sse/${auction_test}.cpp)
     target_link_libraries(${auction_test} PRIVATE sse_auction59)
     target_compile_options(${auction_test} PRIVATE -UNDEBUG)

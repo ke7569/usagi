@@ -78,6 +78,9 @@ void Session::process_prediction_output(const sse_stream::Output& output) {
     if (!(tick ? output.tick.prediction_valid : output.snapshot.prediction_valid) || !prediction.selected) return;
     const std::uint64_t exchange_us = tick ? output.tick.event.time_of_day_micros : output.snapshot.snapshot.time_of_day_micros;
     const std::string& code = tick ? output.tick.event.security_id : output.snapshot.snapshot.security_id;
+    // A later snapshot in the same hardware batch may invalidate daily
+    // prices after this prediction was queued. Check again at dispatch.
+    if (instrument_gate_ && !instrument_gate_(code)) return;
     const bool tick_window = exchange_us >= 34500000000ULL;
     if (exchange_us < 34200000000ULL || exchange_us >= 86400000000ULL || tick != tick_window ||
         prediction.selected_source != (tick ? sse_hybrid_model::kTickSource : sse_hybrid_model::kSnapshotSource) ||

@@ -6,13 +6,36 @@ target_link_libraries(sse_journal_timestamp_test PRIVATE sse_journal_core deepwi
 add_test(NAME sse_journal_timestamp_test COMMAND sse_journal_timestamp_test)
 set_tests_properties(sse_journal_timestamp_test PROPERTIES TIMEOUT 30)
 
-foreach(oms_test_name oms_test oms_recovery_test journal_test atp_boundary_test async_journal_test)
+foreach(oms_test_name oms_test oms_recovery_test journal_test atp_boundary_test atp_snapshot_collector_test async_journal_test)
   add_executable(${oms_test_name} ${USAGI_ROOT}/tests/oms/${oms_test_name}.cpp)
   target_include_directories(${oms_test_name} PRIVATE ${BOOST_INCLUDE})
   target_link_libraries(${oms_test_name} PRIVATE t0_oms_core)
   add_test(NAME ${oms_test_name} COMMAND ${oms_test_name})
   set_tests_properties(${oms_test_name} PROPERTIES TIMEOUT 30)
 endforeach()
+
+# Test-only TD shared objects have no SDK or production account dependency.
+if(T0_BUILD_SSE_STREAM_PROCESSOR)
+  add_library(fake_live_td_plugin SHARED ${USAGI_ROOT}/tests/oms/fake_live_td_plugin.cpp)
+  target_compile_options(fake_live_td_plugin PRIVATE -fno-gnu-unique)
+  target_link_libraries(fake_live_td_plugin PRIVATE pthread)
+  add_library(missing_live_td_plugin SHARED ${USAGI_ROOT}/tests/oms/fake_live_td_plugin.cpp)
+  target_compile_definitions(missing_live_td_plugin PRIVATE USAGI_TEST_MISSING_TD_ENTRYPOINT)
+  target_compile_options(missing_live_td_plugin PRIVATE -fno-gnu-unique)
+  target_link_libraries(missing_live_td_plugin PRIVATE pthread)
+  add_executable(live_td_plugin_test ${USAGI_ROOT}/tests/oms/live_td_plugin_test.cpp)
+  target_link_libraries(live_td_plugin_test PRIVATE sse_strategy_session pthread dl)
+  add_dependencies(live_td_plugin_test fake_live_td_plugin missing_live_td_plugin)
+  add_test(NAME live_td_plugin_test COMMAND live_td_plugin_test
+    $<TARGET_FILE:fake_live_td_plugin> $<TARGET_FILE:missing_live_td_plugin>)
+  set_tests_properties(live_td_plugin_test PROPERTIES TIMEOUT 30)
+  add_executable(sse_live_td_gate_test ${USAGI_ROOT}/tests/sse/sse_live_td_gate_test.cpp)
+  target_include_directories(sse_live_td_gate_test PRIVATE ${BOOST_INCLUDE})
+  target_link_libraries(sse_live_td_gate_test PRIVATE sse_strategy_session sse_runtime_support)
+  add_dependencies(sse_live_td_gate_test fake_live_td_plugin)
+  add_test(NAME sse_live_td_gate_test COMMAND sse_live_td_gate_test $<TARGET_FILE:fake_live_td_plugin>)
+  set_tests_properties(sse_live_td_gate_test PROPERTIES TIMEOUT 30)
+endif()
 
 # OMS merge item regression: Engine report idempotency, has_working_order and
 # AtpBackend closed loop (see docs/oms-merge-oms1-2-20260908.md).
@@ -130,6 +153,20 @@ if(T0_BUILD_SSE_STREAM_PROCESSOR)
   if(T0_SSE_AFFINITY_PYTHON)
     add_test(NAME sse_capture_retention_test
       COMMAND ${T0_SSE_AFFINITY_PYTHON} -B ${USAGI_ROOT}/tests/sse/test_capture_retention.py)
+    add_test(NAME sse_capture_check_test
+      COMMAND ${T0_SSE_AFFINITY_PYTHON} -B ${USAGI_ROOT}/tests/sse/test_capture_check.py)
+    add_test(NAME sse_journal_trading_launcher_test
+      COMMAND ${T0_SSE_AFFINITY_PYTHON} -B ${USAGI_ROOT}/tests/sse/test_journal_trading_launcher.py)
+    set_tests_properties(sse_journal_trading_launcher_test PROPERTIES TIMEOUT 30)
+    add_test(NAME sse_journal_launcher_test
+      COMMAND ${T0_SSE_AFFINITY_PYTHON} -B ${USAGI_ROOT}/tests/sse/sse_journal_launcher_test.py
+        --launcher ${USAGI_ROOT}/tools/sse/run_journal_capture.py
+        --binary $<TARGET_FILE:t0_sse_journal_capture>)
+    set_tests_properties(sse_journal_launcher_test PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+    add_test(NAME sse_td_query_cli_test
+      COMMAND ${T0_SSE_AFFINITY_PYTHON} -B ${USAGI_ROOT}/tests/sse/test_td_query_cli.py
+        $<TARGET_FILE:t0_sse_journal_predict>)
+    set_tests_properties(sse_capture_check_test sse_td_query_cli_test PROPERTIES TIMEOUT 30)
     add_test(NAME sse_journal_integration_test
       COMMAND ${T0_SSE_AFFINITY_PYTHON} -B ${USAGI_ROOT}/tests/sse/sse_journal_integration_test.py
         $<TARGET_FILE:t0_sse_journal_capture> $<TARGET_FILE:t0_sse_journal_predict>)

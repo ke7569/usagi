@@ -1,0 +1,18 @@
+[Unit]
+Description=SSE journal prediction, strategy and ATP TD
+After=sse-journal-capture.service
+Requisite=sse-journal-capture.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/zane/usagi-sse-dev
+Environment=TZ=Asia/Shanghai
+Environment=SSE_ENABLE_LIVE_ORDER=NO
+ExecStart=/usr/bin/python2 /home/zane/usagi-sse-dev/tools/sse/run_journal_trading.py --live-config /home/zane/usagi-runtime/journal_trading.live.json
+Restart=on-failure
+RestartSec=30
+StartLimitInterval=0
+TimeoutStopSec=60
+KillSignal=SIGTERM
+KillMode=control-group
+UMask=0077

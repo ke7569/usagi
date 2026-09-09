@@ -50,6 +50,14 @@ namespace {
 
 typedef nlohmann::json Json;
 
+void append_channels(Json* output, const Status& status) {
+    (*output)["channels"] = Json::array();
+    for (std::vector<Status::Channel>::const_iterator it = status.channels.begin();
+         it != status.channels.end(); ++it)
+        (*output)["channels"].push_back(Json{{"index", it->index},
+            {"name", it->name}, {"datagrams", it->datagrams}});
+}
+
 std::uint64_t monotonic_now_ns() {
     timespec value = {};
     if (::clock_gettime(CLOCK_MONOTONIC, &value) != 0) return 0U;
@@ -106,6 +114,7 @@ private:
                 line["event"] = "capture_status";
                 line["ready"] = stream_->ready() && status.journal_ready && !status.failed;
                 line["datagrams"] = status.datagrams;
+                append_channels(&line, status);
                 line["hardware_timestamps"] = status.hardware_timestamps;
                 line["missing_hardware_timestamps"] = status.missing_hardware_timestamps;
                 line["software_timestamp_fallbacks"] = status.software_timestamp_fallbacks;
@@ -214,6 +223,10 @@ Capture::Capture(const sse_journal::Config& config)
       accepted_events_(0), journal_events_(0), journal_errors_(0), journal_overflows_(0),
       latest_event_id_(0), latest_feed_sequence_(0), journal_published_offset_(0),
       journal_flushed_offset_(0), flush_count_(0), error_mutex_(), error_() {
+    channel_datagrams_.reserve(config_.channels.size());
+    for (std::size_t i = 0; i < config_.channels.size(); ++i)
+        channel_datagrams_.push_back(std::shared_ptr<std::atomic<std::uint64_t> >(
+            new std::atomic<std::uint64_t>(0)));
 }
 
 Capture::~Capture() {
@@ -270,6 +283,9 @@ bool Capture::open(std::string* error) {
     journal_closed_.store(false, std::memory_order_release);
     failure_reason_.store(static_cast<int>(sze_recovery::kInvalidNone), std::memory_order_release);
     datagrams_.store(0, std::memory_order_relaxed);
+    for (std::vector<std::shared_ptr<std::atomic<std::uint64_t> > >::iterator it =
+             channel_datagrams_.begin(); it != channel_datagrams_.end(); ++it)
+        (*it)->store(0, std::memory_order_relaxed);
     hardware_timestamps_.store(0, std::memory_order_relaxed);
     missing_hardware_timestamps_.store(0, std::memory_order_relaxed);
     software_timestamp_fallbacks_.store(0, std::memory_order_relaxed);
@@ -370,6 +386,8 @@ bool Capture::on_event(const deepwin_market_data::StreamEvent& event, std::strin
     }
     if (event.kind == deepwin_market_data::kDatagramEvent) {
         datagrams_.fetch_add(1U, std::memory_order_relaxed);
+        if (event.channel_id < channel_datagrams_.size())
+            channel_datagrams_[event.channel_id]->fetch_add(1U, std::memory_order_relaxed);
         if (event.timestamp_flags & deepwin_market_data::kHardwareReceiveTimestamp)
             hardware_timestamps_.fetch_add(1U, std::memory_order_relaxed);
         else if (event.timestamp_flags & deepwin_market_data::kHardwareTimestampRequested)
@@ -599,6 +617,14 @@ Status Capture::status() const {
     result.journal_closed = journal_closed_.load(std::memory_order_acquire);
     result.journal_ready = journal_ready_.load(std::memory_order_acquire);
     result.datagrams = datagrams_.load(std::memory_order_relaxed);
+    result.channels.clear();
+    for (std::size_t i = 0; i < channel_datagrams_.size(); ++i) {
+        Status::Channel channel;
+        channel.index = i;
+        channel.name = config_.channels[i].name;
+        channel.datagrams = channel_datagrams_[i]->load(std::memory_order_relaxed);
+        result.channels.push_back(channel);
+    }
     result.hardware_timestamps = hardware_timestamps_.load(std::memory_order_relaxed);
     result.missing_hardware_timestamps = missing_hardware_timestamps_.load(std::memory_order_relaxed);
     result.software_timestamp_fallbacks = software_timestamp_fallbacks_.load(std::memory_order_relaxed);
@@ -680,6 +706,7 @@ int run_cli(const std::string& config_path) {
         Json output;
         output["ok"] = stream_ok && capture_ok && clean;
         output["datagrams"] = capture_status.datagrams;
+        append_channels(&output, capture_status);
         output["hardware_timestamps"] = capture_status.hardware_timestamps;
         output["missing_hardware_timestamps"] = capture_status.missing_hardware_timestamps;
         output["software_timestamp_fallbacks"] = capture_status.software_timestamp_fallbacks;

@@ -250,6 +250,29 @@ void test_source_selection_validation() {
     assert(!session.execution()->permits_new_orders());
 }
 
+void test_static_conflict_blocks_already_queued_signal() {
+    oms_test::ManagedFixture managed(session_config(), "SH", 28, "sse-static-gate");
+    sse_strategy::Session session(session_config(), 28, managed.execution, []() { return true; });
+    bool first_stock_valid = true;
+    session.set_instrument_gate([&](const std::string& code) {
+        return code != "600000" || first_stock_valid;
+    });
+    session.set_ready(true, true, true);
+    managed.engine->advance_to(1000000000LL);
+    session.on_output(tick_output("600000", 34500000000ULL, 100.0,
+                                  10000, 10100, 1U, true));
+    session.on_output(tick_output("600001", 34500000000ULL, 100.0,
+                                  20000, 20100, 2U, true));
+    first_stock_valid = false;  // Snapshot conflict arrives before batch dispatch.
+    sse_stream::Output marker;
+    marker.kind = sse_stream::kBatchEndOutput;
+    session.on_output(marker);
+    assert(session.signals() == 1U);
+    assert(session.last_view("600001") != 0);
+    const MSMarketDataField* blocked = session.last_view("600000");
+    assert(blocked == 0 || blocked->MarketTime == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -257,6 +280,7 @@ int main() {
     test_paper_cancel_deadline();
     test_hardware_tick_waits_for_batch_end();
     test_source_selection_validation();
+    test_static_conflict_blocks_already_queued_signal();
     std::cout << "sse_strategy_session_test: PASS" << std::endl;
     return 0;
 }

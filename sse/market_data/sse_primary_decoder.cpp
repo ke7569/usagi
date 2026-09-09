@@ -1,6 +1,7 @@
 #include "sse/market_data/sse_primary_decoder.h"
 
 #include <ctime>
+#include <cstring>
 
 namespace sse_live {
 namespace {
@@ -49,6 +50,15 @@ void fail(const char* message, std::string* error) {
 }
 
 }  // namespace
+
+bool is_primary_heartbeat(const unsigned char* payload, std::size_t length) {
+    if (!payload || length != 32U || std::memcmp(payload, payload + 16, 16U))
+        return false;
+    if (payload[8] != 0xa2U) return false;
+    for (unsigned i = 4U; i < 16U; ++i)
+        if (i != 8U && payload[i] != 0U) return false;
+    return true;
+}
 
 bool is_sse_stock(const std::string& security_id) {
     return security_id.size() == 6U &&

@@ -119,6 +119,10 @@ public:
             engine_->on_rsp_cash_order_query(account_index_, msg, request_id, error_info, isLast);
         }
     }
+    void OnRspCashTradeOrderQueryResult(const ATPRspCashTradeOrderQueryResultMsg& msg,
+            const int64_t request_id, const ATPRspErrorInfo& error_info, const bool isLast) override {
+        if (engine_) engine_->on_rsp_cash_trade_query(account_index_, msg, request_id, error_info, isLast);
+    }
 
     void OnRspCashExtQueryResultSecurityInfo(const ATPRspCashExtQueryResultSecurityInfoMsg& msg,
                                              const int64_t request_id,
@@ -559,7 +563,7 @@ void TDEngineGXBSE::login(long timeout_nsec)
         if (unit.bypass_account_queries) {
             unit.connected.store(true);
             unit.logged_in.store(true);
-            login_ok();
+            if (!stream_mode_) login_ok();
             login_cv_.notify_all();
             ++login_sent;
             KF_LOG_INFO(logger, "[login] bypass account queries account_index=" << i
@@ -714,7 +718,10 @@ std::shared_ptr<oms::Backend> TDEngineGXBSE::make_oms_backend(int account_index,
     if (oms_backends_.count(account_index))
         throw std::logic_error("ATP generation cannot be rebound; recreate the SDK connection owner");
     std::shared_ptr<oms::AtpBackend> backend(new oms::AtpBackend(scope,
-        [this, account_index](const oms::Command& command) { return send_oms_command(account_index, command); }));
+        [this, account_index](const oms::Command& command) { return send_oms_command(account_index, command); },
+        [this, account_index](const oms::Scope& s, std::uint64_t token) {
+            return query_oms_snapshot(account_index, s, token);
+        }, stream_mode_, stream_mode_));
     oms_backends_[account_index] = backend;
     return backend;
 }
@@ -722,6 +729,12 @@ std::shared_ptr<oms::Backend> TDEngineGXBSE::make_oms_backend(int account_index,
 oms::SendResult TDEngineGXBSE::send_oms_command(int account_index, const oms::Command& command)
 {
     oms::SendResult result;
+    const char* live_key = std::getenv("SSE_ENABLE_LIVE_ORDER");
+    if (stream_mode_ && (!stream_allow_orders_ || !live_key || std::string(live_key) != "YES")) {
+        result.error.category = oms::ErrorCategory::NotReady;
+        result.error.message = "live order permission disabled";
+        return result;
+    }
     if (command.id > static_cast<oms::OrderId>(std::numeric_limits<int>::max()) || command.intent.quantity <= 0 ||
         command.intent.quantity > std::numeric_limits<int>::max() || command.intent.price <= 0 ||
         (command.intent.instrument.market != "SZE" && command.intent.instrument.market != "SSE")) {
@@ -1334,7 +1347,7 @@ void TDEngineGXBSE::on_login(int account_index, const ATPCustomerInfo& msg)
     }
     unit->logged_in.store(true);
     unit->connected.store(true);
-    login_ok();
+    if (!stream_mode_) login_ok();
     login_cv_.notify_all();
     KF_LOG_INFO(logger, "[OnLogin] account_index=" << account_index
         << " cust_id=" << msg.GetCustId()
@@ -1343,6 +1356,12 @@ void TDEngineGXBSE::on_login(int account_index, const ATPCustomerInfo& msg)
 
 void TDEngineGXBSE::on_logout(int account_index, const char* desc)
 {
+    if (stream_mode_) {
+        std::lock_guard<std::mutex> guard(oms_query_mutex_);
+        stream_disconnected_ = true;
+        oms_collector_.activity(stream_scope_);
+        oms_query_error_ = "ATP disconnected; restart with a fresh connection epoch";
+    }
     std::shared_ptr<oms::AtpBackend> backend;
     { std::lock_guard<std::mutex> guard(route_mutex_); backend = oms_backends_[account_index].lock(); }
     if (backend) backend->disconnected();
@@ -1356,6 +1375,12 @@ void TDEngineGXBSE::on_logout(int account_index, const char* desc)
 
 void TDEngineGXBSE::on_recovering(int account_index, const char* desc)
 {
+    if (stream_mode_) {
+        std::lock_guard<std::mutex> guard(oms_query_mutex_);
+        stream_disconnected_ = true;
+        oms_collector_.activity(stream_scope_);
+        oms_query_error_ = "ATP reconnect requires a new connection epoch";
+    }
     std::shared_ptr<oms::AtpBackend> backend;
     { std::lock_guard<std::mutex> guard(route_mutex_); backend = oms_backends_[account_index].lock(); }
     if (backend) backend->disconnected();
@@ -1420,6 +1445,7 @@ void TDEngineGXBSE::on_rsp_cash_auction_order(int account_index,
             backend->publish(report); return;
         }
     }
+    if (stream_mode_) { fail_oms_query("unowned ATP insert response requires reconciliation"); return; }
     if (error_info.error_id != 0) {
         LFInputOrderField err = {};
         copy_text(err.InstrumentID, sizeof(err.InstrumentID), msg.GetSecurityId());
@@ -1462,6 +1488,7 @@ void TDEngineGXBSE::on_rsp_cash_cancel_order(int account_index,
             backend->publish(report); return;
         }
     }
+    if (stream_mode_) { fail_oms_query("unowned ATP cancel response requires reconciliation"); return; }
     (void)account_index;
     uint64_t latency_ns = 0;
     if (consume_request_send_latency(request_id, &latency_ns)) {
@@ -1485,6 +1512,14 @@ void TDEngineGXBSE::on_rtn_cash_auction_order(int account_index, const ATPRtnCas
         return;
     }
 
+    if (stream_mode_) {
+        std::lock_guard<std::mutex> guard(oms_query_mutex_);
+        if (!oms_snapshot_published_ && oms_collector_.snapshot().token) {
+            oms_collector_.activity(stream_scope_);
+            if (oms_query_error_.empty()) oms_query_error_ = "ATP order activity interrupted account snapshot";
+        }
+    }
+
     OrderRoute route;
     if (!lookup_route_by_clord(msg.GetClOrdNo(), &route)) {
         {
@@ -1505,6 +1540,18 @@ void TDEngineGXBSE::on_rtn_cash_auction_order(int account_index, const ATPRtnCas
     if (!route.oms_backend.expired()) {
         if (route.account_index != account_index) return;
         bind_clord_route(msg.GetClOrdNo(), route); publish_oms_order(route, msg); return;
+    }
+    if (stream_mode_) {
+        std::shared_ptr<oms::AtpBackend> backend;
+        { std::lock_guard<std::mutex> guard(route_mutex_); backend = oms_backends_[account_index].lock(); }
+        std::lock_guard<std::mutex> guard(oms_query_mutex_);
+        if (oms_collector_.snapshot().token) {
+            oms_collector_.activity(stream_scope_);
+            oms_query_error_ = "unowned ATP order activity requires account reconciliation in a new epoch";
+            stream_disconnected_ = true;
+            if (backend) backend->disconnected();
+        }
+        return; // Standalone stream mode never dispatches into legacy Deepwin helpers.
     }
     if (!route.first_rtn_observed && route.send_time_ns != 0) {
         const uint64_t rtn_entry_ns = now_ns();
@@ -1568,6 +1615,7 @@ void TDEngineGXBSE::on_rsp_cash_share_query(int account_index,
                                             const ATPRspErrorInfo& error_info,
                                             bool is_last)
 {
+    if (stream_mode_) { collect_oms_positions(msg, request_id, error_info, is_last); return; }
     AccountUnitGXBSE* unit = unit_at(account_index);
     if (unit == nullptr) {
         return;
@@ -1702,6 +1750,7 @@ void TDEngineGXBSE::on_rsp_cash_fund_query(int account_index,
                                            const ATPRspErrorInfo& error_info,
                                            bool is_last)
 {
+    if (stream_mode_) { collect_oms_funds(msg, request_id, error_info, is_last); return; }
     AccountUnitGXBSE* unit = unit_at(account_index);
     const bool periodic_account_sync = is_periodic_account_query(request_id);
     if (is_last) {
@@ -1751,6 +1800,7 @@ void TDEngineGXBSE::on_rsp_cash_order_query(int account_index,
                                             const ATPRspErrorInfo& error_info,
                                             bool is_last)
 {
+    if (stream_mode_) { collect_oms_orders(msg, request_id, error_info, is_last); return; }
     if (is_last) {
         uint64_t latency_ns = 0;
         if (consume_request_send_latency(request_id, &latency_ns)) {

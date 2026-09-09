@@ -360,7 +360,7 @@ def wait_for_datagrams(directory, minimum, timeout):
                          (minimum, len(records), len(datagrams)))
 
 
-def send_round(port, state, include_snapshot):
+def send_round(port, state, include_snapshot, snapshot_port=None):
     packets = []
     wire = state['wire_sequence']
     tick_index = state['tick_index']
@@ -381,8 +381,9 @@ def send_round(port, state, include_snapshot):
     tick_index += 1
     sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        for packet in packets:
-            sender.sendto(packet, ('127.0.0.1', port))
+        for index, packet in enumerate(packets):
+            destination = snapshot_port if include_snapshot and index == 0 and snapshot_port else port
+            sender.sendto(packet, ('127.0.0.1', destination))
             # Give the receiver a chance to preserve packet order under a busy
             # CI host while keeping the test entirely loopback-local.
             time.sleep(0.002)
@@ -409,11 +410,14 @@ def validate_prediction(path, minimum_events):
     return result
 
 
-def validate_capture_status(path):
+def validate_capture_status(path, expected_channels):
     result = last_json(path)
-    if result is None:
-        return
-    check(result.get('ok', True) is True, 'capture final status failed: %r' % result)
+    check(result is not None, 'capture did not emit status JSON: %s' % read_text(path))
+    check(result.get('ok', True) is True, 'capture status failed: %r' % result)
+    check(result.get('channels') == expected_channels,
+          'capture channel counters differ from sent packets: %r' % result)
+    check(result.get('datagrams') == sum(row['datagrams'] for row in expected_channels),
+          'capture total differs from per-channel counts: %r' % result)
     rows = result.get('cpu_affinity')
     if rows is None:
         rows = result.get('affinity')
@@ -469,7 +473,8 @@ def run(capture_binary, predictor_binary):
 
         state = {'round': 0, 'wire_sequence': 1, 'tick_index': 1}
         sent = []
-        sent.extend(send_round(config['channels'][0]['port'], state, True))
+        sent.extend(send_round(config['channels'][0]['port'], state, True,
+                               config['channels'][1]['port']))
         wait_for_datagrams(config['journal_directory'], len(sent), 8.0)
 
         predictor_one = launch(predictor_binary,
@@ -516,8 +521,21 @@ def run(capture_binary, predictor_binary):
         stop_process(predictor_two[0], signal.SIGTERM, 8.0, 'predictor-two')
         validate_prediction(predictor_two[3], len(records_before_restart_feed))
 
+        expected_channels = [
+            {'index': 0, 'name': 'loopback-0', 'datagrams': len(sent) - 1},
+            {'index': 1, 'name': 'loopback-1', 'datagrams': 1},
+        ]
+        status_deadline = time.time() + 7.0
+        while (last_json(capture[4]) or {}).get('channels') != expected_channels:
+            check(time.time() < status_deadline,
+                  'capture live log did not report both channel counts: %s' % read_text(capture[4]))
+            require_alive(capture[0], 0.02, capture[4], 'capture')
+        check(last_json(capture[4]).get('event') == 'capture_status',
+              'channel counters were not emitted in capture_status')
+        validate_capture_status(capture[4], expected_channels)
+
         stop_process(capture[0], signal.SIGTERM, 10.0, 'capture')
-        validate_capture_status(capture[3])
+        validate_capture_status(capture[3], expected_channels)
         final_records, final_datagrams, clean_flags = journal_snapshot(
             config['journal_directory'])
         check(final_records, 'capture journal is empty after clean stop')
@@ -528,7 +546,7 @@ def run(capture_binary, predictor_binary):
               'journal event ids are not contiguous: %r' % event_ids[:16])
         check(clean_flags and clean_flags[-1] == 1,
               'journal did not record a clean producer shutdown')
-        print('sse_journal_integration_test: PASS')
+        print('sse_journal_integration_test: PASS channels=%s' % expected_channels)
     finally:
         for process in children:
             if process.poll() is None:

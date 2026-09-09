@@ -65,15 +65,24 @@ std::vector<unsigned char> tick(std::uint32_t sequence, std::uint64_t index,
     return bytes;
 }
 
+std::vector<unsigned char> primary_heartbeat() {
+    std::vector<unsigned char> bytes(32U, 0U);
+    put_u32(&bytes, 0U, 999U);
+    bytes[8] = 0xa2U;
+    std::memcpy(&bytes[16], &bytes[0], 16U);
+    return bytes;
+}
+
 std::vector<unsigned char> snapshot(std::uint32_t sequence,
                                     std::uint32_t time_raw,
                                     std::uint64_t volume,
-                                    std::uint64_t turnover) {
+                                    std::uint64_t turnover,
+                                    const std::string& security = "600000") {
     std::vector<unsigned char> bytes(440U, 0U);
     bytes[8] = 0x27U;
     put_u32(&bytes, 0U, sequence);
     put_u32(&bytes, 21U, sequence);
-    put_ascii(&bytes, 30U, "600000", 8U);
+    put_ascii(&bytes, 30U, security, 8U);
     put_u32(&bytes, 26U, time_raw);
     put_u32(&bytes, 42U, 10000U);
     put_u32(&bytes, 46U, 10000U);
@@ -127,9 +136,11 @@ deepwin_market_data::StreamEvent idle(std::uint64_t sequence,
 
 deepwin_market_data::StreamEvent hardware_event(
     const std::vector<unsigned char>& bytes, std::uint64_t sequence,
-    std::uint64_t monotonic_ns, std::uint64_t hardware_ns) {
+    std::uint64_t monotonic_ns, std::uint64_t hardware_ns,
+    std::uint32_t channel_id = 4U) {
     deepwin_market_data::StreamEvent value = event(
         bytes, sequence, monotonic_ns, sequence, 0U, 1U);
+    value.channel_id = channel_id;
     value.timestamp_flags = static_cast<std::uint16_t>(
         deepwin_market_data::kKernelRealtimeTimestamp |
         deepwin_market_data::kHardwareReceiveTimestamp |
@@ -243,6 +254,39 @@ void test_hardware_batch_end_marker() {
     assert(outputs.size() == 4U);
     assert(outputs[3].kind == sse_stream::kBatchEndOutput);
     assert(outputs[2].tick.provenance.batch_id == outputs[3].batch_end.batch_id);
+}
+
+void test_hardware_batches_are_per_channel() {
+    sse_stream::SseStreamProcessor processor(
+        metadata(), 0, true, [](const sse_stream::Output&) {});
+    std::vector<unsigned char> opening = tick(1U, 1U, 'A', 0, 9300000U, 1001U, 0U);
+    const std::vector<unsigned char> ask = tick(2U, 2U, 'A', 1, 9300000U, 0U, 2001U);
+    opening.insert(opening.end(), ask.begin(), ask.end());
+    processor.on_event(hardware_event(opening, 1U, 1000U, 1000000ULL, 0U));
+    processor.on_event(hardware_event(
+        snapshot(1U, 93000U, 1000U, 1000U), 2U, 2000U, 900000ULL, 1U));
+    processor.on_event(hardware_event(
+        tick(3U, 3U, 'T', 0, 9300100U, 1001U, 2001U, 100000U),
+        3U, 3000U, 1001200ULL, 0U));
+    assert(!processor.invalid());
+    processor.on_event(idle(4U, 100000U));
+    assert(!processor.invalid());
+}
+
+void test_hardware_timestamp_regression_is_per_channel() {
+    sse_stream::SseStreamProcessor processor(
+        metadata(), 0, true, [](const sse_stream::Output&) {});
+    const std::vector<unsigned char> first = tick(
+        1U, 1U, 'A', 0, 9300000U, 1001U, 0U);
+    processor.on_event(hardware_event(first, 1U, 1000U, 1000000ULL, 2U));
+    processor.on_event(idle(2U, 2000U));
+    bool threw = false;
+    try {
+        processor.on_event(hardware_event(
+            tick(2U, 2U, 'A', 1, 9300000U, 0U, 2001U),
+            3U, 3000U, 999999ULL, 2U));
+    } catch (const std::runtime_error&) { threw = true; }
+    assert(threw && processor.invalid());
 }
 
 void test_duplicate_and_gap_are_distinct() {
@@ -491,6 +535,121 @@ void test_malformed_is_sticky() {
     assert(threw);
 }
 
+void test_primary_heartbeat() {
+    sse_stream::SseStreamProcessor accepted(
+        metadata(), 0, true, [](const sse_stream::Output&) {});
+    const std::vector<unsigned char> pulse = primary_heartbeat();
+    accepted.on_event(event(pulse, 1U, 1U));
+    assert(!accepted.invalid());
+
+    sse_stream::SseStreamProcessor mismatched(
+        metadata(), 0, true, [](const sse_stream::Output&) {});
+    std::vector<unsigned char> corrupt = pulse;
+    corrupt[31] = 1U;
+    bool threw = false;
+    try { mismatched.on_event(event(corrupt, 1U, 1U)); }
+    catch (const std::runtime_error&) { threw = true; }
+    assert(threw && mismatched.invalid());
+
+    sse_stream::SseStreamProcessor reserved(
+        metadata(), 0, true, [](const sse_stream::Output&) {});
+    corrupt = pulse;
+    corrupt[4] = corrupt[20] = 1U;
+    threw = false;
+    try { reserved.on_event(event(corrupt, 1U, 1U)); }
+    catch (const std::runtime_error&) { threw = true; }
+    assert(threw && reserved.invalid());
+}
+
+std::vector<std::vector<unsigned char> > auction_packets() {
+    struct Row {
+        char type, side;
+        std::uint32_t time;
+        std::uint64_t buy, sell, shares;
+        std::uint32_t price;
+    };
+    // Conserved auction with a varying clearing-price path and both sides of
+    // the last-minute book. No fabricated zero/NaN replacement is needed.
+    const Row rows[] = {
+        {'A', 0, 9150000U, 1, 0, 80, 10000},
+        {'A', 1, 9150000U, 0, 2, 70, 9980},
+        {'A', 1, 9170000U, 0, 4, 90, 9990},
+        {'A', 0, 9180000U, 5, 0, 50, 10000},
+        {'A', 1, 9180000U, 0, 6, 60, 9990},
+        {'D', 0, 9180400U, 5, 0, 50, 10000},
+        {'D', 1, 9180400U, 0, 6, 60, 9990},
+        {'A', 1, 9190000U, 0, 7, 80, 10000},
+        {'A', 1, 9200000U, 0, 8, 40, 10010},
+        {'A', 0, 9210000U, 9, 0, 50, 10000},
+        {'A', 0, 9240000U, 3, 0, 120, 10020},
+        {'A', 0, 9240000U, 10, 0, 30, 9990},
+        {'T', 0, 9250000U, 1, 2, 70, 10000},
+        {'T', 0, 9250000U, 1, 4, 10, 10000},
+        {'T', 0, 9250000U, 3, 4, 80, 10000},
+        {'T', 0, 9250000U, 3, 7, 40, 10000},
+        {'T', 0, 9250000U, 9, 7, 40, 10000},
+        {'S', 3, 9250000U, 0, 0, 0, 0}
+    };
+    std::vector<std::vector<unsigned char> > result;
+    for (std::size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); ++i) {
+        const Row& row = rows[i];
+        std::vector<unsigned char> bytes = tick(
+            static_cast<std::uint32_t>(i + 1U), i + 1U, row.type, row.side,
+            row.time, row.buy, row.sell, row.shares * 1000ULL);
+        put_u32(&bytes, 51U, row.price);
+        result.push_back(bytes);
+    }
+    return result;
+}
+
+void test_inline_auction_model(const sse_hybrid_model::Model& model) {
+    const std::vector<std::vector<unsigned char> > packets = auction_packets();
+    std::vector<float> reference_factors;
+    for (int mode = 0; mode < 4; ++mode) {
+        std::vector<sse_stream::Output> outputs;
+        sse_stream::SseStreamProcessor processor(
+            metadata_two_instruments(), &model, false,
+            [&outputs](const sse_stream::Output& output) { outputs.push_back(output); });
+        std::uint64_t arrival = 0;
+        const auto feed = [&processor, &arrival](const std::vector<unsigned char>& bytes) {
+            ++arrival;
+            processor.on_event(event(bytes, arrival, arrival * 10000ULL));
+        };
+        // Modes cover snapshot before S, S before snapshot, first available
+        // snapshot at 09:30, and missing S. The second stock has no auction.
+        if (mode == 0) feed(snapshot(1U, 92501U, 240U, 2400U));
+        for (std::size_t i = 0; i < packets.size() - (mode == 3 ? 1U : 0U); ++i)
+            feed(packets[i]);
+        if (mode == 1 || mode == 3) feed(snapshot(2U, 92501U, 240U, 2400U));
+        feed(snapshot(3U, 92501U, 240U, 2400U, "600001"));
+        feed(snapshot(4U, 93000U, 1000U, 10000U, "600001"));
+        // A continuous-session total includes post-auction trades. It must
+        // not be compared for equality against the auction's 240 shares.
+        feed(snapshot(5U, 93000U, 1000U, 10000U));
+        feed(snapshot(6U, 93001U, 1100U, 11000U));
+        assert(!processor.invalid());
+        if (mode == 3) {
+            assert(outputs.empty());
+            // Once opening inference has been skipped, late auction state
+            // must not start a partially initialized Snapshot model mid-day.
+            feed(packets.back());
+            feed(snapshot(7U, 93002U, 1200U, 12000U));
+            assert(outputs.empty());
+            continue;
+        }
+        assert(!outputs.empty());
+        for (std::size_t i = 0; i < outputs.size(); ++i) {
+            assert(outputs[i].kind == sse_stream::kSnapshotOutput);
+            assert(outputs[i].snapshot.snapshot.security_id == "600000");
+            assert(outputs[i].snapshot.prediction_valid);
+            assert(outputs[i].snapshot.prediction.selected);
+            assert(outputs[i].snapshot.auction59.size() == 59U);
+            if (reference_factors.empty()) reference_factors = outputs[i].snapshot.auction59;
+            assert(outputs[i].snapshot.auction59 == reference_factors);
+        }
+    }
+}
+
 void test_synthetic_model_wiring() {
     const std::string prefix = std::string("/tmp/sse_stream_processor_model_") +
                                std::to_string(static_cast<long long>(::getpid()));
@@ -509,6 +668,7 @@ void test_synthetic_model_wiring() {
     std::string error;
     assert(model.load(tick_path, baseline_path, baseline_scaler,
                       auction_path, auction_scaler, &error));
+    test_inline_auction_model(model);
     std::vector<sse_stream::Output> outputs;
     sse_stream::Auction59Provider provider =
         [](const std::string&, std::uint64_t, std::vector<float>* values,
@@ -520,21 +680,31 @@ void test_synthetic_model_wiring() {
         metadata(), &model, false,
         [&outputs](const sse_stream::Output& output) { outputs.push_back(output); },
         provider);
+    const std::vector<unsigned char> snap1 = snapshot(10U, 93000U, 1000U, 1000U);
+    const std::vector<unsigned char> snap2 = snapshot(11U, 93100U, 1100U, 1100U);
+    processor.on_event(event(snap1, 1U, 100U));
+    processor.on_event(event(snap2, 2U, 200U));
+    assert(outputs.size() == 1U);
+    assert(outputs.back().kind == sse_stream::kSnapshotOutput);
+    assert(outputs.back().snapshot.prediction_valid);
+    assert(outputs.back().snapshot.prediction.selected);
+    assert(outputs.back().snapshot.auction59.size() == 59U);
+    outputs.clear();
     std::vector<unsigned char> opening = tick(1U, 1U, 'A', 0, 9350000U, 1001U, 0U);
     const std::vector<unsigned char> ask = tick(2U, 2U, 'A', 1, 9350000U, 0U, 2001U);
     opening.insert(opening.end(), ask.begin(), ask.end());
     const std::vector<unsigned char> trade = tick(
         3U, 3U, 'T', 0, 9350000U, 1001U, 2001U, 100000U);
     opening.insert(opening.end(), trade.begin(), trade.end());
-    processor.on_event(event(opening, 1U, 1000U));
-    processor.on_event(idle(2U, 101001U));
+    processor.on_event(event(opening, 3U, 1000U));
+    processor.on_event(idle(4U, 101001U));
     processor.on_event(event(tick(4U, 4U, 'T', 0, 9350100U,
-                              1001U, 2001U, 100000U), 3U, 200000U));
-    processor.on_event(idle(4U, 301001U));
+                              1001U, 2001U, 100000U), 5U, 200000U));
+    processor.on_event(idle(6U, 301001U));
     const std::vector<unsigned char> later = tick(
         5U, 5U, 'T', 0, 9350200U, 1001U, 2001U, 100000U);
-    processor.on_event(event(later, 5U, 400000U));
-    processor.on_event(idle(6U, 501001U));
+    processor.on_event(event(later, 7U, 400000U));
+    processor.on_event(idle(8U, 501001U));
     assert(outputs.size() >= 2U);
     assert(outputs[0].kind == sse_stream::kTickOutput);
     assert(outputs[0].tick.prediction_valid);
@@ -543,22 +713,119 @@ void test_synthetic_model_wiring() {
     assert(outputs[1].tick.prediction.selected);
     assert(outputs[1].tick.prediction.selected_source == sse_hybrid_model::kTickSource);
 
-    const std::vector<unsigned char> snap1 = snapshot(10U, 93000U, 1000U, 1000U);
-    const std::vector<unsigned char> snap2 = snapshot(11U, 93100U, 1100U, 1100U);
-    processor.on_event(event(snap1, 7U, 600000U));
-    processor.on_event(event(snap2, 8U, 700000U));
-    assert(outputs.size() >= 3U);
-    assert(outputs.back().kind == sse_stream::kSnapshotOutput);
-    assert(outputs.back().snapshot.prediction_valid);
-    assert(outputs.back().snapshot.prediction.selected);
-    assert(outputs.back().snapshot.auction59.size() == 59U);
+    // Missing auction history no longer prevents starting the model stream.
+    // Its tick state warms before 09:35, while only its own Snapshot is skipped.
+    std::vector<sse_stream::Output> fallback_outputs;
+    sse_stream::SseStreamProcessor missing_auction(
+        metadata(), &model, false,
+        [&fallback_outputs](const sse_stream::Output& output) {
+            fallback_outputs.push_back(output);
+        });
+    assert(missing_auction.instrument_static_valid("600000"));
+    assert(!missing_auction.instrument_static_valid("600001"));
+    missing_auction.on_event(event(snapshot(1U, 92500U, 1000U, 10000U), 1U, 1000U));
+    missing_auction.on_event(event(snapshot(2U, 93000U, 1100U, 11000U), 2U, 2000U));
+    missing_auction.on_event(event(snapshot(3U, 93100U, 1200U, 12000U), 3U, 3000U));
+    // A broken/stale Snapshot cumulative total is irrelevant after this stock
+    // has locked tick-only; it must not throw and abort all tick processing.
+    missing_auction.on_event(event(snapshot(4U, 93200U, 100U, 1000U), 4U, 4000U));
+    assert(fallback_outputs.empty() && !missing_auction.invalid());
+    std::vector<unsigned char> fallback_opening = tick(1U, 1U, 'A', 0, 9300000U, 1001U, 0U);
+    const std::vector<unsigned char> fallback_ask = tick(2U, 2U, 'A', 1, 9300000U, 0U, 2001U);
+    const std::vector<unsigned char> fallback_trade = tick(3U, 3U, 'T', 0, 9300100U,
+                                                         1001U, 2001U, 100000U);
+    fallback_opening.insert(fallback_opening.end(), fallback_ask.begin(), fallback_ask.end());
+    fallback_opening.insert(fallback_opening.end(), fallback_trade.begin(), fallback_trade.end());
+    missing_auction.on_event(event(fallback_opening, 4U, 10000U));
+    missing_auction.on_event(idle(5U, 111001U));
+    missing_auction.on_event(event(tick(4U, 4U, 'T', 0, 9345900U,
+                                      1001U, 2001U, 100000U), 6U, 200000U));
+    missing_auction.on_event(idle(7U, 301001U));
+    missing_auction.on_event(event(tick(5U, 5U, 'T', 0, 9350000U,
+                                      1001U, 2001U, 100000U), 8U, 400000U));
+    missing_auction.on_event(idle(9U, 501001U));
+    assert(fallback_outputs.size() == 3U);
+    for (std::size_t i = 0; i < fallback_outputs.size(); ++i) {
+        assert(fallback_outputs[i].kind == sse_stream::kTickOutput);
+        assert(fallback_outputs[i].tick.prediction_valid);
+    }
+    assert(!fallback_outputs[0].tick.prediction.selected);
+    assert(!fallback_outputs[1].tick.prediction.selected);
+    assert(fallback_outputs[2].tick.prediction.selected);
 
-    bool threw = false;
-    try {
-        sse_stream::SseStreamProcessor missing_provider(
-            metadata(), &model, false, [](const sse_stream::Output&) {});
-    } catch (const std::runtime_error&) { threw = true; }
-    assert(threw);
+    // Even a one-sided later snapshot must still close the common static gate.
+    // Auction fallback must not let a contradictory daily pre-close trade.
+    std::vector<unsigned char> conflict = snapshot(4U, 93501U, 1300U, 13000U);
+    put_u32(&conflict, 42U, 10100U);
+    put_u64(&conflict, 124U + 10U * 16U + 4U, 0U);
+    missing_auction.on_event(event(conflict, 10U, 600000U));
+    assert(!missing_auction.instrument_static_valid("600000"));
+    missing_auction.on_event(event(tick(6U, 6U, 'T', 0, 9350200U,
+                                      1001U, 2001U, 100000U), 11U, 700000U));
+    missing_auction.on_event(idle(12U, 801001U));
+    assert(fallback_outputs.back().tick.prediction_valid);
+    assert(!fallback_outputs.back().tick.prediction.selected);
+    assert(!missing_auction.invalid());
+
+    std::vector<sse_stream::Output> no_snapshot_outputs;
+    sse_stream::SseStreamProcessor no_snapshot(
+        metadata(), &model, false,
+        [&no_snapshot_outputs](const sse_stream::Output& output) { no_snapshot_outputs.push_back(output); },
+        [](const std::string&, std::uint64_t, std::vector<float>*, std::string*) -> bool {
+            assert(false); return false;
+        });
+    std::vector<unsigned char> no_snapshot_opening(opening);
+    // The first book cut seeds the gate at 09:35:00. A trade at that exact
+    // exchange timestamp intentionally does not sample; give this fixture's
+    // first trade its own timestamp so two eligible windows are exercised.
+    put_u32(&no_snapshot_opening, 2U * 72U + 30U, 9350001U);
+    no_snapshot.on_event(event(no_snapshot_opening, 1U, 1000U));
+    no_snapshot.on_event(idle(2U, 101001U));
+    no_snapshot.on_event(event(tick(4U, 4U, 'T', 0, 9350100U,
+                                   1001U, 2001U, 100000U), 3U, 200000U));
+    no_snapshot.on_event(idle(4U, 301001U));
+    assert(no_snapshot_outputs.size() == 2U);
+    assert(no_snapshot_outputs[0].tick.event.tick_index == 3U);
+    assert(no_snapshot_outputs[0].tick.prediction_valid);
+    assert(!no_snapshot_outputs[0].tick.prediction.selected);
+    assert(no_snapshot_outputs[1].tick.event.tick_index == 4U);
+    assert(no_snapshot_outputs.back().tick.prediction.selected);
+    no_snapshot.on_event(event(snapshot(1U, 93501U, 1000U, 10000U), 5U, 400000U));
+    no_snapshot.on_event(event(snapshot(2U, 93502U, 1100U, 11000U), 6U, 500000U));
+    assert(no_snapshot_outputs.size() == 2U && !no_snapshot.invalid());
+
+    std::vector<sse_stream::Output> independent_outputs;
+    sse_stream::SseStreamProcessor per_stock(
+        metadata_two_instruments(), &model, false,
+        [&independent_outputs](const sse_stream::Output& output) {
+            independent_outputs.push_back(output);
+        },
+        [](const std::string& code, std::uint64_t, std::vector<float>* values,
+           std::string* error) {
+            if (code == "600001") { *error = "test_missing_history"; return false; }
+            values->assign(59U, 0.0f);
+            return true;
+        });
+    per_stock.on_event(event(snapshot(1U, 92500U, 240U, 2400U), 1U, 1000U));
+    per_stock.on_event(event(snapshot(2U, 92500U, 240U, 2400U, "600001"), 2U, 2000U));
+    per_stock.on_event(event(snapshot(3U, 93000U, 300U, 3000U, "600001"), 3U, 3000U));
+    per_stock.on_event(event(snapshot(4U, 93000U, 300U, 3000U), 4U, 4000U));
+    assert(!per_stock.invalid() && independent_outputs.size() == 1U);
+    assert(independent_outputs[0].snapshot.snapshot.security_id == "600000");
+    assert(independent_outputs[0].snapshot.prediction_valid);
+    assert(independent_outputs[0].snapshot.prediction.selected);
+
+    // Explicit tick-only configuration cannot accidentally invoke a provider.
+    std::vector<sse_stream::Output> disabled_outputs;
+    sse_stream::SseStreamProcessor disabled(
+        metadata(), &model, false,
+        [&disabled_outputs](const sse_stream::Output& output) { disabled_outputs.push_back(output); },
+        [](const std::string&, std::uint64_t, std::vector<float>*, std::string*) -> bool {
+            assert(false); return false;
+        }, sse_auction59::StaticMetadataMap(), false);
+    disabled.on_event(event(snapshot(1U, 92500U, 240U, 2400U), 1U, 1000U));
+    disabled.on_event(event(snapshot(2U, 93000U, 300U, 3000U), 2U, 2000U));
+    assert(disabled_outputs.empty() && !disabled.invalid());
     std::remove(tick_path.c_str());
     std::remove(baseline_path.c_str());
     std::remove(auction_path.c_str());
@@ -696,6 +963,8 @@ void test_market_data_stream_live_replay_parity() {
 int main() {
     test_tick_batch_and_provenance();
     test_hardware_batch_end_marker();
+    test_hardware_batches_are_per_channel();
+    test_hardware_timestamp_regression_is_per_channel();
     test_duplicate_and_gap_are_distinct();
     test_unconfigured_market_records_count_for_sequence_only();
     test_per_instrument_quiet_stock_closes_while_other_updates();
@@ -704,6 +973,7 @@ int main() {
     test_snapshot36_and_parity();
     test_snapshot_boundaries_and_regression();
     test_malformed_is_sticky();
+    test_primary_heartbeat();
     test_callback_exception_is_sticky();
     test_static_metadata_validation();
     test_synthetic_model_wiring();

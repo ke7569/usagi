@@ -75,6 +75,9 @@ bool is_sse_stock(const std::string& security_id);
 bool decode_primary_tick(const unsigned char* payload, std::size_t length,
                          TickEvent* event, std::string* error = 0,
                          bool equities_only = true);
+// Recognizes the provisioned feed's duplicated 16-byte heartbeat frames.
+// It carries no exchange ChannelNo and must not advance channel tick sequence.
+bool is_primary_heartbeat(const unsigned char* payload, std::size_t length);
 bool decode_primary_snapshot(const unsigned char* payload, std::size_t length,
                              Snapshot* snapshot, std::string* error = 0,
                              bool equities_only = true);

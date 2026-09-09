@@ -14,6 +14,7 @@
 #include <thread>
 #include <ctime>
 #include "common/execution/OmsStrategyExecution.h"
+#include "common/execution/LiveTd.h"
 
 #ifdef T0_STREAM_SZE
 #include "sze/runtime/sze_stream_processor.h"
@@ -22,7 +23,7 @@
 #include "sze/market_data/SZERecoverable.h"
 #else
 #include "sse/runtime/sse_stream_processor.h"
-#include "sse/factors/auction59_sidecar.h"
+#include "sse/auction/auction_static_metadata.h"
 #include "sse/runtime/sse_strategy_session.h"
 #endif
 
@@ -69,10 +70,10 @@ public:
     StreamProcessingCli(const std::string& path, bool capture,
                         const std::string& recording, std::size_t channels,
                         const std::function<bool()>& healthy = std::function<bool()>(),
-                        const std::string& input_driver = "raw")
+                        const std::string& input_driver = "raw", bool live_handoff = false)
         : profile_(load_stream_json(path)), rows_(0), predictions_(0), last_sequence_(0),
           order_intents_(0), cancel_intents_(0), input_driver_(input_driver),
-          stopped_(false), reached_live_(false) {
+          stopped_(false), reached_live_(false), live_(false), monitor_(false) {
         std::set<std::string> fields = {"schema_version", "market", "execution", "processing_mode",
             "processing_contract", "trading_day", "processing_sha256", "environment", "prediction", "instruments"};
         if (profile_.count("strategy_runtime")) fields.insert("strategy_runtime");
@@ -91,15 +92,22 @@ public:
         const std::string fingerprint = string(profile_, "processing_sha256");
         if (fingerprint.size() != 64 || fingerprint.find_first_not_of("0123456789abcdef") != std::string::npos)
             throw std::runtime_error("invalid profile processing fingerprint");
-        if (number(profile_, "schema_version") != 1 || string(profile_, "execution") != "disabled")
-            throw std::runtime_error("only schema v1 execution-disabled processing profiles are supported");
+        const std::string execution = string(profile_, "execution");
+        live_ = execution == "live";
+        monitor_ = execution == "monitor";
+        if (number(profile_, "schema_version") != 1 ||
+            (!live_ && !monitor_ && execution != "disabled"))
+            throw std::runtime_error("only schema v1 disabled/monitor/live execution profiles are supported");
+        if ((live_ || monitor_) && (!capture || !live_handoff || string(profile_, "market") != "SH" ||
+                      !profile_.count("strategy_runtime")))
+            throw std::runtime_error("live execution requires the Shanghai journal handoff strategy entry point");
         const std::string mode = string(profile_, "processing_mode");
         if (mode != "factors-only" && mode != "prediction") throw std::runtime_error("invalid processing mode");
         const bool factors_only = mode == "factors-only";
         if (factors_only && profile_.count("strategy_runtime"))
             throw std::runtime_error("strategy intents require model predictions");
         const Json& environment = profile_.at("environment");
-        if (string(environment, "execution") != "disabled" ||
+        if (string(environment, "execution") != (live_ ? "live" : monitor_ ? "monitor" : "disabled") ||
             string(environment, "mode") != (capture ? "live" : "replay") ||
             string(environment, "clock") != (capture ? "host" : "virtual"))
             throw std::runtime_error("processing profile environment disagrees with input driver");
@@ -154,22 +162,26 @@ public:
             throw std::runtime_error("this binary requires the SSE per-instrument-v2 profile");
         const Json sampling = Json::parse(R"json({"mode":"hardware-gap-batch","threshold_ns":5000,
             "comparison":"greater-or-equal","clock":"NIC_PHC","candidate_event":"CompleteOrderBookSH Level2",
-            "activity_scope":"global-sse-datagram-gap","same_exchange_time_policy":"at-most-one-sample",
+            "activity_scope":"per-subscription-sse-datagram-gap","same_exchange_time_policy":"at-most-one-sample",
             "initial_window":"first-valid-book-at-or-after-open","sequence_gap_policy":"fail-closed","periodic_md":false,
             "shutdown_flush":false,"standard_gate":{"turnover_threshold_source":"daily-instrument-static-required",
             "exchange_time_trigger_us":100000000,"mid_change_epsilon":0.000001,"min_volume_change":100}})json");
         const Json routing = Json::parse(R"json({"clock":"exchange-time-of-day-micros",
             "snapshot_selected_window":"[09:30:00,09:35:00)","tick_selected_window":"[09:35:00,24:00:00)",
             "tick_warm_before_switch":true,"silent_fallback":false})json");
-        // Reserved integration switch for the Auction59 producer package
-        // (sse/auction). Disabled by default: wiring the engine into this
-        // stream processor is deferred, so only enabled:false is accepted.
-        const Json auction59_contract = Json::parse(R"json({"enabled":false})json");
-        if (prediction.count("auction59")) subset(prediction.at("auction59"), auction59_contract);
+        bool auction59_enabled = true;
+        if (prediction.count("auction59")) {
+            const Json& auction = prediction.at("auction59");
+            stream_input::fields(auction, {"enabled"});
+            if (!auction.at("enabled").is_boolean())
+                throw std::runtime_error("auction59.enabled must be boolean");
+            auction59_enabled = auction.at("enabled").get<bool>();
+        }
         if (prediction.count("sampling")) subset(prediction.at("sampling"), sampling);
         if (prediction.count("routing")) subset(prediction.at("routing"), routing);
         (void)channels;
         sse_tick::DailyStaticMetadataMap metadata;
+        sse_auction59::StaticMetadataMap auction_metadata;
         for (const Json& input : inputs) {
             sse_tick::DailyStaticMetadata value;
             const std::string instrument = string(input, "instrument");
@@ -184,6 +196,31 @@ public:
             value.stop_price = number(input, "lower_limit"); value.has_stop_price = true;
             if (!metadata.insert(std::make_pair(instrument, value)).second)
                 throw std::runtime_error("duplicate profile instrument");
+            if (input.count("listing_date") || input.count("is_ipo_first_day")) {
+                sse_auction59::StaticMetadata auction;
+                auction.date = value.date;
+                auction.pre_close = value.pre_close;
+                auction.upper_limit = value.limit_price;
+                auction.lower_limit = value.stop_price;
+                auction.limits_valid = auction.pre_close > 0 && auction.lower_limit > 0 &&
+                                       auction.upper_limit >= auction.lower_limit;
+                if (input.count("listing_date")) {
+                    const std::uint64_t listing = stream_input::uint_value(input.at("listing_date"));
+                    if (listing < 19000101U || listing > value.date)
+                        throw std::runtime_error("invalid Auction59 listing_date");
+                    auction.listing_date = static_cast<std::uint32_t>(listing);
+                    auction.is_ipo_first_day = auction.listing_date == value.date;
+                }
+                if (input.count("is_ipo_first_day")) {
+                    if (!input.at("is_ipo_first_day").is_boolean())
+                        throw std::runtime_error("is_ipo_first_day must be boolean");
+                    const bool first_day = input.at("is_ipo_first_day").get<bool>();
+                    if (input.count("listing_date") && first_day != auction.is_ipo_first_day)
+                        throw std::runtime_error("Auction59 listing_date and first-day flag differ");
+                    auction.is_ipo_first_day = first_day;
+                }
+                auction_metadata[instrument] = auction;
+            }
         }
         if (!factors_only) {
             if (!model_.load(string(prediction, "model_path"),
@@ -192,15 +229,6 @@ public:
                              string(prediction, "snapshot_auction59_model_path"),
                              string(prediction, "snapshot_auction59_scaler_path"), &error))
                 throw std::runtime_error(error);
-            if (!sse_auction59::load_csv(string(prediction, "snapshot_auction59_factors_path"), &auction_, &error))
-                throw std::runtime_error(error);
-            for (const auto& entry : metadata) {
-                const auto found = auction_.find(entry.first);
-                if (found == auction_.end() || found->second.size() != 59)
-                    throw std::runtime_error("missing Auction59 factors for " + entry.first);
-                for (float value : found->second) if (!std::isfinite(value))
-                    throw std::runtime_error("non-finite Auction59 factors for " + entry.first);
-            }
         }
         processor_.reset(new sse_stream::SseStreamProcessor(metadata, factors_only ? 0 : &model_, factors_only,
             [&](const sse_stream::Output& output) {
@@ -215,13 +243,15 @@ public:
                     last_sequence_ = output.snapshot.provenance.stream_sequence;
                     crc_.process_bytes(output.snapshot.snapshot36.data(), sizeof(float) * output.snapshot.snapshot36.size());
                 }
+                if (live_ || monitor_) {
+                    if (output.kind == sse_stream::kTickOutput)
+                        signal_times_[output.tick.event.security_id] = output.tick.event.time_of_day_micros;
+                    else if (output.kind == sse_stream::kSnapshotOutput)
+                        signal_times_[output.snapshot.snapshot.security_id] = output.snapshot.snapshot.time_of_day_micros;
+                    if (strategy_) strategy_->set_ready(oms_->account().ready, true, true);
+                }
                 if (strategy_) strategy_->on_output(output);
-            }, [&](const std::string& instrument, std::uint64_t, std::vector<float>* values, std::string*) {
-                const auto found = auction_.find(instrument);
-                if (found == auction_.end()) return false;
-                *values = found->second;
-                return true;
-            }));
+            }, sse_stream::Auction59Provider(), auction_metadata, auction59_enabled));
 #endif
         initialize_strategy(healthy);
     }
@@ -232,10 +262,17 @@ public:
         }
         catch (...) { begin_stop(); throw; }
     }
+    // TD reports and cancel timers must progress even when market data is idle.
+    void poll() {
+        if ((!live_ && !monitor_) || stopped_.load()) return;
+        try { advance_clock(0); }
+        catch (...) { begin_stop(); throw; }
+    }
     void begin_stop() {
         if (strategy_) strategy_->begin_stop();
         if (oms_) oms_->begin_stop();
         stopped_.store(true);
+        if (live_td_) live_td_->session().stop();
 #ifdef T0_STREAM_SZE
         if (recovery_) recovery_->request_stop();
 #endif
@@ -286,6 +323,21 @@ public:
         return std::string();
 #endif
     }
+    // Constant-size status for the five-second journal heartbeat. Avoid
+    // copying the OMS audit history or the instrument universe in this path.
+    Json runtime_status() const {
+        Json result{{"rows", rows_}, {"predictions", predictions_},
+            {"execution", live_ ? "live" : monitor_ ? "monitor" : "disabled"}};
+        if (strategy_) {
+            const oms::AccountView account = oms_->account();
+            result["strategy"] = Json{
+                {"mode", live_ ? "live" : monitor_ ? "monitor" : "paper-intents"},
+                {"orders_enabled", live_}, {"connected", account.connected},
+                {"ready", account.ready}, {"reason", account.reason},
+                {"order_intents", (live_ || monitor_) ? account.admissions : order_intents_}};
+        }
+        return result;
+    }
     Json summary() const {
         Json result;
         result["contract"] = profile_.at("processing_contract");
@@ -295,21 +347,29 @@ public:
         result["predictions"] = predictions_;
         result["factor_crc32"] = crc_.checksum();
         result["last_ingress_sequence"] = last_sequence_;
-        result["execution"] = "disabled";
+        result["execution"] = live_ ? "live" : monitor_ ? "monitor" : "disabled";
         if (strategy_) {
-            result["strategy"]["mode"] = "paper-intents";
+            result["strategy"]["mode"] = live_ ? "live" : monitor_ ? "monitor" : "paper-intents";
             result["strategy"]["signals"] = strategy_->signals();
             result["strategy"]["order_intents"] = order_intents_;
             result["strategy"]["cancel_intents"] = cancel_intents_;
             result["strategy"]["intent_crc32"] = intent_crc_.checksum();
             result["strategy"]["fills_simulated"] = false;
-            result["strategy"]["account_baseline"] = "configured-paper-snapshot";
+            result["strategy"]["account_baseline"] = (live_ || monitor_) ? "ATP-account-snapshot" : "configured-paper-snapshot";
             const oms::AccountView account = oms_->account();
             result["strategy"]["oms"]["orders"] = account.orders;
             result["strategy"]["oms"]["pending_orders"] = account.pending_orders;
             result["strategy"]["oms"]["reserved_money_units"] = account.cash_reserved;
             result["strategy"]["oms"]["rejections"] = account.rejections;
             result["strategy"]["oms"]["anomalies"] = account.anomalies;
+            result["strategy"]["oms"]["ready"] = account.ready;
+            result["strategy"]["oms"]["connected"] = account.connected;
+            result["strategy"]["oms"]["reason"] = account.reason;
+            if (live_ || monitor_) {
+                result["strategy"]["orders_enabled"] = live_;
+                result["strategy"]["order_intents"] = account.admissions;
+                result["strategy"]["td_status"] = live_td_->session().status();
+            }
             result["strategy"]["oms"]["audit_tail"] = Json::array();
             const auto audit = oms_->audit_events();
             for (std::size_t i = audit.size() > 16 ? audit.size() - 16 : 0; i < audit.size(); ++i)
@@ -329,14 +389,104 @@ public:
         return result;
     }
 private:
+    bool live_signal_fresh(const std::string& code) const {
+        const auto found = signal_times_.find(code);
+        if (found == signal_times_.end()) return false;
+        timespec wall = {}; tm local = {};
+        if (::clock_gettime(CLOCK_REALTIME, &wall) || !::localtime_r(&wall.tv_sec, &local)) return false;
+        const std::uint32_t day = (local.tm_year + 1900) * 10000 + (local.tm_mon + 1) * 100 + local.tm_mday;
+        if (day != static_cast<std::uint32_t>(number(profile_, "trading_day"))) return false;
+        const long long now = (local.tm_hour * 3600LL + local.tm_min * 60LL + local.tm_sec) * 1000000LL + wall.tv_nsec / 1000;
+        const long long delta = now - static_cast<long long>(found->second);
+        return delta >= -1000000LL && delta <= 1000000LL;
+    }
+    void initialize_live_strategy(const std::function<bool()>& healthy) {
+#ifdef T0_STREAM_SZE
+        (void)healthy;
+        throw std::runtime_error("live TD is only wired to the Shanghai journal entry point");
+#else
+        const Json& runtime = profile_.at("strategy_runtime");
+        stream_input::fields(runtime, {"mode", "account_reference", "legacy_config", "oms", "td"});
+        if (string(runtime, "mode") != (monitor_ ? "monitor" : "live") || !healthy)
+            throw std::runtime_error("live strategy runtime (live or monitor) and transport health provider required");
+        const Json& td = runtime.at("td");
+        stream_input::fields(td, {"library", "config_path", "trading_enabled", "production_approval", "epoch", "cpu"});
+        const char* key = std::getenv("SSE_ENABLE_LIVE_ORDER");
+        if (!monitor_ && (!td.at("trading_enabled").is_boolean() || !td.at("trading_enabled").get<bool>() ||
+            !td.at("production_approval").is_boolean() || !td.at("production_approval").get<bool>() ||
+            !key || std::string(key) != "YES"))
+            throw std::runtime_error("live execution requires trading_enabled, production_approval and SSE_ENABLE_LIVE_ORDER=YES");
+        Json legacy = runtime.at("legacy_config");
+        if (number(legacy, "trading_day") != number(profile_, "trading_day") ||
+            legacy.at("ins_params").size() != profile_.at("instruments").size())
+            throw std::runtime_error("live strategy and processing date/universe differ");
+        const Json& settings = runtime.at("oms");
+        stream_input::fields(settings, {"journal_path", "fee_reserve_per_order"});
+        oms::Config config;
+        config.scope.account.broker = "guoxin"; config.scope.account.account = string(runtime, "account_reference");
+        config.scope.gateway = "sse_td"; config.scope.source = 190;
+        config.scope.day = static_cast<std::uint32_t>(number(profile_, "trading_day"));
+        config.instance = "stream-live-SH"; config.enabled = true;
+        config.ownership = oms::OwnershipMode::ExclusiveLocal;
+        config.lock_directory = "/run/usagi/oms/accounts";
+        config.journal_path = string(settings, "journal_path");
+        config.restart_cancel_open_orders = !monitor_;
+        if (config.journal_path.empty() || config.journal_path[0] != '/' ||
+            !oms::money_from_double(number(settings, "fee_reserve_per_order"), &config.limits.fee_reserve_per_order))
+            throw std::runtime_error("live OMS journal and explicit fee reserve required");
+        std::set<oms::Instrument> universe;
+        for (const Json& input : profile_.at("instruments")) {
+            const std::string code = string(input, "instrument");
+            if (!legacy.at("ins_params").count(code + ".SH")) throw std::runtime_error("live strategy universe mismatch");
+            Json& params = legacy["ins_params"][code + ".SH"];
+            // The strategy refreshes actual positions from OMS before every signal.
+            // No configured last_position may enter live account initialization.
+            params["last_position"] = -params.at("static_position").get<long long>();
+            oms::InstrumentRules rules;
+            if (!oms::money_from_double(number(input, "lower_limit"), &rules.lower_price) ||
+                !oms::money_from_double(number(input, "upper_limit"), &rules.upper_price))
+                throw std::runtime_error("live OMS price bands not representable");
+            rules.lot = params.value("vol_unit", 100);
+            if (params.count("max_order_size") &&
+                !oms::money_from_double(number(params, "max_order_size"), &rules.max_order_notional))
+                throw std::runtime_error("live OMS order limit not representable");
+            const oms::Instrument instrument = {"SSE", code}; universe.insert(instrument); config.instruments[instrument] = rules;
+        }
+        oms::Scope scope = config.scope; scope.epoch = stream_input::uint_value(td.at("epoch"));
+        if (!scope.epoch) throw std::runtime_error("live TD connection epoch must be nonzero");
+        live_td_.reset(new strategy_runtime::LiveTdPlugin(string(td, "library"), string(td, "config_path"), scope, universe, !monitor_));
+        oms_ = oms::Engine::create(config, live_td_->session().backend());
+        live_td_->session().attach(oms_);
+        if (!oms_->start_epoch(scope.epoch, false)) throw std::runtime_error("cannot start live OMS epoch");
+        execution_.reset(new strategy_runtime::OmsStrategyExecution(oms_, config.instance));
+        const std::function<bool()> gate = [this, healthy]() {
+            return live_ && !stopped_.load() && oms_->account().ready && healthy();
+        };
+        strategy_.reset(new MarketStrategySession(legacy, 190, execution_, gate));
+        strategy_->set_instrument_gate([this](const std::string& code) {
+            return processor_->instrument_static_valid(code) && live_signal_fresh(code);
+        });
+        strategy_->set_ready(false, true, true);
+        std::string error;
+        if (!live_td_->session().connect(5000000000LL, &error)) throw std::runtime_error(error);
+        advance_clock(0); // Delivers the SDK connection event on the strategy owner thread.
+        if (!oms_->begin_reconcile(1)) throw std::runtime_error("cannot start ATP account reconciliation");
+#endif
+    }
     void advance_clock(std::uint64_t ns) {
         if (!oms_) return;
+        if (live_ || monitor_) {
+            timespec now = {};
+            if (::clock_gettime(CLOCK_MONOTONIC, &now)) throw std::runtime_error("cannot read live OMS clock");
+            ns = static_cast<std::uint64_t>(now.tv_sec) * 1000000000ULL + now.tv_nsec;
+        }
         if (ns > static_cast<std::uint64_t>(std::numeric_limits<long long>::max()))
             throw std::runtime_error("strategy stream time out of range");
         oms_->advance_to(static_cast<long long>(ns));
     }
     void initialize_strategy(const std::function<bool()>& healthy) {
         if (!profile_.count("strategy_runtime")) return;
+        if (live_ || monitor_) { initialize_live_strategy(healthy); return; }
         const Json& runtime = profile_.at("strategy_runtime");
         if (!runtime.is_object() || runtime.size() != 4 ||
             string(runtime, "mode") != "paper-intents" || !healthy)
@@ -414,6 +564,11 @@ private:
             return true;
         };
         strategy_.reset(new MarketStrategySession(legacy, source, execution_, gate));
+#ifndef T0_STREAM_SZE
+        strategy_->set_instrument_gate([this](const std::string& code) {
+            return processor_->instrument_static_valid(code);
+        });
+#endif
         if (!oms_->start_epoch(1) || !oms_->begin_reconcile(1, false))
             throw std::runtime_error("cannot initialize explicit paper account snapshot");
         snapshot.scope = oms_->scope(); snapshot.token = 1;
@@ -479,6 +634,11 @@ private:
     boost::crc_32_type intent_crc_;
     std::string input_driver_;
     std::atomic<bool> stopped_, reached_live_;
+    bool live_;
+    bool monitor_;
+    std::map<std::string, std::uint64_t> signal_times_;
+    // Declared before OMS: backend objects die before their plugin is unloaded.
+    std::unique_ptr<strategy_runtime::LiveTdPlugin> live_td_;
     std::shared_ptr<oms::Engine> oms_;
     std::shared_ptr<strategy_runtime::OmsStrategyExecution> execution_;
     std::unique_ptr<MarketStrategySession> strategy_;
@@ -489,7 +649,6 @@ private:
     std::unique_ptr<sze_stream::SzeRecoveryDriver> recovery_;
 #else
     sse_hybrid_model::Model model_;
-    sse_auction59::FactorMap auction_;
     std::unique_ptr<sse_stream::SseStreamProcessor> processor_;
 #endif
 };

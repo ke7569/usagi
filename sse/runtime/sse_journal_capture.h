@@ -15,6 +15,12 @@
 namespace sse_journal_capture {
 
 struct Status {
+    struct Channel {
+        std::size_t index;
+        std::string name;
+        std::uint64_t datagrams;
+        Channel() : index(0), name(), datagrams(0) {}
+    };
     Status()
         : accepting(false), stop_requested(false), failed(false), journal_degraded(false),
           journal_closed(false), journal_ready(false),
@@ -48,6 +54,7 @@ struct Status {
     std::uint64_t flush_count;
     std::string error;
     std::vector<sse_cpu::Cpu> cpu_affinity;
+    std::vector<Channel> channels;
 };
 
 class Capture {
@@ -114,6 +121,7 @@ private:
     std::atomic<int> failure_reason_;
 
     std::atomic<std::uint64_t> datagrams_;
+    std::vector<std::shared_ptr<std::atomic<std::uint64_t> > > channel_datagrams_;
     std::atomic<std::uint64_t> hardware_timestamps_, missing_hardware_timestamps_, software_timestamp_fallbacks_;
     std::atomic<std::uint64_t> idle_events_;
     std::atomic<std::uint64_t> payload_bytes_;

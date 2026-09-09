@@ -1,0 +1,17 @@
+{
+  "account_reference": "170000795600",
+  "td_library": "/home/zane/usagi-bin/libsse_td.so",
+  "td_config": "/home/zane/td_query_runtime_20260824/config/sse_td_query_live.json",
+  "library_path": "/home/zane/td_query_runtime_20260824/lib",
+  "runtime_root": "/home/zane/usagi-runtime",
+  "daily_config_pattern": "/home/zane/sse/configs/daily/config_sse_daily_%Y%m%d.json",
+  "td_cpu": -1,
+  "trading_enabled": false,
+  "production_approval": false,
+  "fee_reserve_per_order": 0.0,
+  "model_path": "/home/zane/models/tick.bin",
+  "snapshot_baseline_model_path": "/home/zane/models/baseline.ssegru",
+  "snapshot_baseline_scaler_path": "/home/zane/models/baseline.json",
+  "snapshot_auction59_model_path": "/home/zane/models/auction59.ssegru",
+  "snapshot_auction59_scaler_path": "/home/zane/models/auction59.json"
+}

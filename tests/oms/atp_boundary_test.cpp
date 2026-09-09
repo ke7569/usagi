@@ -6,6 +6,8 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace {
 using namespace oms;
@@ -163,6 +165,80 @@ void test_query_is_explicitly_unsupported() {
             "ATP query certification remains explicitly unsupported");
 }
 
+void test_deferred_callbacks_run_on_owner_thread() {
+    const std::thread::id owner = std::this_thread::get_id();
+    std::vector<std::string> delivered;
+    AtpBackend backend(scope(), [](const Command&) {
+        SendResult r; r.disposition = SendDisposition::Submitted; return r;
+    }, AtpBackend::QuerySender(), true, true);
+    backend.bind([&](const Report&) {
+        require(std::this_thread::get_id() == owner, "report entered OMS from SDK thread");
+        delivered.push_back("report");
+    }, [&](const Snapshot&) {
+        require(std::this_thread::get_id() == owner, "snapshot entered OMS from SDK thread");
+        delivered.push_back("snapshot");
+    }, [&](const Scope&, bool connected) {
+        require(std::this_thread::get_id() == owner, "connection entered OMS from SDK thread");
+        delivered.push_back(connected ? "connected" : "disconnected");
+    });
+    require(backend.submit(command(scope())).error.failed(), "unconnected deferred transport must block sends");
+    std::thread sdk([&]() {
+        backend.connected();
+        Report r; r.scope = scope(); backend.publish(r);
+        Snapshot s; s.scope = scope(); backend.publish_snapshot(s);
+    });
+    sdk.join();
+    require(delivered.empty(), "SDK callbacks must wait for owner advance");
+    backend.advance_to(1);
+    require(delivered.size() == 3 && delivered[0] == "connected" &&
+            delivered[1] == "report" && delivered[2] == "snapshot", "callback order changed");
+    require(!backend.submit(command(scope())).error.failed(), "owner connection acknowledgement permits send");
+}
+
+void test_deferred_disconnect_discards_old_certification() {
+    std::vector<std::string> delivered;
+    int sends = 0;
+    AtpBackend backend(scope(), [&](const Command&) { ++sends; return SendResult(); },
+                       AtpBackend::QuerySender(), true, true);
+    backend.bind([&](const Report&) { delivered.push_back("report"); },
+        [&](const Snapshot&) { delivered.push_back("snapshot"); },
+        [&](const Scope&, bool value) { delivered.push_back(value ? "connected" : "disconnected"); });
+    backend.connected(); backend.advance_to(1); delivered.clear();
+    Snapshot snapshot; snapshot.scope = scope(); snapshot.token = 5;
+    backend.publish_snapshot(snapshot);
+    Report report; report.scope = scope(); backend.publish(report);
+    backend.disconnected();
+    // Late SDK login/query callbacks belong to the broken immutable generation.
+    backend.connected(); backend.publish_snapshot(snapshot);
+    require(backend.submit(command(scope())).error.failed() && sends == 0,
+            "disconnect must block transport before owner drains callbacks");
+    backend.advance_to(2);
+    require(delivered.size() == 2 && delivered[0] == "disconnected" && delivered[1] == "report",
+            "disconnect must precede reports and discard queued certification");
+    require(backend.submit(command(scope())).error.failed(), "stale connected event reopened transport");
+}
+
+void test_deferred_overflow_and_close_block_sender() {
+    int reports = 0, snapshots = 0, disconnected = 0, sends = 0;
+    AtpBackend backend(scope(), [&](const Command&) { ++sends; return SendResult(); },
+                       AtpBackend::QuerySender(), true, true, 2);
+    backend.bind([&](const Report&) { ++reports; }, [&](const Snapshot&) { ++snapshots; },
+        [&](const Scope&, bool value) { if (!value) ++disconnected; });
+    backend.connected(); backend.advance_to(1);
+    Report report; report.scope = scope();
+    std::thread sdk([&]() { backend.publish(report); backend.publish(report); backend.publish(report); });
+    sdk.join();
+    backend.connected();
+    Snapshot snapshot; snapshot.scope = scope(); backend.publish_snapshot(snapshot);
+    require(backend.submit(command(scope())).error.failed() && sends == 0, "queue overflow did not block sender");
+    backend.advance_to(2);
+    require(disconnected == 1 && reports == 0 && snapshots == 0, "overflow must disconnect without partial certification");
+    backend.close(); backend.connected();
+    require(backend.submit(command(scope())).error.failed(), "close must immediately block sender");
+    backend.advance_to(3);
+    require(disconnected == 2, "close connection event must drain on owner");
+}
+
 }  // namespace
 
 int main() {
@@ -172,6 +248,9 @@ int main() {
         test_sender_dispositions_raw_error_and_close();
         test_publish_scope_and_connection_callback();
         test_query_is_explicitly_unsupported();
+        test_deferred_callbacks_run_on_owner_thread();
+        test_deferred_disconnect_discards_old_certification();
+        test_deferred_overflow_and_close_block_sender();
     } catch (const std::exception& error) {
         std::cerr << "atp_boundary_test: " << error.what() << std::endl;
         return EXIT_FAILURE;

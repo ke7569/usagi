@@ -454,6 +454,9 @@ bool Engine::start_epoch(std::uint64_t epoch, bool connected) {
     if (!epoch || epoch <= s.config.scope.epoch || s.stopping) return false;
     s.save("epoch", Json{{"epoch", epoch}, {"connected", connected}}, true);
     s.config.scope.epoch = epoch; s.connected = connected; s.reconciled = s.reconciling = false;
+    // Query identity is (scope, token). A new epoch may restart its token
+    // sequence; old-epoch snapshots are still rejected by their scope.
+    s.token = s.last_token = 0;
     s.reason = "new epoch requires account reconciliation";
     ++s.activity; s.broker_ids.clear(); s.timers.clear(); s.orphans.clear(); s.actions.clear();
     for (auto& item : s.orders) {
@@ -1213,6 +1216,7 @@ bool Engine::Impl::replay_record(const std::string& payload) {
     if (!have_header) return false;
     if (type == "epoch") {
         config.scope.epoch = data.at("epoch").get<std::uint64_t>();
+        token = last_token = 0;
         connected = data.at("connected").get<bool>(); broker_ids.clear();
         for (auto& o : orders) o.second.cancel_epoch_verified = false;
     } else if (type == "connected") connected = data.at("connected").get<bool>();

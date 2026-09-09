@@ -25,7 +25,7 @@ class ConfigError(ValueError):
 STATIC_FIELDS = {
     "Date", "Close", "Amount", "Range", "HistoryAmount", "FreeShare",
     "free_share", "HpUpperPrice", "HpLowerPrice", "HpFeeShare",
-    "HistoryVolatility20d",
+    "HistoryVolatility20d", "listing_date", "is_ipo_first_day",
 }
 POSITION_FIELDS = {"static_position", "last_position"}
 INSTRUMENT_FIELDS = {"vol_unit", "min_order_size", "max_order_size"}
@@ -407,8 +407,18 @@ def validate(config):
                 date_value(value, symbol + ".Date")
                 if value != daily["trading_day"]:
                     raise ConfigError(symbol + ".Date differs from trading_day")
+            elif key == "listing_date":
+                date_value(value, symbol + ".listing_date")
+                if value > daily["trading_day"]:
+                    raise ConfigError(symbol + ".listing_date is after trading_day")
+            elif key == "is_ipo_first_day":
+                if type(value) is not bool:
+                    raise ConfigError(symbol + ".is_ipo_first_day must be boolean")
             else:
                 number(value, symbol + "." + key, minimum=0)
+        if "listing_date" in values and "is_ipo_first_day" in values and \
+                values["is_ipo_first_day"] != (values["listing_date"] == daily["trading_day"]):
+            raise ConfigError(symbol + " has inconsistent listing date and first-day flag")
         for key in ("Close", "HistoryAmount", "FreeShare", "free_share", "HpUpperPrice", "HpLowerPrice"):
             if key in values and values[key] <= 0:
                 raise ConfigError(symbol + "." + key + " must be positive")

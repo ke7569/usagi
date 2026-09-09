@@ -1,0 +1,20 @@
+[Unit]
+Description=SSE raw tick and snapshot journal capture
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/zane/usagi-sse-dev
+ExecStartPre=/home/zane/usagi-bin/sse_hwstamp_ctl hqh-p1-k2 enable-rx-all
+ExecStart=/usr/bin/python2 /home/zane/usagi-sse-dev/tools/sse/run_journal_capture.py --config /home/zane/usagi-sse-dev/deploy/sse/journal_capture.live.json --binary /home/zane/usagi-bin/t0_sse_journal_capture --runtime-root /home/zane/usagi-runtime
+Restart=on-failure
+RestartSec=30
+StartLimitInterval=0
+TimeoutStopSec=60
+KillSignal=SIGTERM
+KillMode=control-group
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

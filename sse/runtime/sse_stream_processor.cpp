@@ -1,6 +1,7 @@
 #include "sse/runtime/sse_stream_processor.h"
 
 #include <cmath>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 
@@ -54,10 +55,14 @@ BatchEndOutput::BatchEndOutput()
 Output::Output() : kind(kTickOutput), tick(), snapshot(), batch_end() {}
 
 SseStreamProcessor::InstrumentState::InstrumentState(
-    const std::string& code, const sse_tick::DailyStaticMetadata& metadata)
+    const std::string& code, const sse_tick::DailyStaticMetadata& metadata,
+    const sse_auction59::StaticMetadata& auction_metadata, bool ipo_known)
     : book(code), factors(), sample_gate(), model_state(), previous_snapshot(),
       have_previous_snapshot(false), last_snapshot_time(0ULL), pending_tick(),
-      pending_provenance(), have_pending_tick(false) {
+      pending_provenance(), have_pending_tick(false),
+      auction(new sse_auction59::Session(code, auction_metadata, ipo_known)),
+      auction_decided(false), snapshot_model_enabled(false),
+      auction_failure_logged(false), static_failure_logged(false) {
     factors.set_static_metadata(metadata);
 }
 
@@ -66,22 +71,21 @@ SseStreamProcessor::SseStreamProcessor(
     const sse_hybrid_model::Model* model,
     bool factors_only,
     const OutputCallback& callback,
-    const Auction59Provider& auction59_provider)
-    : states_(), channel_sequences_(), batch_sampler_(instrument_ids(metadata)), model_(model),
-      factors_only_(factors_only), callback_(callback),
-      auction59_provider_(auction59_provider), auction59_inputs_(),
-      hardware_batch_mode_(false), hardware_batch_open_(false), hardware_batch_id_(0ULL),
-      next_hardware_batch_id_(1ULL), last_hardware_ns_(0ULL),
-      last_hardware_monotonic_ns_(0ULL), hardware_batch_packet_count_(0U),
-      hardware_candidates_(),
+    const Auction59Provider& auction59_provider,
+    const sse_auction59::StaticMetadataMap& auction_metadata,
+    bool auction_enabled)
+    : states_(), channel_sequences_(), batch_sampler_(instrument_ids(metadata)),
+      closed_batches_(),
+      hardware_batch_mode_(false), next_hardware_batch_id_(1ULL),
+      hardware_batches_(), model_(model), factors_only_(factors_only),
+      callback_(callback), auction59_provider_(auction59_provider),
+      auction59_inputs_(), auction_arrival_index_(0ULL),
       invalid_(false), invalid_reason_() {
     if (!callback_) throw std::runtime_error("SSE stream processor callback required");
     if (factors_only_ && model_ != 0)
         throw std::runtime_error("SSE factors-only processor cannot take a model");
     if (!factors_only_ && (model_ == 0 || !model_->loaded()))
         throw std::runtime_error("SSE processor requires a loaded model or factors-only mode");
-    if (!factors_only_ && !auction59_provider_)
-        throw std::runtime_error("SSE model processor requires an Auction59 provider");
     std::uint32_t metadata_date = 0U;
     for (sse_tick::DailyStaticMetadataMap::const_iterator it = metadata.begin();
          it != metadata.end(); ++it) {
@@ -99,21 +103,33 @@ SseStreamProcessor::SseStreamProcessor(
             throw std::runtime_error("invalid SSE static metadata security: " + it->first);
         if (states_.find(code) != states_.end())
             throw std::runtime_error("duplicate SSE static metadata security: " + code);
-        states_.insert(std::make_pair(code, InstrumentState(code, it->second)));
+        sse_auction59::StaticMetadata auction_row;
+        auction_row.date = row.date;
+        auction_row.pre_close = row.pre_close;
+        auction_row.upper_limit = row.limit_price;
+        auction_row.lower_limit = row.stop_price;
+        auction_row.limits_valid = true;
+        auction_row.source = row.source;
+        auction_row.quality = row.quality;
+        sse_auction59::StaticMetadataMap::const_iterator known = auction_metadata.find(code);
+        if (known == auction_metadata.end()) known = auction_metadata.find(it->first);
+        const bool ipo_known = known != auction_metadata.end();
+        // Daily prices remain authoritative; optional metadata supplies only
+        // the IPO facts which cannot be inferred from a level-2 snapshot.
+        if (ipo_known) {
+            auction_row.listing_date = known->second.listing_date;
+            auction_row.is_ipo_first_day = known->second.is_ipo_first_day;
+        }
+        StateMap::iterator inserted = states_.insert(std::make_pair(
+            code, InstrumentState(code, row, auction_row, ipo_known))).first;
+        if (!auction_enabled) {
+            inserted->second.auction->disable("auction_disabled");
+            inserted->second.auction_decided = true;
+            report_auction_state(code, inserted->second);
+        }
     }
     if (states_.empty()) throw std::runtime_error("SSE processor requires static metadata");
     closed_batches_.reserve(states_.size());
-    if (!factors_only_) {
-        for (StateMap::const_iterator it = states_.begin(); it != states_.end(); ++it) {
-            std::vector<float> factors;
-            std::string error;
-            if (!auction59_provider_(it->first, kSnapshotGenerateStartMicros,
-                                     &factors, &error) || !valid_auction59(factors))
-                throw std::runtime_error(error_text(
-                    "SSE Auction59 provider rejected static instrument", error));
-            auction59_inputs_[it->first] = factors;
-        }
-    }
 }
 
 void SseStreamProcessor::fail(const std::string& reason) {
@@ -128,6 +144,11 @@ SseStreamProcessor::InstrumentState* SseStreamProcessor::state_for(
     const std::string& code) {
     StateMap::iterator it = states_.find(code);
     return it == states_.end() ? 0 : &it->second;
+}
+
+bool SseStreamProcessor::instrument_static_valid(const std::string& code) const {
+    const StateMap::const_iterator it = states_.find(code);
+    return it != states_.end() && it->second.auction->shared_static_valid();
 }
 
 Provenance SseStreamProcessor::provenance(
@@ -202,8 +223,14 @@ void SseStreamProcessor::on_idle(const deepwin_market_data::StreamEvent& event) 
     if (event.data != 0 || event.size != 0U)
         fail("SSE idle event carries payload");
     if (hardware_batch_mode_) {
-        if (hardware_batch_open_)
-            close_hardware_batch(event.monotonic_ns, sse_live_sampling::kBatchClosedByTimer);
+        std::vector<std::uint32_t> channels;
+        for (HardwareBatchMap::const_iterator it = hardware_batches_.begin();
+             it != hardware_batches_.end(); ++it)
+            if (it->second.open) channels.push_back(it->first);
+        for (std::vector<std::uint32_t>::const_iterator it = channels.begin();
+             it != channels.end(); ++it)
+            close_hardware_batch(*it, event.monotonic_ns,
+                                 sse_live_sampling::kBatchClosedByTimer);
     } else {
         std::string error;
         if (!batch_sampler_.on_timer(event.monotonic_ns, &closed_batches_, &error))
@@ -216,56 +243,65 @@ void SseStreamProcessor::advance_hardware_batch(
     const deepwin_market_data::StreamEvent& event) {
     const std::uint64_t timestamp = event.hardware_ns != 0ULL
         ? event.hardware_ns : event.monotonic_ns;
-    if (!hardware_batch_open_) {
-        hardware_batch_open_ = true;
-        hardware_batch_id_ = next_hardware_batch_id_++;
-        hardware_batch_packet_count_ = 0U;
-        hardware_candidates_.clear();
+    HardwareBatchState& state = hardware_batches_[event.channel_id];
+    if (state.have_hardware_timestamp && timestamp < state.last_hardware_ns)
+        fail("SSE hardware receive timestamp moved backwards");
+    if (!state.open) {
+        state.open = true;
+        state.batch_id = next_hardware_batch_id_++;
+        state.packet_count = 0U;
+        state.candidates.clear();
     } else {
-        if (timestamp < last_hardware_ns_)
-            fail("SSE hardware receive timestamp moved backwards");
-        if (timestamp - last_hardware_ns_ >= kHardwareBatchGapNanoseconds) {
-            close_hardware_batch(event.monotonic_ns,
+        if (timestamp - state.last_hardware_ns >= kHardwareBatchGapNanoseconds) {
+            close_hardware_batch(event.channel_id, event.monotonic_ns,
                                  sse_live_sampling::kBatchClosedByNextEvent);
-            hardware_batch_open_ = true;
-            hardware_batch_id_ = next_hardware_batch_id_++;
-            hardware_batch_packet_count_ = 0U;
-            hardware_candidates_.clear();
+            state.open = true;
+            state.batch_id = next_hardware_batch_id_++;
+            state.packet_count = 0U;
+            state.candidates.clear();
         }
     }
-    last_hardware_ns_ = timestamp;
-    last_hardware_monotonic_ns_ = event.monotonic_ns;
-    ++hardware_batch_packet_count_;
+    state.last_hardware_ns = timestamp;
+    state.have_hardware_timestamp = true;
+    state.last_hardware_monotonic_ns = event.monotonic_ns;
+    ++state.packet_count;
 }
 
 void SseStreamProcessor::close_hardware_batch(
-    std::uint64_t emitted_monotonic_ns,
+    std::uint32_t channel_id, std::uint64_t emitted_monotonic_ns,
     sse_live_sampling::BatchCloseReason reason) {
-    if (!hardware_batch_open_) return;
+    HardwareBatchMap::iterator state_it = hardware_batches_.find(channel_id);
+    if (state_it == hardware_batches_.end() || !state_it->second.open) return;
+    HardwareBatchState& state = state_it->second;
     sse_live_sampling::BatchEnd batch;
-    batch.batch_id = hardware_batch_id_;
-    batch.last_activity_ns = last_hardware_ns_;
+    batch.batch_id = state.batch_id;
+    batch.last_activity_ns = state.last_hardware_ns;
     batch.emitted_ns = emitted_monotonic_ns;
-    batch.packet_count = hardware_batch_packet_count_;
+    batch.packet_count = state.packet_count;
     batch.reason = reason;
     for (std::map<std::string, sse_live_sampling::Candidate>::const_iterator it =
-             hardware_candidates_.begin(); it != hardware_candidates_.end(); ++it)
+             state.candidates.begin(); it != state.candidates.end(); ++it)
         batch.candidates.push_back(it->second);
-    hardware_batch_open_ = false;
-    hardware_batch_packet_count_ = 0U;
-    hardware_candidates_.clear();
+    state.open = false;
+    state.packet_count = 0U;
+    state.candidates.clear();
     process_closed_batch(batch);
 }
 
 void SseStreamProcessor::commit_hardware_candidate(
+    std::uint32_t channel_id,
     const sse_live_sampling::Candidate& candidate) {
-    hardware_candidates_[candidate.instrument_id] = candidate;
+    HardwareBatchMap::iterator state_it = hardware_batches_.find(channel_id);
+    if (state_it == hardware_batches_.end() || !state_it->second.open)
+        fail("SSE hardware batch state missing");
+    state_it->second.candidates[candidate.instrument_id] = candidate;
 }
 
 void SseStreamProcessor::on_datagram(
     const deepwin_market_data::StreamEvent& event) {
     if (event.data == 0 || event.size == 0U)
         fail("SSE datagram is empty or has no borrowed payload");
+    if (sse_live::is_primary_heartbeat(event.data, event.size)) return;
     std::size_t offset = 0U;
     while (offset < event.size) {
         const std::size_t remaining = event.size - offset;
@@ -299,6 +335,17 @@ void SseStreamProcessor::process_tick(
     if (!valid_tick_sequence(tick)) return;
     InstrumentState* state = state_for(tick.security_id);
     if (state == 0) return;
+    // Every accepted event reaches the auction accumulator, independently of
+    // tick sampling. Quiet batches and pre-open rows must not discard history.
+    state->auction->on_tick(tick, event.realtime_ns, ++auction_arrival_index_);
+    if (!factors_only_ && !state->auction_decided &&
+        tick.time_of_day_micros >= sse_hybrid_model::kSnapshotToTickSwitchMicros) {
+        // If no opening snapshot ever arrived, the tick handover is the last
+        // useful decision boundary. Release the unused auction history now.
+        state->auction->disable("no_opening_snapshot_before_tick_handover");
+        state->auction_decided = true;
+    }
+    report_auction_state(tick.security_id, *state);
     std::string error;
 
     const sse_tick::ApplyResult applied = state->book.apply(tick);
@@ -320,7 +367,7 @@ void SseStreamProcessor::process_tick(
         state->have_pending_tick = true;
     }
     if (hardware_batch_mode_) {
-        if (candidate_ptr) commit_hardware_candidate(*candidate_ptr);
+        if (candidate_ptr) commit_hardware_candidate(event.channel_id, *candidate_ptr);
     } else if (!batch_sampler_.commit_applied_event(tick.security_id, candidate_ptr,
                                                    applied.sequence_healthy, &error))
         fail(error_text("SSE batch sampler commit failure", error));
@@ -401,7 +448,7 @@ void SseStreamProcessor::process_closed_batch(
                 &state->model_state, &output.tick.prediction, &model_error);
             if (!output.tick.prediction_valid)
                 fail(error_text("SSE tick model rejected factors", model_error));
-            if (!row.validity.complete) {
+            if (!row.validity.complete || !state->auction->shared_static_valid()) {
                 output.tick.prediction.selected = false;
                 output.tick.prediction.selected_source = sse_hybrid_model::kNoSource;
                 output.tick.prediction.selected_pred = 0.0f;
@@ -430,6 +477,53 @@ bool SseStreamProcessor::valid_auction59(const std::vector<float>& factors) {
     return true;
 }
 
+void SseStreamProcessor::report_auction_state(
+    const std::string& code, InstrumentState& state) {
+    if (!state.auction->shared_static_valid() && !state.static_failure_logged) {
+        std::cerr << "sse_prediction_gate code=" << code
+                  << " mode=blocked reason=" << state.auction->reason() << "\n";
+        state.static_failure_logged = true;
+    }
+    if (state.auction->failed() && state.auction->shared_static_valid() &&
+        !state.auction_failure_logged) {
+        std::cerr << "sse_auction59 code=" << code
+                  << " mode=tick_only reason=" << state.auction->reason() << "\n";
+        state.auction_failure_logged = true;
+    }
+}
+
+void SseStreamProcessor::select_snapshot_mode(
+    const std::string& code, InstrumentState& state) {
+    if (state.auction_decided) return;
+    state.auction_decided = true;
+    if (auction59_provider_ && state.auction->shared_static_valid()) {
+        // Retain explicit injection for model/replay tests. The production
+        // entry points use the in-memory session, without a CSV provider.
+        std::vector<float> factors;
+        std::string error;
+        bool ok = false;
+        try {
+            ok = auction59_provider_(code, kSnapshotGenerateStartMicros, &factors, &error);
+        } catch (const std::exception& exception) {
+            error = exception.what();
+        }
+        if (ok && valid_auction59(factors)) {
+            auction59_inputs_[code] = factors;
+            state.snapshot_model_enabled = true;
+        } else {
+            state.auction->disable(error_text("auction_provider_rejected", error));
+        }
+    } else if (state.auction->ready()) {
+        auction59_inputs_[code] = state.auction->factors();
+        state.snapshot_model_enabled = true;
+    } else {
+        state.auction->seal_missing();
+    }
+    report_auction_state(code, state);
+    if (state.snapshot_model_enabled)
+        std::cerr << "sse_auction59 code=" << code << " mode=snapshot_and_tick reason=ready\n";
+}
+
 void SseStreamProcessor::process_snapshot(
     const sse_live::Snapshot& snapshot,
     const deepwin_market_data::StreamEvent& event,
@@ -438,6 +532,18 @@ void SseStreamProcessor::process_snapshot(
         fail("SSE snapshot has invalid wire sequence");
     InstrumentState* state = state_for(snapshot.security_id);
     if (state == 0) return;
+    // Opening snapshots may be one-sided. Static/opening reconciliation does
+    // not require Snapshot36's two-sided quote, and must precede its filters.
+    state->auction->on_snapshot(snapshot);
+    report_auction_state(snapshot.security_id, *state);
+    if (!factors_only_ && snapshot.time_of_day_micros >= kSnapshotGenerateStartMicros)
+        select_snapshot_mode(snapshot.security_id, *state);
+    // A stock that has already fallen back does not run Snapshot36. Keep
+    // checking common metadata above, but stale/invalid Snapshot totals must
+    // not invalidate its independent tick path or the other stocks.
+    if (!factors_only_ && state->auction_decided &&
+        (!state->snapshot_model_enabled || !state->auction->shared_static_valid() ||
+         (!auction59_provider_ && !state->auction->ready()))) return;
     // A one-sided quote is not a corrupt feed. It simply cannot form a
     // Snapshot36 row, just as in the existing live snapshot path.
     if (!sse_snapshot36::valid(snapshot)) return;

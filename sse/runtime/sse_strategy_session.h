@@ -16,6 +16,9 @@ public:
             const std::shared_ptr<StrategyExecution>& execution,
             const std::function<bool()>& healthy);
     void set_ready(bool account, bool risk, bool execution);
+    void set_instrument_gate(const std::function<bool(const std::string&)>& gate) {
+        instrument_gate_ = gate;
+    }
     void begin_stop();
     void on_output(const sse_stream::Output& output);
     bool on_order(const LFRtnOrderField& order, int request_id, short source, long received_ns);
@@ -40,6 +43,7 @@ private:
     // Single-flight gate: suppress a new signal while an order for the same
     // instrument is still working. Enabled by default for Shanghai.
     bool single_flight_;
+    std::function<bool(const std::string&)> instrument_gate_;
 };
 
 }  // namespace sse_strategy

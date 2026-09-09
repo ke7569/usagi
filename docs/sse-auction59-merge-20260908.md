@@ -40,24 +40,53 @@
    调用 decode/local_trading_date）。避免将来与 `sse_stream_processing` 重复定义。
 3. `auction59_sidecar`（sse/factors）与实盘逐字节一致，未动。
 
-## 主进程接入（预留、未接线）
+## 主进程接入（2026-09-09）
 
-按用户要求：当前不接入 `t0_sse_stream`/StreamProcessingCli，但保留 config 开关位。
-在 SSE 处理 profile 的 `prediction` 下预留可选对象：
+`t0_sse_stream` 和 `t0_sse_journal_predict` 共用的 processor 已接入
+`auction59_session`。同一份解码逐笔同时用于盘口和竞价计算，收到开盘结束状态
+S 及有效快照后，将 59 个因子直接交给 Snapshot 模型，不再读取 Auction59 CSV。
+旧 `snapshot_auction59_factors_path` 不再使用，配置可以删去该字段。
 
-```json
-"prediction": {
-  "...": "...",
-  "auction59": { "enabled": false }
-}
+程序可以在 09:15 前启动。09:25 或 09:30 的快照用于核对昨收和开盘价；
+09:25 至 09:30 之前还核对竞价成交量，09:30 起累计量可能包含连续交易，不做此比较。
+快照先到或 S 先到均可。59 个因子全部有效后冻结，不用零值补缺。
+
+静态价格直接复用 daily：`Close`、`HpUpperPrice`、`HpLowerPrice`。
+快照没有涨跌停价或上市日期；可选 `listing_date` / `is_ipo_first_day` 由 daily
+提供。缺少首日信息且触发既有首日价格范围特例时，该股票跳过 Auction59。
+普通股票无需为此另造静态 CSV。
+
+首次 09:30 后快照到达仍未就绪的股票，永久跳过当天 Snapshot，逐笔继续预热，
+09:35 后才向策略提供信号；没有快照时在 09:35 首笔逐笔确定降级。
+单股失败不拖住整个股票池。昨收冲突等公共静态错误同时禁止该股逐笔信号；
+策略在批末真正派发前重新检查，已缓存的旧预测也不能绕过这一限制。
+日志记录 `sse_auction59 code=... mode=tick_only reason=...` 或
+`mode=snapshot_and_tick reason=ready`；公共错误记录 `sse_prediction_gate ... mode=blocked`。
+
+默认启用在线竞价计算。处理 profile 中可显式设置
+`prediction.auction59.enabled=false`，整个运行只用逐笔；不设置则默认 true。
+旧版 profile 如带 `enabled:false`，需删除或改 true 才会运行 Snapshot。
+
+采集必须订阅逐笔和快照，并保留 09:15 起完整历史及顺序。
+金桥现有源为逐笔 `239.35.80.9:37109`、快照 `239.35.80.5:37105`，同一网卡
+`11.11.11.11`。`journal_capture_hardware.example.json` 已包含两条通道。
+09-08 的运行配置只有逐笔。09-09 已部署双频道 journal capture，实际逐笔与快照
+收包、硬件时间戳和落盘已在盘中确认；操作入口见
+[上海 journal 采集](operations/sse-journal-capture-live.md)。
+
+构建与回归：
+
+```sh
+cmake -S . -B build/sse-dev-auction-wire -DCMAKE_BUILD_TYPE=Release -DT0_BUILD_SZE_STREAM_PROCESSOR=OFF
+cmake --build build/sse-dev-auction-wire -j 6
+ctest --test-dir build/sse-dev-auction-wire --output-on-failure
 ```
 
-当前契约只接受 `enabled:false`；置 `true` 会抛
-“unsupported processing contract value”（`apps/StreamProcessingCli.h` 中
-`auction59_contract`）。将来接线时：把 auction59 runner/引擎改为库内服务，
-在 09:15-09:30 产出因子并喂给 snapshot auction59 模型路径，再放开该开关。
+新增 session/processor 测试覆盖原始竞价事件至模型预测、两种到达顺序、单位错误、
+缺少 S、按股降级、09:35 切换和公共静态冲突；CLI 测试覆盖无 CSV 的盘前启动。
+真实行情完整性及实际有效因子覆盖率须在相同入口消费当天行情后确认。
 
-## 运行
+## 独立 CSV 工具（离线使用，不是主程序前置步骤）
 
 ```sh
 cmake -S . -B build/sse-dev-auction -DCMAKE_BUILD_TYPE=Release
