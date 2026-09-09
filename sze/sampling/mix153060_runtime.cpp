@@ -28,30 +28,8 @@ const int64_t kCloseUs = 54000000000LL;
 const int64_t kTimeTriggerUs = 100000000LL;
 const int64_t kChangeMinVolume = 100;
 const int64_t kMaxChangeLocalGapUs = 10000;
-const int64_t kYoungAgeSeconds = 30;
+const double kYoungAgeSeconds = 30.0;
 const double kEpsilon = 1.0e-12;
-
-// Same approximation as sse-factor-opt-20260909: 2048 linear intervals
-// over [-4,4], clamped to the endpoint weights outside that interval.
-// The approximation changes factor values; it is not bitwise libm parity.
-struct FlowWeightTable {
-    static const int kIntervals = 2048;
-    double values[kIntervals + 1];
-    FlowWeightTable() {
-        for (int i = 0; i <= kIntervals; ++i)
-            values[i] = 1.0 - std::tanh(-4.0 + 8.0 * i / kIntervals);
-    }
-};
-
-double flow_weight(double x) {
-    static const FlowWeightTable table;
-    if (x <= -4.0) return table.values[0];
-    if (x >= 4.0) return table.values[FlowWeightTable::kIntervals];
-    const double position = (x + 4.0) * (FlowWeightTable::kIntervals / 8.0);
-    const int index = static_cast<int>(position);
-    const double fraction = position - index;
-    return table.values[index] + (table.values[index + 1] - table.values[index]) * fraction;
-}
 
 int64_t positive_mod(int64_t value, int64_t modulus) {
     int64_t result = value % modulus;
@@ -128,18 +106,18 @@ struct NativeOrder {
     bool buy;
     int tick;
     int64_t remaining;
-    int64_t insert_seconds;
+    int64_t insert_us;
 };
 
 struct NativeLevel {
     int tick;
     int64_t volume;
-    __int128 insert_sum_seconds;
+    __int128 insert_sum_us;
     int64_t young_volume;
     std::unordered_map<int64_t, NativeOrder> orders;
 
     explicit NativeLevel(int value = 0)
-        : tick(value), volume(0), insert_sum_seconds(0), young_volume(0), orders() {
+        : tick(value), volume(0), insert_sum_us(0), young_volume(0), orders() {
         orders.reserve(32);
     }
 };
@@ -215,14 +193,14 @@ struct Cut {
 
 class NativeBook {
 public:
-    NativeBook() : bids_(), asks_(), locators_(), young_entries_(), young_cutoff_seconds_(0) {}
+    NativeBook() : bids_(), asks_(), locators_(), young_entries_(), young_cutoff_us_(0) {}
 
     void clear() {
         bids_.clear();
         asks_.clear();
         locators_.clear();
         young_entries_.clear();
-        young_cutoff_seconds_ = 0;
+        young_cutoff_us_ = 0;
     }
 
     bool add(const OrderEvent& event) {
@@ -252,7 +230,7 @@ public:
         order.buy = event.buy;
         order.tick = tick;
         order.remaining = event.volume;
-        order.insert_seconds = event.exchange_time_us / 1000000LL;
+        order.insert_us = event.exchange_time_us;
         if (event.buy) {
             if (!add_to_side(&bids_, tick, order)) {
                 return false;
@@ -266,7 +244,7 @@ public:
         locator.buy = event.buy;
         locator.tick = tick;
         locators_[event.app_sequence] = locator;
-        young_entries_.push_back(AgeEntry{order.id, order.insert_seconds, order.buy, order.tick});
+        young_entries_.push_back(AgeEntry{order.id, order.insert_us, order.buy, order.tick});
         return true;
     }
 
@@ -344,7 +322,7 @@ public:
 private:
     struct AgeEntry {
         int64_t id;
-        int64_t insert_seconds;
+        int64_t insert_us;
         bool buy;
         int tick;
     };
@@ -356,18 +334,15 @@ private:
         const auto level = side.find(entry.tick);
         if (level == side.end()) return;
         const auto order = level->second.orders.find(entry.id);
-        if (order == level->second.orders.end() || order->second.insert_seconds != entry.insert_seconds) return;
+        if (order == level->second.orders.end() || order->second.insert_us != entry.insert_us) return;
         level->second.young_volume -= order->second.remaining;
     }
 
     void advance_age(int64_t now_us) {
         // Runtime validates nondecreasing exchange timestamps before book mutation.
-        // Quantize only order ages, not event ordering or sampling clocks.
-        // A quantized age of 30 seconds is young; 31 seconds is expired.
-        const int64_t cutoff = now_us / 1000000LL - kYoungAgeSeconds;
-        if (cutoff == young_cutoff_seconds_) return;
-        young_cutoff_seconds_ = cutoff;
-        while (!young_entries_.empty() && young_entries_.front().insert_seconds < young_cutoff_seconds_) {
+        // Exactly 30 seconds remains young; retain full microsecond precision.
+        young_cutoff_us_ = now_us - 30000000LL;
+        while (!young_entries_.empty() && young_entries_.front().insert_us < young_cutoff_us_) {
             const AgeEntry entry = young_entries_.front();
             if (entry.buy) expire(bids_, entry); else expire(asks_, entry);
             young_entries_.pop_front();
@@ -386,7 +361,7 @@ private:
         level.tick = tick;
         level.orders[order.id] = order;
         level.volume += order.remaining;
-        level.insert_sum_seconds += order.insert_seconds;
+        level.insert_sum_us += order.insert_us;
         level.young_volume += order.remaining;
         return true;
     }
@@ -442,9 +417,9 @@ private:
                                     : std::min(order.remaining, std::max<int64_t>(quantity, 0));
         order.remaining -= removed;
         level.volume -= removed;
-        if (order.insert_seconds >= young_cutoff_seconds_) level.young_volume -= removed;
+        if (order.insert_us >= young_cutoff_us_) level.young_volume -= removed;
         if (order.remaining <= 0) {
-            level.insert_sum_seconds -= order.insert_seconds;
+            level.insert_sum_us -= order.insert_us;
             level.orders.erase(order_it);
             locators_.erase(locator_it);
         }
@@ -458,7 +433,7 @@ private:
     SellMap asks_;
     std::unordered_map<int64_t, Locator> locators_;
     std::deque<AgeEntry> young_entries_;
-    int64_t young_cutoff_seconds_;
+    int64_t young_cutoff_us_;
 };
 
 // Helpers that work with the two differently ordered side maps without
@@ -489,7 +464,7 @@ struct Flow {
     double buy_filled_amount;
     double sell_filled_amount;
 
-    Flow() { (void)flow_weight(0.0); clear(); }
+    Flow() { clear(); }
 
     void clear() {
         turnover = 0.0;
@@ -532,7 +507,7 @@ struct Flow {
                                          : bench + 0.01;
                 if (raw_price < limit - 1.0e-6 && raw_price > 0.0 && bench > 0.0) {
                     positive_order_amount += volume *
-                        flow_weight((bench / raw_price - 1.0) * 100.0);
+                        (1.0 - std::tanh((bench / raw_price - 1.0) * 100.0));
                 }
             }
         } else {
@@ -548,7 +523,7 @@ struct Flow {
                                          : bench - 0.01;
                 if (raw_price > limit + 1.0e-6 && raw_price > 0.0 && bench > 0.0) {
                     negative_order_amount += volume *
-                        flow_weight((raw_price / bench - 1.0) * 100.0);
+                        (1.0 - std::tanh((raw_price / bench - 1.0) * 100.0));
                 }
             }
         }
@@ -1449,8 +1424,7 @@ void Runtime::Impl::fill_book_factors(const Cut& current,
         value.volume = level.volume;
         value.count = static_cast<int64_t>(level.orders.size());
         value.age_sum_us = static_cast<int64_t>(
-            (static_cast<__int128>(current.exchange_time_us / 1000000LL) * value.count -
-             level.insert_sum_seconds) * 1000000LL);
+            static_cast<__int128>(current.exchange_time_us) * value.count - level.insert_sum_us);
         bids.push_back(value);
     });
     book.for_each_level(false, [&asks, &current](const NativeLevel& level) {
@@ -1459,8 +1433,7 @@ void Runtime::Impl::fill_book_factors(const Cut& current,
         value.volume = level.volume;
         value.count = static_cast<int64_t>(level.orders.size());
         value.age_sum_us = static_cast<int64_t>(
-            (static_cast<__int128>(current.exchange_time_us / 1000000LL) * value.count -
-             level.insert_sum_seconds) * 1000000LL);
+            static_cast<__int128>(current.exchange_time_us) * value.count - level.insert_sum_us);
         asks.push_back(value);
     });
     const double span_10 = mid_tick * 0.1;

@@ -5,11 +5,6 @@ Reference: `sse-factor-opt-20260909` at
 Shenzhen baseline: `467e1c1` (the in-process Paper OMS shadow revision).
 Implementation and verification use a separate checkout and build directory.
 
-**Current branch policy:** the requested follow-up now quantizes order ages to
-seconds and approximates the two order-flow `tanh` weights. The exact-age results
-below describe `dff59ae`, not bitwise parity of the current follow-up. See
-[Seconds and interpolation follow-up](#seconds-and-interpolation-follow-up).
-
 ## What Shanghai changed
 
 The main speedup comes from removing per-sample work proportional to the number
@@ -41,7 +36,7 @@ Relevant upstream files:
 - `sse/factors/sse_tick_factors.cpp`
 - `tests/sse/sse_book_incremental_test.cpp`
 
-## Initial exact-age implementation (dff59ae)
+## Shenzhen implementation
 
 Shenzhen already accumulates flow incrementally. Its expensive work was the
 full-order age scan inside `fill_book_factors()` and a second scan for young
@@ -63,7 +58,7 @@ This preserves the formula but changes floating-point addition order. Therefore
 the probe compares all float factor values and sample identities individually;
 no precision relaxation or approximate `tanh` was added to the production code.
 
-## Initial exact-age measurement and reproduction
+## Measurement and reproduction
 
 Both variants use GCC 4.8.5, `-O3 -march=x86-64 -mtune=generic
 -ffp-contract=off`, sequentially on Shenzhen CPU 44. EventTiming instrumentation
@@ -145,90 +140,3 @@ end. No SHM attachment or execution backend is used by the probe.
 Focused aggregate/reference tests cover 30 seconds +/- 1 microsecond, partial
 fills, cancellation, empty-level reuse, reset, and epoch sum overflow. The 45
 registered CTest cases pass, including the real-model sequence golden test.
-
-## Seconds and interpolation follow-up
-
-This follow-up was explicitly requested after reviewing the exact-age results.
-Only order ages are quantized: both insertion and current query timestamps are
-floored independently to seconds, and age is their integer difference. The
-public factor calculations still receive age sums expressed in microseconds,
-now as multiples of 1,000,000. Sampling clocks, event sequence ordering and model
-weights retain their existing representation. This is a deliberate numerical
-change; it does discard fractional-second age precision.
-
-An integer age of 30 remains young and 31 expires. For example, an order entered
-at `09:31:00.750000` is still young at `09:31:30.999999`, but expires at
-`09:31:31.000000`. Same-second updates avoid repeatedly walking the expiry queue.
-The focused test checks both sides of this boundary, partial fills, cancellation,
-stale entries, level reuse, reset, and insertion-time aggregate arithmetic.
-
-The two order-flow price weights use a shared 2049-value table (2048 linear
-intervals) for `1 - tanh(x)` on `[-4,4]`. Outside the interval, weights clamp to
-the table endpoint, matching the Shanghai implementation. `Flow` initializes the
-table during runtime construction, before incoming market events. Model
-activations and all other math functions are unaffected.
-
-The dense unit check covers 160,001 points over `[-8,8]`, including monotonicity,
-symmetry and endpoint behavior. Weight absolute error is bounded in that check
-by `1.5e-6` inside the interval and `6.71e-4` outside. These are weight errors,
-not bounds on final factor or recurrent-model prediction errors. Endpoint
-saturation is a separate approximation from interpolation and is not claimed
-to be invisible at float precision.
-
-The expected changed factor indices (zero based) are 29, 30, 37 and 38 for age
-statistics, and 43 and 44 for the order-flow weights. The complete-day comparison
-checks identities and all 50 factor columns, then runs both sequences through
-the same real model with independent recurrent states per instrument.
-
-To reproduce the prediction comparison after producing the two probe CSV files:
-
-```sh
-cmake --build build/verify --target sze_factor_model_compare
-taskset -c 44 build/verify/sze_factor_model_compare exact.csv approximate.csv MODEL
-```
-
-The prior model golden test verifies the model implementation, not equivalence
-of approximate input factors. Numeric differences from the new policy must be
-reported independently. No production service is replaced by this branch push.
-
-### Follow-up measurement (2026-09-10)
-
-Full-day September 9 replay on CPU44 again consumed 277,910,376 records and
-2,033,382 selected events. Both versions produced 89,167 samples with identical
-identities. Of 4,458,350 factor values, 368,889 changed, exclusively in the six
-expected columns. All values were finite. The separate real-model sequence test
-used the same weights and independent recurrent state per instrument.
-
-| Metric | Exact-age dff59ae | Seconds + interpolation |
-|---|---:|---:|
-| Factor sampling p50 | 4.55 us | 4.60 us |
-| Factor sampling p99 | 17.43 us | 18.27 us |
-| Book mutation p50 | 0.36 us | 0.36 us |
-| Runtime callback p50 | 0.93 us | 0.93 us |
-| Runtime callback p99 | 6.71 us | 6.85 us |
-| Runtime callback mean | 1.215 us | 1.236 us |
-
-This run does not establish an incremental speedup from the approximations.
-The main speedup remains the earlier incremental age aggregation.
-
-| Factor index | Changed values | Maximum absolute error |
-|---:|---:|---:|
-| 29 | 72,829 | 1.51015532 |
-| 30 | 89,153 | 0.77888703 |
-| 37 | 89,122 | 0.00071973 |
-| 38 | 34,632 | 1.81511128 |
-| 43 | 42,564 | 0.00369430 |
-| 44 | 40,589 | 0.00355476 |
-
-Prediction absolute error: median 0.00497591, P99 0.29199076, maximum
-1.13925934, mean 0.02160206, RMSE 0.06062071. There were 497 sign changes among
-89,167 predictions (about 0.557%). Units are raw model output, not price units;
-sign changes do not themselves prove a trading decision changes. Baseline
-maximum absolute prediction was 15.51202011. No per-change attribution between
-age rounding and the LUT is claimed by this combined experiment.
-
-All 45 registered tests passed. The approximation bounds test characterizes
-the lookup weights, and the model-impact report characterizes observed output
-drift; neither declares the drift acceptable for live execution. Both requested
-changes are enabled on this candidate branch, with production services untouched.
-Machine-readable evidence: `benchmarks/sze-factor-approx-20260910.json`.
