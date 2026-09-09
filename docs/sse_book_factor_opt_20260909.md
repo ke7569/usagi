@@ -46,8 +46,10 @@ g++ -std=c++11 -O2 -Wall -Wextra -Werror -I. \
 ```
 
 The complete `sse_stream_processing` target also built successfully with
-`make -j4`. The old and new downstream benchmark checksums both were
-`71890.4863182008`.
+`make -j4`. The pre-seconds baseline checksum was
+`71890.4863182008`; the seconds/lazy-age and streaming-flow path is
+`71890.9272733331` (the documented relative difference is from the deliberate
+seconds precision change).
 
 ## Controlled benchmark
 
@@ -99,6 +101,47 @@ not the sum of component percentiles. The old/new real-model fixture checksum
 changed from `71890.4863` to `71890.9273`, a relative difference of about
 `0.00061%`; serial and parallel pipeline outputs remained exactly equal. The
 seconds boundary test and all 50 integrated CTest targets passed.
+
+## Streaming flow and zero-copy full-depth aggregation
+
+The next bottleneck was the flow loop inside `FactorState::build()`. For a
+520-record window, the loop scanned every retained event and made roughly 300
+price-distance `tanh` calls. A controlled split measured the flow scan at about
+19.5µs; the rest of the factor build was about 12.6µs.
+
+Flow is now accumulated as the book applies each add/trade. The book keeps the
+raw order/fill quantities and model-share flow totals for positive, negative,
+market, and trade flow. The factor path reads those counters in constant time;
+the event vector is still retained for `has_flow` and compatibility consumers,
+but it is no longer rescanned. The hot price weight uses a 2048-entry linear
+interpolation table for `1 - tanh(x)` on `[-4,4]`, with saturated endpoints
+outside the interval. The table is initialized when an `OrderBook` is created,
+so the first market update does not pay the initialization cost.
+
+Full-depth factor construction now visits the ordered price maps directly and
+feeds the existing one-pass band accumulator. The public `full_depth()` vector
+API remains available, while the factor path avoids copying both sides into
+temporary vectors. This also keeps the fixed-depth and distance-band formulas
+on one pass over each side.
+
+On the same CPU56 synthetic fixture, the representative 50,000-order,
+520-record case is:
+
+| Component | Seconds/lazy-age path | Streaming flow + direct depth |
+|---|---:|---:|
+| Order-book updates | ~106.9µs | ~118.5µs |
+| Factor build | ~32.0µs | ~9.3µs |
+| Tick inference | ~85.8µs | ~85.6µs |
+| Combined path | ~224.9µs | ~213.7µs |
+
+The extra book time contains the streaming flow arithmetic; the combined path
+is lower because the former 19.5µs event scan and the vector materialization
+are gone. The standalone diagnostic `full_depth()` API remains around 4.75µs
+for 100 levels; factor construction no longer pays that vector-copy cost.
+The real-model checksum remains `71890.9272733331`, and serial/parallel
+pipeline outputs remain exactly equal. The full 50-target CTest run passes.
+The measured JSON is in
+`docs/benchmarks/sse-flow-streaming-20260909.json`.
 
 ## CMake integration fragment
 

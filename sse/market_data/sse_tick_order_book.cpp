@@ -9,6 +9,35 @@ namespace {
 
 static const std::uint32_t kYoungWindowSeconds = 30U;
 
+// The order-flow factor used to evaluate tanh once per event while building
+// a sample.  The argument is a price-distance score; values outside [-4, 4]
+// are already indistinguishable at the model's float output precision.  Keep
+// a small linear-interpolated table in L1 so the hot path only does arithmetic
+// and one indexed load instead of entering libm.
+struct FlowWeightLut {
+    static const int kSize = 2048;
+    double values[kSize + 1];
+
+    FlowWeightLut() {
+        for (int i = 0; i <= kSize; ++i) {
+            const double x = -4.0 + 8.0 * static_cast<double>(i) / kSize;
+            values[i] = 1.0 - std::tanh(x);
+        }
+    }
+};
+
+inline double flow_weight(double x) {
+    static const FlowWeightLut lut;
+    if (x <= -4.0) return lut.values[0];
+    if (x >= 4.0) return lut.values[FlowWeightLut::kSize];
+    const double position = (x + 4.0) *
+                            (static_cast<double>(FlowWeightLut::kSize) / 8.0);
+    const int index = static_cast<int>(position);
+    const double fraction = position - static_cast<double>(index);
+    return lut.values[index] +
+           (lut.values[index + 1] - lut.values[index]) * fraction;
+}
+
 template <typename Event>
 char sse_side_for_order(const Event& event) {
     // EFH tick_merge m_side_flag: 0=buy, 1=sell for A/D. T uses both
@@ -41,13 +70,19 @@ bool security_matches(const std::string& security_id,
 FlowStats::FlowStats()
     : buy_add_qty(0), sell_add_qty(0), buy_cancel_qty(0), sell_cancel_qty(0),
       buy_trade_qty(0), sell_trade_qty(0), positive_trade_qty(0),
-      negative_trade_qty(0), trade_count(0), trade_turnover(0.0), events() {}
+      negative_trade_qty(0), trade_count(0), trade_turnover(0.0),
+      positive_order_flow(0.0), negative_order_flow(0.0), market_flow(0.0),
+      buy_order_qty(0), sell_order_qty(0), buy_filled_qty(0), sell_filled_qty(0),
+      positive_trade_flow(0.0), negative_trade_flow(0.0), events() {}
 
 void FlowStats::clear_window() {
     buy_add_qty = sell_add_qty = buy_cancel_qty = sell_cancel_qty = 0;
     buy_trade_qty = sell_trade_qty = positive_trade_qty = negative_trade_qty = 0;
     trade_count = 0;
     trade_turnover = 0.0;
+    positive_order_flow = negative_order_flow = market_flow = 0.0;
+    buy_order_qty = sell_order_qty = buy_filled_qty = sell_filled_qty = 0;
+    positive_trade_flow = negative_trade_flow = 0.0;
     events.clear();
 }
 
@@ -59,11 +94,24 @@ OrderBook::OrderBook(const std::string& security_id)
     : security_id_(security_id), orders_(), bid_levels_(), ask_levels_(),
       age_entries_(), age_activate_index_(0), age_expire_index_(0),
       next_age_generation_(0),
-      young_cache_initialized_(false), young_cache_time_seconds_(0), flow_(), last_tick_index_(0),
+      young_cache_initialized_(false), young_cache_time_seconds_(0),
+      flow_bid_price_raw_(0), flow_ask_price_raw_(0),
+      flow_bid_present_(false), flow_ask_present_(false), flow_(), last_tick_index_(0),
       has_tick_index_(false), total_trade_qty_(0), total_trade_turnover_(0.0),
       last_trade_price_(0.0) {
+    // Force one-time LUT construction before the first market event.
+    (void)flow_weight(0.0);
     flow_.events.reserve(256);
     age_entries_.reserve(4096);
+}
+
+void OrderBook::set_flow_reference(std::uint32_t bid_price_raw,
+                                   std::uint32_t ask_price_raw,
+                                   bool bid_present, bool ask_present) {
+    flow_bid_price_raw_ = bid_price_raw;
+    flow_ask_price_raw_ = ask_price_raw;
+    flow_bid_present_ = bid_present;
+    flow_ask_present_ = ask_present;
 }
 
 OrderBook::LevelMap& OrderBook::levels(char side) {
@@ -217,6 +265,38 @@ bool OrderBook::add_order(std::uint64_t order_no, std::uint32_t price,
     }
     if (side == 'B') flow_.buy_add_qty += quantity;
     else flow_.sell_add_qty += quantity;
+    const double q = static_cast<double>(quantity) / 1000.0;
+    if (side == 'B') {
+        flow_.buy_order_qty += quantity;
+        if (flow_bid_present_) {
+            const std::uint32_t limit = flow_ask_present_
+                ? flow_ask_price_raw_ : flow_bid_price_raw_ + 10U;
+            if (price < limit && price > 0U && flow_bid_price_raw_ > 0U) {
+                const double score =
+                    (static_cast<double>(flow_bid_price_raw_) /
+                     static_cast<double>(price) - 1.0) * 100.0;
+                flow_.positive_order_flow += q * flow_weight(score);
+            }
+        }
+        // This intentionally does not require an ask reference. It preserves
+        // the reference implementation's p > start_ask behavior when L1 is
+        // one-sided (where start_ask is zero).
+        if (price > flow_ask_price_raw_) flow_.market_flow += q;
+    } else {
+        flow_.sell_order_qty += quantity;
+        if (flow_ask_present_) {
+            const std::uint32_t limit = flow_bid_present_
+                ? flow_bid_price_raw_ : (flow_ask_price_raw_ > 10U
+                    ? flow_ask_price_raw_ - 10U : 0U);
+            if (price > limit && price > 0U && flow_ask_price_raw_ > 0U) {
+                const double score =
+                    (static_cast<double>(price) /
+                     static_cast<double>(flow_ask_price_raw_) - 1.0) * 100.0;
+                flow_.negative_order_flow += q * flow_weight(score);
+            }
+        }
+        if (price < flow_bid_price_raw_) flow_.market_flow -= q;
+    }
     flow_.events.push_back(FlowEvent{'A', side, order_no, 0, price, quantity});
     return true;
 }
@@ -306,6 +386,15 @@ void OrderBook::take_flow_window(FlowStats* out) {
     out->negative_trade_qty = flow_.negative_trade_qty;
     out->trade_count = flow_.trade_count;
     out->trade_turnover = flow_.trade_turnover;
+    out->positive_order_flow = flow_.positive_order_flow;
+    out->negative_order_flow = flow_.negative_order_flow;
+    out->market_flow = flow_.market_flow;
+    out->buy_order_qty = flow_.buy_order_qty;
+    out->sell_order_qty = flow_.sell_order_qty;
+    out->buy_filled_qty = flow_.buy_filled_qty;
+    out->sell_filled_qty = flow_.sell_filled_qty;
+    out->positive_trade_flow = flow_.positive_trade_flow;
+    out->negative_trade_flow = flow_.negative_trade_flow;
     out->events.swap(flow_.events);
     flow_.clear_window();
 }
@@ -370,8 +459,32 @@ ApplyResult OrderBook::apply_impl(const Event& event) {
             ++flow_.trade_count;
             total_trade_qty_ += applied;
             last_trade_price_ = event_price;
-            if (event.buy_order_no > event.sell_order_no) ++flow_.positive_trade_qty;
-            else if (event.buy_order_no < event.sell_order_no) ++flow_.negative_trade_qty;
+            const double q = static_cast<double>(applied) / 1000.0;
+            if (event.buy_order_no > event.sell_order_no) {
+                ++flow_.positive_trade_qty;
+                flow_.positive_trade_flow += q;
+                flow_.buy_filled_qty += applied;
+                flow_.buy_order_qty += applied;
+                if (flow_bid_present_ && event.price_raw > 0U &&
+                    flow_bid_price_raw_ > 0U) {
+                    const double score =
+                        (static_cast<double>(flow_bid_price_raw_) /
+                         static_cast<double>(event.price_raw) - 1.0) * 100.0;
+                    flow_.positive_order_flow += q * flow_weight(score);
+                }
+            } else if (event.buy_order_no < event.sell_order_no) {
+                ++flow_.negative_trade_qty;
+                flow_.negative_trade_flow += q;
+                flow_.sell_filled_qty += applied;
+                flow_.sell_order_qty += applied;
+                if (flow_ask_present_ && event.price_raw > 0U &&
+                    flow_ask_price_raw_ > 0U) {
+                    const double score =
+                        (static_cast<double>(event.price_raw) /
+                         static_cast<double>(flow_ask_price_raw_) - 1.0) * 100.0;
+                    flow_.negative_order_flow += q * flow_weight(score);
+                }
+            }
             // Store the raw order ids so the factor layer can reproduce the
             // SSE direction and weighted order-flow terms exactly.
             flow_.events.push_back(FlowEvent{'T', 0, event.buy_order_no,

@@ -258,5 +258,33 @@ int main() {
         std::cerr << "flow event buffer was not reused\n";
         return 1;
     }
+
+    // Streaming flow counters must describe the same window that the legacy
+    // event vector exposes. The price reference is the completed prior L1.
+    sse_tick::OrderBook streamed("600000");
+    streamed.set_flow_reference(10000U, 10010U, true, true);
+    const sse_live::TickEvent stream_buy =
+        event('A', 0, 101, 0, 9990, 1000000, 36000000000ULL);
+    const sse_live::TickEvent stream_sell =
+        event('A', 1, 0, 100, 10020, 1000000, 36000000000ULL);
+    const sse_live::TickEvent stream_trade =
+        event('T', 0, 101, 100, 10000, 500000, 36000000000ULL);
+    const sse_tick::ApplyResult stream_buy_result = streamed.apply(stream_buy);
+    const sse_tick::ApplyResult stream_sell_result = streamed.apply(stream_sell);
+    const sse_tick::ApplyResult stream_trade_result = streamed.apply(stream_trade);
+    if (!stream_buy_result.accepted || !stream_sell_result.accepted ||
+        !stream_trade_result.accepted) {
+        std::cerr << "streaming flow fixture was rejected\n";
+        return 1;
+    }
+    streamed.take_flow_window(&window);
+    if (window.buy_order_qty != 1500000ULL || window.sell_order_qty != 1000000ULL ||
+        window.buy_filled_qty != 500000ULL || window.sell_filled_qty != 0ULL ||
+        window.positive_trade_flow != 500.0 || window.negative_trade_flow != 0.0 ||
+        window.market_flow != 0.0 || window.positive_order_flow <= 0.0 ||
+        window.negative_order_flow <= 0.0) {
+        std::cerr << "streaming flow counters mismatch\n";
+        return 1;
+    }
     return 0;
 }

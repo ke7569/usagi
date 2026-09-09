@@ -152,9 +152,51 @@ Band make_top_band(const std::vector<Level>& levels, std::size_t max_levels) {
 }
 
 // Aggregate all distance bands and top-N statistics in one ordered pass. The
-// old implementation rescanned each side six times and then rescanned it for
-// maximum/young-order/hermes terms; keeping these accumulators together makes
-// the common full-depth path linear with a small constant.
+// same visitor is used for a materialized vector and for the order book's
+// zero-copy level traversal.
+inline void aggregate_level(SideBands* result, const Level& level, bool ask,
+                            double mid, double max01, double max05,
+                            double max10, std::size_t index) {
+    const double p = price(level);
+    const double q = static_cast<double>(level.quantity);
+    if (index == 0U) add_level_to_band(level, &result->top1.volume,
+                                       &result->top1.count, &result->top1.time_sum,
+                                       &result->top1.amount, &result->top1.young_volume);
+    if (index < 5U) add_level_to_band(level, &result->top5.volume,
+                                      &result->top5.count, &result->top5.time_sum,
+                                      &result->top5.amount, &result->top5.young_volume);
+    if (q > result->max_volume) {
+        result->max_volume = q;
+        result->max_price = p;
+    }
+    const double d = ask ? p - mid : mid - p;
+    // Distance bands use strict bounds; young/hermes use inclusive bounds.
+    if (d < max01) {
+        add_level_to_band(level, &result->dist01.volume, &result->dist01.count,
+                          &result->dist01.time_sum, &result->dist01.amount,
+                          &result->dist01.young_volume);
+    }
+    if (d >= 0.0 && d <= max01)
+        result->young_weighted += static_cast<double>(level.young_quantity) *
+                                 (1.0 - d / max01);
+    if (d < max05) {
+        add_level_to_band(level, &result->dist05.volume, &result->dist05.count,
+                          &result->dist05.time_sum, &result->dist05.amount,
+                          &result->dist05.young_volume);
+    }
+    if (d >= 0.0 && d <= max05) {
+        const double w = (1.0 - d / max05) * q;
+        if (w > 0.0) {
+            result->fix_dot += w * p;
+            result->fix_weight += w;
+        }
+    }
+    if (d < max10)
+        add_level_to_band(level, &result->dist10.volume, &result->dist10.count,
+                          &result->dist10.time_sum, &result->dist10.amount,
+                          &result->dist10.young_volume);
+}
+
 SideBands aggregate_side(const std::vector<Level>& levels, bool ask,
                          double mid) {
     SideBands result;
@@ -162,48 +204,22 @@ SideBands aggregate_side(const std::vector<Level>& levels, bool ask,
     const double max01 = mid * 0.01;
     const double max05 = mid * 0.05;
     const double max10 = mid * 0.10;
-    for (std::size_t i = 0; i < levels.size(); ++i) {
-        const Level& level = levels[i];
-        const double p = price(level);
-        const double q = static_cast<double>(level.quantity);
-        if (i == 0U) add_level_to_band(level, &result.top1.volume,
-                                       &result.top1.count, &result.top1.time_sum,
-                                       &result.top1.amount, &result.top1.young_volume);
-        if (i < 5U) add_level_to_band(level, &result.top5.volume,
-                                      &result.top5.count, &result.top5.time_sum,
-                                      &result.top5.amount, &result.top5.young_volume);
-        if (q > result.max_volume) {
-            result.max_volume = q;
-            result.max_price = p;
-        }
-        const double d = ask ? p - mid : mid - p;
-        // make_band uses strict distance bounds; young/hermes use inclusive
-        // bounds (their reference loops break only when d > max).
-        if (d < max01) {
-            add_level_to_band(level, &result.dist01.volume, &result.dist01.count,
-                              &result.dist01.time_sum, &result.dist01.amount,
-                              &result.dist01.young_volume);
-        }
-        if (d >= 0.0 && d <= max01)
-            result.young_weighted += static_cast<double>(level.young_quantity) *
-                                     (1.0 - d / max01);
-        if (d < max05) {
-            add_level_to_band(level, &result.dist05.volume, &result.dist05.count,
-                              &result.dist05.time_sum, &result.dist05.amount,
-                              &result.dist05.young_volume);
-        }
-        if (d >= 0.0 && d <= max05) {
-            const double w = (1.0 - d / max05) * q;
-            if (w > 0.0) {
-                result.fix_dot += w * p;
-                result.fix_weight += w;
-            }
-        }
-        if (d < max10)
-            add_level_to_band(level, &result.dist10.volume, &result.dist10.count,
-                              &result.dist10.time_sum, &result.dist10.amount,
-                              &result.dist10.young_volume);
-    }
+    for (std::size_t i = 0; i < levels.size(); ++i)
+        aggregate_level(&result, levels[i], ask, mid, max01, max05, max10, i);
+    return result;
+}
+
+SideBands aggregate_side(OrderBook& book, char side, bool ask,
+                         std::uint64_t now_micros, double mid) {
+    SideBands result;
+    if (mid <= 0.0) return result;
+    const double max01 = mid * 0.01;
+    const double max05 = mid * 0.05;
+    const double max10 = mid * 0.10;
+    book.for_each_full_depth(side, now_micros,
+        [&](const Level& level, std::size_t index) {
+            aggregate_level(&result, level, ask, mid, max01, max05, max10, index);
+        });
     return result;
 }
 
@@ -482,17 +498,6 @@ FactorRow FactorState::build(OrderBook& book, std::uint64_t now_micros,
     row.values[18] = static_cast<float>(safe_div(
         current_turnover - previous_turnover, top5_turnover_base));
 
-    // Reconstruct the window flow using the start-of-window L1 prices, as in
-    // the C++/C# reference implementation. SSE T carries both order ids and
-    // therefore contributes to both fill and order-flow denominators.
-    double positive_order = 0.0, negative_order = 0.0, market_flow = 0.0;
-    double cancel_buy = 0.0, cancel_sell = 0.0, positive_trade = 0.0, negative_trade = 0.0;
-    double buy_order = 0.0, sell_order = 0.0, buy_filled = 0.0, sell_filled = 0.0;
-    const double start_bid = have_previous_ ? price(previous_.bids[0]) : bp;
-    const double start_ask = have_previous_ ? price(previous_.asks[0]) : ap;
-    const bool start_bid_present = have_previous_ && previous_.bids[0].quantity > 0;
-    const bool start_ask_present = have_previous_ && previous_.asks[0].quantity > 0;
-
     if (have_previous_ && previous_.two_sided && two_sided) {
         const double current_volume = snapshot_volume >= 0.0 ? snapshot_volume
                                                               : static_cast<double>(book.total_trade_qty());
@@ -510,43 +515,20 @@ FactorRow FactorState::build(OrderBook& book, std::uint64_t now_micros,
                 std::sqrt(std::max(0.0, free_volume * (0.5 - r))));
         }
     }
-    for (std::size_t i = 0; i < flow.events.size(); ++i) {
-        const FlowEvent& event = flow.events[i];
-        // EFH tick_merge quantity is 1000 times the model's share unit.
-        const double q = static_cast<double>(event.quantity) / 1000.0;
-        const double p = static_cast<double>(event.price_raw) / 1000.0;
-        if (event.kind == 'A') {
-            if (event.side == 'B') {
-                buy_order += q;
-                if (start_bid_present) {
-                    const double limit = start_ask_present ? start_ask : start_bid + 0.01;
-                    if (p < limit - 1e-6 && p > 0.0 && start_bid > 0.0)
-                        positive_order += q * (1.0 - std::tanh((start_bid / p - 1.0) * 100.0));
-                }
-                if (p > start_ask + 1e-6) market_flow += q;
-            } else if (event.side == 'S') {
-                sell_order += q;
-                if (start_ask_present) {
-                    const double limit = start_bid_present ? start_bid : start_ask - 0.01;
-                    if (p > limit + 1e-6 && p > 0.0 && start_ask > 0.0)
-                        negative_order += q * (1.0 - std::tanh((p / start_ask - 1.0) * 100.0));
-                }
-                if (p < start_bid - 1e-6) market_flow -= q;
-            }
-        } else if (event.kind == 'D') {
-            if (event.side == 'B') cancel_buy += q; else if (event.side == 'S') cancel_sell += q;
-        } else if (event.kind == 'T') {
-            if (event.order_no > event.other_order_no) {
-                positive_trade += q; buy_filled += q; buy_order += q;
-                if (start_bid_present && p > 0.0 && start_bid > 0.0)
-                    positive_order += q * (1.0 - std::tanh((start_bid / p - 1.0) * 100.0));
-            } else if (event.order_no < event.other_order_no) {
-                negative_trade += q; sell_filled += q; sell_order += q;
-                if (start_ask_present && p > 0.0 && start_ask > 0.0)
-                    negative_order += q * (1.0 - std::tanh((p / start_ask - 1.0) * 100.0));
-            }
-        }
-    }
+    // Flow is accumulated at order-book update time. This keeps the factor
+    // build independent of the number of ticks in the window and removes the
+    // per-sample event scan and libm tanh calls from the prediction path.
+    const double positive_order = flow.positive_order_flow;
+    const double negative_order = flow.negative_order_flow;
+    const double market_flow = flow.market_flow;
+    const double cancel_buy = static_cast<double>(flow.buy_cancel_qty) / 1000.0;
+    const double cancel_sell = static_cast<double>(flow.sell_cancel_qty) / 1000.0;
+    const double positive_trade = flow.positive_trade_flow;
+    const double negative_trade = flow.negative_trade_flow;
+    const double buy_order = static_cast<double>(flow.buy_order_qty) / 1000.0;
+    const double sell_order = static_cast<double>(flow.sell_order_qty) / 1000.0;
+    const double buy_filled = static_cast<double>(flow.buy_filled_qty) / 1000.0;
+    const double sell_filled = static_cast<double>(flow.sell_filled_qty) / 1000.0;
     if (have_free_share_) {
         const double bench = free_share_;
         row.values[21] = static_cast<float>(positive_order / bench);
@@ -564,13 +546,14 @@ FactorRow FactorState::build(OrderBook& book, std::uint64_t now_micros,
         row.values[31] = static_cast<float>(safe_div(buy_cfr - sell_cfr, buy_cfr + sell_cfr + 1.0));
     }
 
-    book.full_depth('B', now_micros, &full_bids_);
-    book.full_depth('S', now_micros, &full_asks_);
-    const bool full_valid = two_sided && !full_bids_.empty() && !full_asks_.empty();
+    // Aggregate directly from the ordered level maps. Materializing both
+    // sides into vectors here used to cost roughly 5µs per sample before the
+    // fixed-depth formulas even ran.
+    const bool full_valid = two_sided;
     if (full_valid) {
-        const double full_mid = (price(full_bids_[0]) + price(full_asks_[0])) * 0.5;
-        const SideBands bid = aggregate_side(full_bids_, false, full_mid);
-        const SideBands ask = aggregate_side(full_asks_, true, full_mid);
+        const double full_mid = (price(bids[0]) + price(asks[0])) * 0.5;
+        const SideBands bid = aggregate_side(book, 'B', false, now_micros, full_mid);
+        const SideBands ask = aggregate_side(book, 'S', true, now_micros, full_mid);
         const Band& bid01 = bid.dist01;
         const Band& ask01 = ask.dist01;
         const Band& bid05 = bid.dist05;
@@ -601,9 +584,9 @@ FactorRow FactorState::build(OrderBook& book, std::uint64_t now_micros,
         row.values[48] = static_cast<float>(safe_div(ask.young_weighted -
             bid.young_weighted, ask.young_weighted + bid.young_weighted));
         const double effective_bid = bid.fix_weight > 0.0 ? bid.fix_dot / bid.fix_weight
-                                                           : price(full_bids_[0]);
+                                                           : price(bids[0]);
         const double effective_ask = ask.fix_weight > 0.0 ? ask.fix_dot / ask.fix_weight
-                                                           : price(full_asks_[0]);
+                                                           : price(asks[0]);
         const double hermes = (effective_bid + effective_ask) * 0.5;
         row.values[49] = static_cast<float>(hermes > 0.0
             ? std::max(-5.0, std::min(5.0, (hermes / full_mid - 1.0) * 1000.0)) : 0.0);
@@ -623,6 +606,14 @@ FactorRow FactorState::build(OrderBook& book, std::uint64_t now_micros,
     for (std::size_t i=0;i<10;++i) { current.bids[i]=bids[i]; current.asks[i]=asks[i]; }
     previous_ = current;
     have_previous_ = true;
+    // The next window starts from this completed sample's L1. The order book
+    // owns the streaming flow accumulator, so keep the reference update on
+    // the same owner thread as apply() and take_flow_window().
+    book.set_flow_reference(
+        bids[0].price_raw > 0 ? static_cast<std::uint32_t>(bids[0].price_raw) : 0U,
+        asks[0].price_raw > 0 ? static_cast<std::uint32_t>(asks[0].price_raw) : 0U,
+        two_sided && bids[0].quantity > 0,
+        two_sided && asks[0].quantity > 0);
     return row;
 }
 

@@ -57,6 +57,17 @@ struct FlowStats {
     std::uint64_t negative_trade_qty;
     std::uint64_t trade_count;
     double trade_turnover;
+    // These are accumulated while ticks enter the book. They use the same
+    // model-share units as the factor code, so build() does not rescan events.
+    double positive_order_flow;
+    double negative_order_flow;
+    double market_flow;
+    std::uint64_t buy_order_qty;
+    std::uint64_t sell_order_qty;
+    std::uint64_t buy_filled_qty;
+    std::uint64_t sell_filled_qty;
+    double positive_trade_flow;
+    double negative_trade_flow;
     std::vector<FlowEvent> events;
     FlowStats();
     void clear_window();
@@ -77,9 +88,20 @@ public:
 
     ApplyResult apply(const sse_live::TickEvent& event);
     ApplyResult apply(const sse_live::DecodedTick& event);
+    // Sets the start-of-window L1 reference used by streamed order-flow
+    // factors. The next flow window is accumulated against this reference.
+    void set_flow_reference(std::uint32_t bid_price_raw,
+                            std::uint32_t ask_price_raw,
+                            bool bid_present, bool ask_present);
     bool snapshot(Level* bids, Level* asks, std::size_t depth) const;
     bool full_depth(char side, std::uint64_t now_micros,
                     std::vector<Level>* levels) const;
+    // Visit the current ordered levels without materializing a temporary
+    // vector. Factor aggregation uses this path on every sample; the vector
+    // API above remains for diagnostics and external consumers.
+    template <typename Visitor>
+    bool for_each_full_depth(char side, std::uint64_t now_micros,
+                             Visitor visitor) const;
     // The pointer overload lets a consumer retain and reuse its FlowStats
     // event buffer across windows. The return-by-value API remains available
     // for existing callers.
@@ -147,6 +169,10 @@ private:
     std::uint32_t next_age_generation_;
     mutable bool young_cache_initialized_;
     mutable std::uint32_t young_cache_time_seconds_;
+    std::uint32_t flow_bid_price_raw_;
+    std::uint32_t flow_ask_price_raw_;
+    bool flow_bid_present_;
+    bool flow_ask_present_;
     FlowStats flow_;
     std::uint64_t last_tick_index_;
     bool has_tick_index_;
@@ -156,5 +182,33 @@ private:
 };
 
 }  // namespace sse_tick
+
+template <typename Visitor>
+bool sse_tick::OrderBook::for_each_full_depth(char side,
+                                              std::uint64_t now_micros,
+                                              Visitor visitor) const {
+    if (side != 'B' && side != 'S') return false;
+    refresh_young(now_micros);
+    const LevelMap& side_levels = levels(side);
+    std::size_t index = 0;
+    if (side == 'B') {
+        for (LevelMap::const_reverse_iterator it = side_levels.rbegin();
+             it != side_levels.rend(); ++it, ++index) {
+            visitor(Level{static_cast<std::int64_t>(it->first),
+                          it->second.quantity, it->second.order_count,
+                          it->second.add_time_sum_micros,
+                          it->second.young_quantity}, index);
+        }
+    } else {
+        for (LevelMap::const_iterator it = side_levels.begin();
+             it != side_levels.end(); ++it, ++index) {
+            visitor(Level{static_cast<std::int64_t>(it->first),
+                          it->second.quantity, it->second.order_count,
+                          it->second.add_time_sum_micros,
+                          it->second.young_quantity}, index);
+        }
+    }
+    return index != 0;
+}
 
 #endif  // SSE_T0_TICK_ORDER_BOOK_H
