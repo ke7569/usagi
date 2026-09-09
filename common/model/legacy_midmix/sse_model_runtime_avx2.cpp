@@ -32,12 +32,29 @@ inline void matvec(const float* packed, std::size_t rows, std::size_t cols,
     std::size_t row = 0U;
     for (; row + 8U <= rows; row += 8U) {
         const float* block = packed + (row / 8U) * cols * 8U;
-        __m256 sum = _mm256_setzero_ps();
-        for (std::size_t col = 0U; col < cols; ++col) {
-            const __m256 weights = _mm256_load_ps(block + col * 8U);
-            const __m256 value = _mm256_set1_ps(input[col]);
-            sum = _mm256_add_ps(sum, _mm256_mul_ps(weights, value));
+        __m256 sum0 = _mm256_setzero_ps();
+        __m256 sum1 = _mm256_setzero_ps();
+        __m256 sum2 = _mm256_setzero_ps();
+        __m256 sum3 = _mm256_setzero_ps();
+        std::size_t col = 0U;
+        for (; col + 3U < cols; col += 4U) {
+            sum0 = _mm256_fmadd_ps(
+                _mm256_load_ps(block + col * 8U), _mm256_set1_ps(input[col]), sum0);
+            sum1 = _mm256_fmadd_ps(
+                _mm256_load_ps(block + (col + 1U) * 8U),
+                _mm256_set1_ps(input[col + 1U]), sum1);
+            sum2 = _mm256_fmadd_ps(
+                _mm256_load_ps(block + (col + 2U) * 8U),
+                _mm256_set1_ps(input[col + 2U]), sum2);
+            sum3 = _mm256_fmadd_ps(
+                _mm256_load_ps(block + (col + 3U) * 8U),
+                _mm256_set1_ps(input[col + 3U]), sum3);
         }
+        __m256 sum = _mm256_add_ps(_mm256_add_ps(sum0, sum1),
+                                   _mm256_add_ps(sum2, sum3));
+        for (; col < cols; ++col)
+            sum = _mm256_fmadd_ps(
+                _mm256_load_ps(block + col * 8U), _mm256_set1_ps(input[col]), sum);
         if (bias != 0) {
             sum = _mm256_add_ps(sum, _mm256_loadu_ps(bias + row));
         }

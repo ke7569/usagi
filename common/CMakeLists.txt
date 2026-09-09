@@ -45,7 +45,7 @@ if(T0_BUILD_SSE_STREAM_PROCESSOR)
   target_compile_options(sse_model_runtime PRIVATE -ffp-contract=off)
   set_source_files_properties(
     ${USAGI_ROOT}/common/model/legacy_midmix/sse_model_runtime_avx2.cpp
-    PROPERTIES COMPILE_FLAGS "-mavx2 -ffp-contract=off")
+    PROPERTIES COMPILE_FLAGS "-mavx2 -mfma -ffp-contract=off")
   
   add_library(snapshot_gru_engine STATIC ${USAGI_ROOT}/common/model/snapshot_gru/snapshot_gru_runtime.cpp)
   target_include_directories(snapshot_gru_engine PUBLIC ${USAGI_ROOT})

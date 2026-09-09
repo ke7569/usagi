@@ -1,0 +1,35 @@
+{
+  "date": "2026-09-09",
+  "host": "sse-live",
+  "cpu": 56,
+  "scope": "Tick model runtime only plus the existing controlled downstream fixture; model loading and input construction excluded.",
+  "model": "/home/zane/sse/artifacts/tick/ssemodl1.bin",
+  "rows": 1000,
+  "repeats": 100,
+  "model_runtime_cycles_per_row": {
+    "original_avx2_single_accumulator": 234817,
+    "float_four_accumulators": 200131,
+    "float_four_accumulators_fma": 157943,
+    "experimental_fp16_weights": 368260,
+    "experimental_int8_weights": 304101
+  },
+  "model_runtime_approx_us_at_2_7ghz": {
+    "original_avx2_single_accumulator": 87.0,
+    "float_four_accumulators": 74.1,
+    "float_four_accumulators_fma": 58.5,
+    "experimental_fp16_weights": 136.4,
+    "experimental_int8_weights": 112.6
+  },
+  "downstream_50000_orders_520_records_p50_us": {
+    "book_updates": 119.2,
+    "factor_build": 9.34,
+    "tick_inference": 58.6,
+    "combined": 187.5
+  },
+  "checksum": 71890.9272122383,
+  "notes": [
+    "The committed path uses float32 weights with four independent AVX2 accumulators and explicit FMA; it preserves the original model architecture and activation functions.",
+    "FP16 conversion overhead was slower than float32 on this CPU.",
+    "The experimental AVX2 INT8 path was slower and accumulated materially different recurrent outputs, so it is not enabled by the committed path."
+  ]
+}

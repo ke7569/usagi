@@ -143,6 +143,24 @@ pipeline outputs remain exactly equal. The full 50-target CTest run passes.
 The measured JSON is in
 `docs/benchmarks/sse-flow-streaming-20260909.json`.
 
+## Tick model kernel follow-up
+
+The model runtime was profiled separately from factor construction. The large
+512-to-256 projection was limited by a long single accumulator chain and the
+model's packed weights were already resident in the AVX2 path. Four independent
+accumulators plus explicit FMA reduce the model-only median from about 234.8k
+to 157.9k TSC cycles per row, or approximately 87.0µs to 58.5µs at the
+measured 2.7GHz rate. The model topology, float32 activations, recurrent state,
+and sigmoid/tanh functions remain unchanged; the checksum difference is below
+the displayed precision (`71890.9272122383` versus `71890.9272733331`).
+
+Lower precision experiments were measured before being discarded. FP16 weight
+conversion took about 136µs per row because F16C conversion cost exceeded the
+cache benefit. The AVX2 INT8 path took about 113µs and produced substantial
+recurrent-state drift over a long sequence. Neither is enabled in the runtime.
+The FMA benchmark is recorded in
+`docs/benchmarks/sse-model-fma-20260909.json`.
+
 ## CMake integration fragment
 
 The focused test was intentionally left out of the shared CMake file to avoid
