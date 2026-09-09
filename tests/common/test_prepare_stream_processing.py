@@ -28,6 +28,35 @@ class PrepareStreamProcessingTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(unified_config.ConfigError):
                 processing.make_profile(config, sse_contract="sse-hardware-batch-v3", pipeline=invalid)
 
+    def test_hardware_pipeline_accepts_optional_frequency_weights(self):
+        config = self.config("SH")
+        pipeline = {"book_cpus": [80, 88], "inference_cpus": [96, 104],
+                    "ingress_capacity": 65536, "inference_capacity": 4096,
+                    "output_capacity": 4096,
+                    "inference_frequency_weights": {"600000": 4.0, "600001": 0.5}}
+        result = processing.make_profile(config, sse_contract="sse-hardware-batch-v3",
+                                         pipeline=pipeline)
+        self.assertEqual(pipeline, result["pipeline"])
+        result["pipeline"]["inference_frequency_weights"]["600000"] = 9.0
+        self.assertEqual(4.0, pipeline["inference_frequency_weights"]["600000"])
+
+        invalid_values = (
+            None, [], {"600000": 0}, {"600000": -1.0},
+            {"600000": True}, {"600000": "4"}, {"600000": float("inf")},
+            {"60000": 1.0}, {"60000A": 1.0}, {"600000": 1.0, "bad": 2.0},
+        )
+        for value in invalid_values:
+            changed = copy.deepcopy(pipeline)
+            changed["inference_frequency_weights"] = value
+            with self.subTest(value=value), self.assertRaises(unified_config.ConfigError):
+                processing.make_profile(config, sse_contract="sse-hardware-batch-v3",
+                                        pipeline=changed)
+
+        unknown = copy.deepcopy(pipeline)
+        unknown["worker_weights"] = {"600000": 1.0}
+        with self.assertRaisesRegex(unified_config.ConfigError, "unknown SSE pipeline field"):
+            processing.make_profile(config, sse_contract="sse-hardware-batch-v3", pipeline=unknown)
+
     def test_software_v2_keeps_complete_original_declaration(self):
         runtime = self.runtime("SH")
         runtime["sse_live_sampling"] = copy.deepcopy(processing._SSE_SOFTWARE_SAMPLING)

@@ -31,12 +31,20 @@ std::vector<std::string> instrument_ids(const sse_tick::DailyStaticMetadataMap& 
 
 PipelineConfig::PipelineConfig()
     : contract(kSoftwarePerInstrumentV2), book_cpus(), inference_cpus(),
+      inference_frequency_weights(),
       ingress_capacity(65536U), inference_capacity(4096U), output_capacity(4096U) {}
+
+PipelineLatencyStats::PipelineLatencyStats()
+    : count(0ULL), p50_ns(0ULL), p99_ns(0ULL), max_ns(0ULL),
+      percentile_upper_bound(true) {}
 
 PipelineStats::PipelineStats()
     : applied_ticks(0), accepted_samples(0), inferred_samples(0), closed_batches(0),
       retained_rows(0), retained_row_high_water(0),
-      book_cpus(), inference_cpus(), channel_shard_counts() {}
+      book_cpus(), inference_cpus(), channel_shard_counts(),
+      inference_channel_shard_counts(), inference_queue_sizes(),
+      inference_queue_high_water(), inference_samples(), inference_queue_wait(),
+      inference_batch_completion(), batch_completion() {}
 
 Provenance::Provenance()
     : processing_contract(kSoftwarePerInstrumentV2),

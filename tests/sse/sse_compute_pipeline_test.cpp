@@ -108,6 +108,14 @@ sse_stream::PipelineConfig parallel(const std::vector<int>& cpus) {
     config.inference_cpus.assign(cpus.begin() + 2, cpus.end());
     return config;
 }
+
+void check_latency_summary(const sse_stream::PipelineLatencyStats& latency,
+                           bool require_samples) {
+    if (require_samples) assert(latency.count > 0);
+    assert(latency.p50_ns <= latency.p99_ns);
+    assert(latency.count == 0 || latency.max_ns > 0);
+    assert(latency.percentile_upper_bound);
+}
 sse_stream::Auction59Provider auction() {
     return [](const std::string&, std::uint64_t, std::vector<float>* output, std::string*) {
         output->assign(59, 0); return true;
@@ -274,6 +282,32 @@ void test_snapshot_marker_and_finish(const Models& models) {
     }
 }
 
+void test_snapshot_first_route_and_frequency_weight() {
+    sse_stream::PipelineConfig config = serial();
+    config.inference_frequency_weights["600000"] = 3.0;
+    std::vector<Output> outputs;
+    Processor processor(metadata(), 0, true,
+        [&](const Output& output) { outputs.push_back(output); }, auction(), config);
+
+    Bytes snapshots = snapshot(1, 9295900, 0);
+    append(snapshots, snapshot(2, 9300000, 1));
+    processor.on_event(datagram(snapshots, 1, 1000, 10000));
+    processor.on_event(idle(2, 6000));
+    assert(!outputs.empty() && outputs[0].kind == sse_stream::kSnapshotOutput);
+
+    // The first tick registers ChannelNo after snapshot routing has already
+    // selected the stock's inference owner. That owner must remain stable.
+    processor.on_event(datagram(opening(), 3, 7000, 16000));
+    processor.on_event(datagram(heartbeat(), 4, 8000, 21000));
+    processor.finish();
+    const sse_stream::PipelineStats stats = processor.pipeline_stats();
+    assert(stats.inference_channel_shard_counts.size() == 6);
+    assert(stats.inference_channel_shard_counts[0].size() == 1);
+    assert(stats.inference_channel_shard_counts[0][0] == 1);
+    assert(stats.accepted_samples == 1 && stats.inference_samples.size() == 1 &&
+           stats.inference_samples[0] == 1);
+}
+
 void test_independent_udp_subscriptions() {
     std::vector<Output> outputs;
     Processor processor(metadata(), 0, true, [&](const Output& output) { outputs.push_back(output); }, auction(), serial());
@@ -377,10 +411,32 @@ std::vector<Output> run(const Recording& recording, const Models& models,
         }
     }
     assert(samples == 268 && stats.accepted_samples == samples && stats.inferred_samples == samples);
+    assert(stats.inference_channel_shard_counts.size() == 6);
+    assert(stats.inference_samples.size() ==
+           (config.inference_cpus.empty() ? 1U : config.inference_cpus.size()));
+    std::uint64_t worker_samples = 0;
+    for (std::size_t i = 0; i < stats.inference_samples.size(); ++i)
+        worker_samples += stats.inference_samples[i];
+    assert(worker_samples == samples);
+    assert(stats.inference_batch_completion.size() == stats.inference_samples.size());
+    for (std::size_t i = 0; i < stats.inference_batch_completion.size(); ++i)
+        check_latency_summary(stats.inference_batch_completion[i], stats.inference_samples[i] > 0);
+    check_latency_summary(stats.batch_completion, stats.closed_batches > 0);
     if (!config.book_cpus.empty()) {
         assert(stats.book_cpus == config.book_cpus && stats.inference_cpus == config.inference_cpus);
         assert(stats.channel_shard_counts[0][0] == 1 && stats.channel_shard_counts[0][1] == 1);
         assert(stats.channel_shard_counts[1][0] == 1 && stats.channel_shard_counts[1][1] == 1);
+        assert(stats.inference_channel_shard_counts[0].size() == config.inference_cpus.size());
+        assert(stats.inference_channel_shard_counts[1].size() == config.inference_cpus.size());
+        assert(stats.inference_channel_shard_counts[0][0] == 1 &&
+               stats.inference_channel_shard_counts[0][1] == 1);
+        assert(stats.inference_channel_shard_counts[1][0] == 1 &&
+               stats.inference_channel_shard_counts[1][1] == 1);
+        assert(stats.inference_queue_sizes.size() == config.inference_cpus.size());
+        assert(stats.inference_queue_high_water.size() == config.inference_cpus.size());
+        assert(stats.inference_queue_wait.size() == config.inference_cpus.size());
+        for (std::size_t i = 0; i < stats.inference_queue_wait.size(); ++i)
+            check_latency_summary(stats.inference_queue_wait[i], true);
     }
     std::cout << label << " input_us=" << std::chrono::duration_cast<std::chrono::microseconds>(ingested - start).count()
               << " drained_us=" << std::chrono::duration_cast<std::chrono::microseconds>(finished - start).count()
@@ -398,11 +454,27 @@ void compare(const std::vector<Output>& a, const std::vector<Output>& b) {
             assert(x.provenance.batch_id == y.provenance.batch_id);
             assert(x.provenance.stream_sequence == y.provenance.stream_sequence);
             assert(x.factors.values == y.factors.values);
-            assert(x.prediction_valid == y.prediction_valid && x.prediction.tick_pred == y.prediction.tick_pred);
+            assert(x.prediction_valid == y.prediction_valid);
+            assert(x.prediction.tick_generated == y.prediction.tick_generated &&
+                   x.prediction.snapshot_generated == y.prediction.snapshot_generated &&
+                   x.prediction.selected == y.prediction.selected &&
+                   x.prediction.selected_source == y.prediction.selected_source &&
+                   x.prediction.tick_pred == y.prediction.tick_pred &&
+                   x.prediction.snapshot_pred == y.prediction.snapshot_pred &&
+                   x.prediction.selected_pred == y.prediction.selected_pred);
         } else if (a[i].kind == sse_stream::kSnapshotOutput) {
-            assert(a[i].snapshot.snapshot.security_id == b[i].snapshot.snapshot.security_id);
-            assert(a[i].snapshot.snapshot36 == b[i].snapshot.snapshot36);
-            assert(a[i].snapshot.prediction.snapshot_pred == b[i].snapshot.prediction.snapshot_pred);
+            const auto& x = a[i].snapshot; const auto& y = b[i].snapshot;
+            assert(x.snapshot.security_id == y.snapshot.security_id);
+            assert(x.provenance.batch_id == y.provenance.batch_id &&
+                   x.provenance.stream_sequence == y.provenance.stream_sequence);
+            assert(x.snapshot36 == y.snapshot36 && x.prediction_valid == y.prediction_valid);
+            assert(x.prediction.tick_generated == y.prediction.tick_generated &&
+                   x.prediction.snapshot_generated == y.prediction.snapshot_generated &&
+                   x.prediction.selected == y.prediction.selected &&
+                   x.prediction.selected_source == y.prediction.selected_source &&
+                   x.prediction.tick_pred == y.prediction.tick_pred &&
+                   x.prediction.snapshot_pred == y.prediction.snapshot_pred &&
+                   x.prediction.selected_pred == y.prediction.selected_pred);
         } else {
             assert(a[i].batch_end.batch_id == b[i].batch_end.batch_id);
             assert(a[i].batch_end.last_stream_sequence == b[i].batch_end.last_stream_sequence);
@@ -526,6 +598,7 @@ int main() {
     test_boundaries_and_software_contract();
     test_full_feed_validation();
     test_snapshot_marker_and_finish(models);
+    test_snapshot_first_route_and_frequency_weight();
     test_independent_udp_subscriptions();
     test_failure_and_owner(serial());
     const Recording input = recording();

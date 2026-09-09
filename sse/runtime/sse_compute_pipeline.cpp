@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <deque>
 #include <limits>
@@ -19,6 +20,123 @@ const std::uint64_t kGapNs = 5000ULL;
 const std::uint64_t kOpenUs = 34200000000ULL;
 const std::uint64_t kEndUs = 86400000000ULL;
 const std::size_t kNoRoute = std::numeric_limits<std::size_t>::max();
+
+std::uint64_t monotonic_now_ns() {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+std::uint64_t elapsed_ns(std::uint64_t now, std::uint64_t origin) {
+    return origin != 0ULL && now >= origin ? now - origin : 0ULL;
+}
+
+// Fixed per-worker histogram.  Buckets are atomic so a stats inspector can
+// sample a live worker without taking a per-sample lock. Percentiles are
+// inclusive upper bounds of log2/16 buckets; max is exact.
+class AtomicLatencyHistogram {
+public:
+    static const std::size_t kExponentCount = 64U;
+    static const std::size_t kSubdivisions = 16U;
+    static const std::size_t kBucketCount = kExponentCount * kSubdivisions;
+
+    AtomicLatencyHistogram() : count_(0ULL), zero_count_(0ULL), max_ns_(0ULL), buckets_() {
+        for (std::size_t i = 0U; i < kBucketCount; ++i)
+            buckets_[i].store(0ULL, std::memory_order_relaxed);
+    }
+
+    void observe(std::uint64_t value_ns) {
+        count_.fetch_add(1ULL, std::memory_order_relaxed);
+        std::uint64_t previous = max_ns_.load(std::memory_order_relaxed);
+        while (previous < value_ns &&
+               !max_ns_.compare_exchange_weak(previous, value_ns,
+                                               std::memory_order_relaxed,
+                                               std::memory_order_relaxed)) {}
+        if (value_ns == 0ULL) {
+            zero_count_.fetch_add(1ULL, std::memory_order_relaxed);
+            return;
+        }
+        buckets_[bucket_index(value_ns)].fetch_add(1ULL, std::memory_order_relaxed);
+    }
+
+    PipelineLatencyStats summary() const {
+        PipelineLatencyStats result;
+        result.count = count_.load(std::memory_order_relaxed);
+        result.max_ns = max_ns_.load(std::memory_order_relaxed);
+        if (result.count != 0ULL) {
+            result.p50_ns = percentile(result.count, 50.0);
+            result.p99_ns = percentile(result.count, 99.0);
+        }
+        result.percentile_upper_bound = true;
+        return result;
+    }
+
+private:
+    static std::size_t floor_log2(std::uint64_t value) {
+        std::size_t exponent = 0U;
+        while (value >>= 1U) ++exponent;
+        return exponent;
+    }
+
+    static std::size_t bucket_index(std::uint64_t value) {
+        const std::size_t exponent = floor_log2(value);
+        std::size_t subdivision = 0U;
+        const std::uint64_t base = static_cast<std::uint64_t>(1ULL) << exponent;
+        if (exponent >= 4U) {
+            subdivision = static_cast<std::size_t>(
+                (value >> (exponent - 4U)) & 0x0fULL);
+        } else {
+            subdivision = static_cast<std::size_t>(
+                ((value - base) << 4U) / base);
+        }
+        return exponent * kSubdivisions + subdivision;
+    }
+
+    static std::uint64_t bucket_upper(std::size_t index) {
+        const std::size_t exponent = index / kSubdivisions;
+        const std::size_t subdivision = index % kSubdivisions;
+        const std::uint64_t base = static_cast<std::uint64_t>(1ULL) << exponent;
+        if (exponent < 4U) {
+            const std::uint64_t scaled =
+                static_cast<std::uint64_t>(subdivision + 1U) * base;
+            const std::uint64_t width = (scaled + 15ULL) / 16ULL;
+            return base + width - 1ULL;
+        }
+        const std::uint64_t width =
+            static_cast<std::uint64_t>(1ULL) << (exponent - 4U);
+        return base - 1ULL +
+               static_cast<std::uint64_t>(subdivision + 1U) * width;
+    }
+
+    static std::uint64_t percentile_rank(std::uint64_t count, double percentile) {
+        if (percentile <= 0.0) return 1ULL;
+        if (percentile >= 100.0) return count;
+        const long double scaled = static_cast<long double>(count) *
+            static_cast<long double>(percentile) / 100.0L;
+        const long double rounded = std::ceil(scaled);
+        if (rounded <= 1.0L) return 1ULL;
+        if (rounded >= static_cast<long double>(count)) return count;
+        return static_cast<std::uint64_t>(rounded);
+    }
+
+    std::uint64_t percentile(std::uint64_t count, double value) const {
+        std::uint64_t rank = percentile_rank(count, value);
+        const std::uint64_t zero = zero_count_.load(std::memory_order_relaxed);
+        if (rank <= zero) return 0ULL;
+        rank -= zero;
+        for (std::size_t i = 0U; i < kBucketCount; ++i) {
+            const std::uint64_t bucket = buckets_[i].load(std::memory_order_relaxed);
+            if (rank <= bucket) return bucket_upper(i);
+            rank -= bucket;
+        }
+        return max_ns_.load(std::memory_order_relaxed);
+    }
+
+    std::atomic<std::uint64_t> count_;
+    std::atomic<std::uint64_t> zero_count_;
+    std::atomic<std::uint64_t> max_ns_;
+    std::atomic<std::uint64_t> buckets_[kBucketCount];
+};
 
 std::size_t checked_capacity(std::size_t value) {
     if (value < 1 || value > 1048576)
@@ -64,13 +182,18 @@ private:
 template<class T> class ReadyQueue {
 public:
     explicit ReadyQueue(std::size_t capacity)
-        : slots_(capacity + 1), write_(0), read_(0) {}
+        : slots_(capacity + 1), write_(0), read_(0), size_(0), high_water_(0) {}
     bool push(T value) {
         std::lock_guard<std::mutex> lock(mutex_);
         const std::size_t next = (write_ + 1) % slots_.size();
         if (next == read_) return false;
         slots_[write_] = value;
         write_ = next;
+        const std::size_t occupied =
+            (write_ + slots_.size() - read_) % slots_.size();
+        size_.store(occupied, std::memory_order_release);
+        const std::size_t previous = high_water_.load(std::memory_order_relaxed);
+        if (occupied > previous) high_water_.store(occupied, std::memory_order_release);
         return true;
     }
     bool pop(T* value) {
@@ -78,11 +201,19 @@ public:
         if (read_ == write_) return false;
         *value = slots_[read_];
         read_ = (read_ + 1) % slots_.size();
+        const std::size_t occupied =
+            (write_ + slots_.size() - read_) % slots_.size();
+        size_.store(occupied, std::memory_order_release);
         return true;
+    }
+    std::size_t size() const { return size_.load(std::memory_order_acquire); }
+    std::size_t high_water() const {
+        return high_water_.load(std::memory_order_acquire);
     }
 private:
     std::vector<T> slots_;
     std::size_t write_, read_;
+    std::atomic<std::size_t> size_, high_water_;
     std::mutex mutex_;
 };
 
@@ -168,6 +299,9 @@ struct ComputePipeline::Impl {
         bool have_snapshot;
         std::vector<SnapshotRecord> snapshots;
         std::size_t shard;
+        // Frontend-only inference owner cache.  Workers receive a copy on
+        // Work; they never read or write this field.
+        std::size_t inference_shard;
         std::uint32_t channel;
         std::size_t tick_subscription, snapshot_subscription;
         std::uint64_t next_work;
@@ -178,7 +312,8 @@ struct ComputePipeline::Impl {
         Instrument(const std::string& id, const sse_tick::DailyStaticMetadata& metadata)
             : code(id), book(id), factors(), gate(), pending_tick(), pending_source(),
               pending_changed(false), previous_snapshot(), have_snapshot(false),
-              snapshots(), shard(kNoRoute), channel(0), tick_subscription(kNoRoute),
+              snapshots(), shard(kNoRoute), inference_shard(kNoRoute), channel(0),
+              tick_subscription(kNoRoute),
               snapshot_subscription(kNoRoute), next_work(0),
               auction59(), model_state(), expected_work(0) {
             factors.set_static_metadata(metadata);
@@ -205,17 +340,24 @@ struct ComputePipeline::Impl {
         bool completed;
         bool tick_cut;
         std::size_t reserved_rows;
+        std::size_t inference_shard;
+        std::uint64_t inference_enqueued_ns;
         Work(std::size_t index, std::uint64_t sequence, Batch* parent)
             : instrument(index), ordinal(sequence), batch(parent), outputs(), completed(false),
-              tick_cut(false), reserved_rows(0) {}
+              tick_cut(false), reserved_rows(0), inference_shard(kNoRoute),
+              inference_enqueued_ns(0ULL) {}
     };
     struct Batch {
         BatchEndOutput marker;
         std::vector<std::unique_ptr<Work> > works;
         std::vector<std::vector<Work*> > by_shard;
         std::vector<Work*> direct;
+        std::vector<std::size_t> inference_owners;
         std::size_t completed;
-        explicit Batch(std::size_t shards) : marker(), works(), by_shard(shards), direct(), completed(0) {}
+        std::uint64_t closed_monotonic_ns;
+        explicit Batch(std::size_t shards)
+            : marker(), works(), by_shard(shards), direct(), inference_owners(), completed(0),
+              closed_monotonic_ns(0ULL) {}
     };
     struct Command {
         enum Kind { Tick = 1, BatchEnd = 2 } kind;
@@ -243,6 +385,7 @@ struct ComputePipeline::Impl {
     bool factors_only;
     OutputCallback callback;
     sse_pipeline::ShardPlan routes;
+    sse_pipeline::InferenceShardPlan inference_routes;
     std::vector<std::unique_ptr<Instrument> > instruments;
     std::vector<int> instrument_lookup;
     std::map<std::uint32_t, std::unique_ptr<Subscription> > subscriptions;
@@ -260,6 +403,9 @@ struct ComputePipeline::Impl {
     std::atomic<bool> cancelled;
     std::atomic<unsigned> started;
     std::vector<std::unique_ptr<Counter> > applied_ticks, accepted_samples, inferred_samples;
+    std::vector<std::unique_ptr<AtomicLatencyHistogram> > inference_queue_wait_latency;
+    std::vector<std::unique_ptr<AtomicLatencyHistogram> > inference_batch_completion_latency;
+    std::unique_ptr<AtomicLatencyHistogram> batch_completion_latency;
     std::atomic<std::size_t> retained_rows, retained_row_high_water;
     std::atomic<std::uint64_t> closed_batches;
     mutable std::mutex routing_mutex;
@@ -277,11 +423,15 @@ struct ComputePipeline::Impl {
         : config(supplied_config), parallel(!config.book_cpus.empty()), model(supplied_model), exchange("sse"),
           factors_only(only_factors), callback(supplied_callback),
           routes(parallel ? config.book_cpus.size() : 1), instruments(),
+          inference_routes(parallel ? config.inference_cpus.size() : 1,
+                           config.inference_frequency_weights),
           instrument_lookup(1000000, -1), subscriptions(), current_subscription(0),
           channel_sequence(), decode_scratch(65535 / 72),
           book_queues(), inference_queues(), completions(checked_capacity(config.output_capacity)), pending(),
           pending_work(0), pending_snapshots(0), lease(), threads(), book_cpus(), inference_cpus(),
           cancelled(false), started(0), applied_ticks(), accepted_samples(), inferred_samples(),
+          inference_queue_wait_latency(), inference_batch_completion_latency(),
+          batch_completion_latency(new AtomicLatencyHistogram),
           retained_rows(0), retained_row_high_water(0), closed_batches(0), routing_mutex(),
           error_mutex(), error(), owner(), have_owner(false), finished(false),
           have_clock(false), have_source(false), next_batch(1),
@@ -293,6 +443,8 @@ struct ComputePipeline::Impl {
             config.inference_capacity < 1 || config.inference_capacity > 1048576 ||
             config.output_capacity < 1 || config.output_capacity > 1048576)
             throw std::runtime_error("SSE pipeline capacities must be in [1,1048576]");
+        if (!routes.valid() || !inference_routes.valid())
+            throw std::runtime_error("invalid SSE shard plan or inference frequency weight");
         check_metadata(metadata);
         for (const auto& entry : metadata) {
             std::string code;
@@ -317,6 +469,8 @@ struct ComputePipeline::Impl {
         for (std::size_t i = 0; i < (parallel ? config.inference_cpus.size() : 1); ++i) {
             accepted_samples.emplace_back(new Counter);
             inferred_samples.emplace_back(new Counter);
+            inference_queue_wait_latency.emplace_back(new AtomicLatencyHistogram);
+            inference_batch_completion_latency.emplace_back(new AtomicLatencyHistogram);
         }
         if (!parallel) return;
         std::vector<int> requested(config.book_cpus);
@@ -415,16 +569,23 @@ struct ComputePipeline::Impl {
         if (instrument.tick_subscription == kNoRoute) instrument.tick_subscription = provenance.stream_channel_id;
         else if (instrument.tick_subscription != provenance.stream_channel_id)
             throw std::runtime_error("SSE stock changed tick UDP subscription");
-        if (instrument.shard == kNoRoute) {
+        {
             std::uint32_t shard = 0;
             std::string detail;
-            std::lock_guard<std::mutex> lock(routing_mutex);
-            if (!routes.assign(tick.channel_no, instrument.code, &shard, &detail))
-                throw std::runtime_error(detail);
-            instrument.shard = shard;
-            instrument.channel = tick.channel_no;
-        } else if (instrument.channel != tick.channel_no) {
-            throw std::runtime_error("SSE stock changed wire channel after shard assignment");
+            if (instrument.shard == kNoRoute) {
+                std::uint32_t inference_shard = 0;
+                std::lock_guard<std::mutex> lock(routing_mutex);
+                if (!routes.assign(tick.channel_no, instrument.code, &shard, &detail))
+                    throw std::runtime_error(detail);
+                if (!inference_routes.register_channel(tick.channel_no, instrument.code,
+                                                        &inference_shard, &detail))
+                    throw std::runtime_error(detail);
+                instrument.shard = shard;
+                instrument.inference_shard = inference_shard;
+                instrument.channel = tick.channel_no;
+            } else if (instrument.channel != tick.channel_no) {
+                throw std::runtime_error("SSE stock changed wire channel after shard assignment");
+            }
         }
         touch(static_cast<std::size_t>(found), 1);
         Command command;
@@ -611,15 +772,19 @@ struct ComputePipeline::Impl {
         retained_rows.fetch_sub(reserved - accepted, std::memory_order_relaxed);
     }
 
-    void infer(Work* work) {
+    void infer(Work* work, std::size_t inference_shard) {
         Instrument& instrument = *instruments[work->instrument];
         if (work->ordinal != instrument.expected_work++)
             throw std::runtime_error("SSE per-stock inference work arrived out of order");
+        if (inference_shard >= accepted_samples.size())
+            throw std::runtime_error("SSE inference owner is outside the worker set");
+        if (parallel)
+            inference_queue_wait_latency[inference_shard]->observe(
+                elapsed_ns(monotonic_now_ns(), work->inference_enqueued_ns));
         std::stable_sort(work->outputs.begin(), work->outputs.end(), source_less);
         for (Output& output : work->outputs) {
             if (cancelled.load(std::memory_order_acquire)) return;
-            const std::size_t shard = work->instrument % accepted_samples.size();
-            accepted_samples[shard]->increment();
+            accepted_samples[inference_shard]->increment();
             if (factors_only) continue;
             std::string detail;
             if (output.kind == kTickOutput) {
@@ -642,17 +807,43 @@ struct ComputePipeline::Impl {
                 if (!output.snapshot.prediction_valid)
                     throw std::runtime_error("SSE snapshot model rejected factors: " + detail);
             }
-            inferred_samples[shard]->increment();
+            inferred_samples[inference_shard]->increment();
         }
         if (!completions.push(work))
             throw std::runtime_error("SSE output queue overflow; prediction invalid");
     }
 
+    void assign_inference_owner(Work* work, Instrument& instrument) {
+        if (instrument.inference_shard != kNoRoute) {
+            work->inference_shard = instrument.inference_shard;
+            return;
+        }
+        std::lock_guard<std::mutex> lock(routing_mutex);
+        std::uint32_t selected = 0;
+        std::string detail;
+        if (instrument.channel != 0U) {
+            if (!inference_routes.register_channel(instrument.channel, instrument.code,
+                                                    &selected, &detail))
+                throw std::runtime_error(detail);
+        } else if (!inference_routes.assign(instrument.code, &selected, &detail)) {
+            throw std::runtime_error(detail);
+        }
+        // This method is called only by the frontend while constructing a
+        // batch, so the selected route can be cached without another lock.
+        instrument.inference_shard = selected;
+        work->inference_shard = static_cast<std::size_t>(selected);
+    }
+
     void ready(Work* work) {
+        if (work->inference_shard == kNoRoute)
+            throw std::runtime_error("SSE inference work has no fixed owner");
         if (parallel) {
-            if (!inference_queues[work->instrument % inference_queues.size()]->push(work))
+            // Capture queue origin from the local monotonic clock. Feed PHC or
+            // replay timestamps are not comparable with this worker clock.
+            work->inference_enqueued_ns = monotonic_now_ns();
+            if (!inference_queues[work->inference_shard]->push(work))
                 throw std::runtime_error("SSE inference queue overflow; prediction invalid");
-        } else infer(work);
+        } else infer(work, work->inference_shard);
     }
 
     void close_batch(Subscription& subscription, std::uint64_t now,
@@ -664,6 +855,7 @@ struct ComputePipeline::Impl {
         batch->marker = subscription.marker;
         batch->marker.emitted_monotonic_ns = now;
         batch->marker.reason = reason;
+        batch->closed_monotonic_ns = monotonic_now_ns();
         batch->marker.candidate_count = static_cast<std::uint32_t>(subscription.touched.size());
         batch->works.reserve(subscription.touched.size());
         for (std::size_t index : subscription.touched) {
@@ -675,6 +867,14 @@ struct ComputePipeline::Impl {
                 pending_snapshots -= instrument.snapshots.size();
                 build_snapshots(work);
             }
+            // Select the inference owner while the single frontend still
+            // owns batch construction. Workers receive only this immutable
+            // copy, so routing maps stay off the per-work hot path.
+            assign_inference_owner(work, instrument);
+            if (std::find(batch->inference_owners.begin(),
+                         batch->inference_owners.end(), work->inference_shard) ==
+                batch->inference_owners.end())
+                batch->inference_owners.push_back(work->inference_shard);
             if (instrument.shard == kNoRoute) batch->direct.push_back(work);
             else batch->by_shard[instrument.shard].push_back(work);
             subscription.activity[index] = 0;
@@ -726,6 +926,13 @@ struct ComputePipeline::Impl {
             Output marker;
             marker.kind = kBatchEndOutput;
             marker.batch_end = batch.marker;
+            const std::uint64_t delivered_ns = monotonic_now_ns();
+            const std::uint64_t completion_ns =
+                elapsed_ns(delivered_ns, batch.closed_monotonic_ns);
+            batch_completion_latency->observe(completion_ns);
+            for (const std::size_t owner : batch.inference_owners)
+                if (owner < inference_batch_completion_latency.size())
+                    inference_batch_completion_latency[owner]->observe(completion_ns);
             callback(marker);
             std::size_t released = 0;
             for (const auto& item : batch.works) released += item->reserved_rows;
@@ -886,7 +1093,7 @@ struct ComputePipeline::Impl {
             Work* work = 0;
             while (!cancelled.load(std::memory_order_acquire)) {
                 if (!inference_queues[shard]->pop(&work)) { _mm_pause(); continue; }
-                infer(work);
+                infer(work, shard);
             }
         } catch (const std::exception& exception) { record_error(exception.what()); }
         catch (...) { record_error("unknown SSE inference worker failure"); }
@@ -905,7 +1112,19 @@ struct ComputePipeline::Impl {
         {
             std::lock_guard<std::mutex> lock(routing_mutex);
             result.channel_shard_counts = routes.counts();
+            result.inference_channel_shard_counts = inference_routes.counts();
         }
+        for (const auto& count : accepted_samples)
+            result.inference_samples.push_back(count->value.load(std::memory_order_relaxed));
+        for (const auto& queue : inference_queues) {
+            result.inference_queue_sizes.push_back(queue->size());
+            result.inference_queue_high_water.push_back(queue->high_water());
+        }
+        for (const auto& histogram : inference_queue_wait_latency)
+            result.inference_queue_wait.push_back(histogram->summary());
+        for (const auto& histogram : inference_batch_completion_latency)
+            result.inference_batch_completion.push_back(histogram->summary());
+        result.batch_completion = batch_completion_latency->summary();
         return result;
     }
 };

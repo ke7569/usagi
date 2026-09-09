@@ -11,6 +11,7 @@ order-intent output only, without TD or simulated fills.
 
 import argparse
 import copy
+import math
 import os
 
 from unified_config import ConfigError, export_legacy, load_json, processing_hash, validate, write_json
@@ -210,10 +211,15 @@ def make_profile(config, factors_only=False, strategy_intents=False,
         if pipeline is not None:
             if sse_contract != "sse-hardware-batch-v3" or not isinstance(pipeline, dict):
                 raise ConfigError("SSE pipeline requires hardware-batch-v3")
-            expected = {"book_cpus", "inference_cpus", "ingress_capacity",
+            required = {"book_cpus", "inference_cpus", "ingress_capacity",
                         "inference_capacity", "output_capacity"}
-            if set(pipeline) != expected:
-                raise ConfigError("SSE pipeline requires exactly: " + ", ".join(sorted(expected)))
+            optional = {"inference_frequency_weights"}
+            unknown = set(pipeline) - required - optional
+            missing = required - set(pipeline)
+            if unknown:
+                raise ConfigError("unknown SSE pipeline field: " + ", ".join(sorted(unknown)))
+            if missing:
+                raise ConfigError("SSE pipeline requires: " + ", ".join(sorted(missing)))
             explicit_cpus = set()
             for key in ("book_cpus", "inference_cpus"):
                 cpus = pipeline[key]
@@ -229,6 +235,23 @@ def make_profile(config, factors_only=False, strategy_intents=False,
             for key in ("ingress_capacity", "inference_capacity", "output_capacity"):
                 if type(pipeline[key]) is not int or not 1 <= pipeline[key] <= 1048576:
                     raise ConfigError("SSE pipeline capacity must be in [1,1048576]")
+            if "inference_frequency_weights" in pipeline:
+                weights = pipeline["inference_frequency_weights"]
+                if not isinstance(weights, dict):
+                    raise ConfigError("SSE pipeline.inference_frequency_weights must be an object")
+                for symbol, weight in weights.items():
+                    if (not isinstance(symbol, str) or len(symbol) != 6 or
+                            any(char < "0" or char > "9" for char in symbol)):
+                        raise ConfigError(
+                            "SSE pipeline.inference_frequency_weights keys must be six digits")
+                    try:
+                        finite = math.isfinite(weight)
+                    except (OverflowError, TypeError, ValueError):
+                        finite = False
+                    if (type(weight) not in (int, float) or isinstance(weight, bool) or
+                            not finite or weight <= 0.0):
+                        raise ConfigError(
+                            "SSE pipeline.inference_frequency_weights values must be finite and positive")
     required_paths = ("model_path",) + (_SNAPSHOT_PATHS if market == "SH" else ())
     if market == "SH" and not factors_only:
         required_paths += ("snapshot_auction59_factors_path",)
@@ -292,7 +315,7 @@ def main(argv=None):
     parser.add_argument("--recovery-input", choices=("journal", "handoff"))
     parser.add_argument("--sse-contract", choices=("sse-per-instrument-v2", "sse-hardware-batch-v3"),
                         help="explicit clock/sampling contract; otherwise use the declaration or software v2")
-    parser.add_argument("--sse-pipeline", help="JSON file with book/inference CPUs and queue capacities")
+    parser.add_argument("--sse-pipeline", help="JSON file with worker CPUs, queue capacities, and optional frequency weights")
     args = parser.parse_args(argv)
     profile = make_profile(load_json(args.config), factors_only=args.factors_only,
                            strategy_intents=args.strategy_intents,

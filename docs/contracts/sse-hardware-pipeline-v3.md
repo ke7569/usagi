@@ -88,10 +88,21 @@ python3 tools/config/prepare_stream_processing.py \
 
 `--sse-pipeline` contains `book_cpus`, `inference_cpus`, `ingress_capacity`,
 `inference_capacity`, and `output_capacity`. Each CPU list must contain 1–64
-entries. `-1` chooses a free L3 domain using the existing `sse_cpu::Lease`; explicit
+entries and the two lists may have different lengths. `-1` chooses a free L3 domain using the existing `sse_cpu::Lease`; explicit
 CPUs must also have distinct, unoccupied L3 domains. The input owner retains its
 existing process CPU lease. Workers acquire their leases before starting and
 bind before the processor accepts input.
+
+`inference_frequency_weights` is an optional object keyed by six-digit SSE stock
+code. Each value is a finite positive number representing the historical
+expected sample frequency for that stock. Missing entries have weight `1.0`.
+Weights affect only initial inference-owner balancing; they never change the
+stock's owner after its first assignment. Channel 1 through Channel 6 are
+balanced independently, using weighted load first and deterministic count/load
+tie-breakers. A snapshot-only stock may reserve an inference owner before its
+first tick; registering its later ChannelNo records the channel without moving
+the owner. The profile generator and CLI reject unknown pipeline fields,
+malformed stock keys, non-finite values, zero, and negative weights.
 
 Capacities are between 1 and 1,048,576. Ingress capacity counts POD commands per
 book shard and also bounds outstanding raw snapshots. Inference capacity counts
@@ -105,7 +116,19 @@ each cut. `retained_rows` and `retained_row_high_water` expose the accounting. T
 default two-book example uses about 30 MB for tick FIFOs.
 Power-of-two ingress capacities use a mask instead of division on the tick path.
 Omitting the pipeline section runs deterministic serial v3 with the same cuts,
-factors, model step order and callback order.
+factors, model step order and callback order. The example configuration starts
+with two book workers and four inference workers, all on automatically leased
+L3 domains; this is a capacity starting point, not a peak-throughput claim.
+
+`status` exposes `inference_channel_shard_counts` in ChannelNo-major order,
+optional `inference_frequency_weights`, and per-inference-worker
+`inference_queue_sizes`, `inference_queue_high_water`, and `inference_samples`.
+`inference_queue_wait` and `inference_batch_completion` contain count, P50, P99,
+and exact maximum nanoseconds for each worker. `batch_completion` is the same
+summary across serialized BatchEnd delivery. Empty serial queue metrics are
+represented by empty arrays; latency percentiles are inclusive upper bounds of
+fixed buckets (`max_ns` remains exact). These are observations from the local
+monotonic clock, not exchange or NIC timestamps and not a latency SLO.
 
 The hardware sampling declaration is `mode=hardware-gap-batch`, `clock=NIC_PHC`,
 `threshold_ns=5000`, `comparison=greater-or-equal`, and
@@ -138,8 +161,10 @@ to use its synthetic nonzero recurrent fixture.
 The concurrency fixture compares serial and parallel output for 248 ticks and
 268 accepted model samples using nonzero recurrent tick weights. It also checks
 that each of the six wire channels distributes four stocks 2/2 across book
-shards, and that both books apply another 100 ticks while one inference worker
-processes 319 snapshot recurrences. All factor values and predictions are
-compared exactly, with accepted/inferred sample counts checked independently.
-The test prints input and drained durations for the fixed workload; these are
-pipeline measurements for that fixture, not a live-market latency claim.
+shards, that inference owners remain fixed per stock, and that both books apply
+another 100 ticks while one inference worker processes 319 snapshot recurrences.
+All factor values and predictions are compared exactly, with accepted/inferred
+sample counts checked independently. The test also checks queue and batch
+latency summary shape without asserting a wall-clock threshold. The test prints
+input and drained durations for the fixed workload; these are pipeline
+measurements for that fixture, not a live-market latency claim.

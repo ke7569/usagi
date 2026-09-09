@@ -1,0 +1,25 @@
+{
+  "host": "sse-live",
+  "date": "2026-09-09",
+  "baseline_commit": "6ba939e",
+  "compiler": "GCC 4.8.5, existing build/latency flags",
+  "fixture": "96 configured stocks, 24 active internal indices divisible by 4 in ChannelNo 1; 60 closed tick batches, 1440 tick samples, 61 BatchEnd markers including opening; synthetic wire data and actual deployed tick model weights",
+  "method": "One unthrottled replay per configuration, timed from first ingress through finish/drain. Model load and fixture generation excluded. Not live latency, not one-batch latency, not NIC reception timing.",
+  "owner_cpu": 56,
+  "book_cpus": [64, 72],
+  "inference_cpu_candidates": [80, 88, 96, 104],
+  "baseline_four_workers": {"drain_us": 81754.131, "samples": 1440, "markers": 61, "checksum": -6858.75531005859},
+  "balanced": [
+    {"workers": 1, "drain_us": 79524.481, "samples_per_worker": [1440], "stocks_per_worker_channel_1": [24], "queue_high_water": [1327], "batch_p99_upper_ns": 79691775},
+    {"workers": 2, "drain_us": 42089.909, "samples_per_worker": [720, 720], "stocks_per_worker_channel_1": [12, 12], "queue_high_water": [610, 650], "batch_p99_upper_ns": 41943039},
+    {"workers": 4, "drain_us": 20993.734, "samples_per_worker": [360, 360, 360, 360], "stocks_per_worker_channel_1": [6, 6, 6, 6], "queue_high_water": [245, 246, 247, 247], "batch_p99_upper_ns": 18874367}
+  ],
+  "all_configurations": {"samples": 1440, "markers": 61, "prediction_checksum": -6858.75531005859},
+  "limitations": [
+    "ChannelNo distribution and per-stock activity are synthetic and deliberately expose modulo routing skew.",
+    "Inputs are submitted without market pacing, intentionally creating a backlog; P99 reflects that backlog.",
+    "Histogram percentiles are bucket upper bounds; small run-to-run scheduling variation is expected.",
+    "Snapshot-first owners are pinned before ChannelNo is known and cannot guarantee later per-channel count balance.",
+    "Production processes and profiles were not restarted or replaced."
+  ]
+}

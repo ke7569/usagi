@@ -35,3 +35,23 @@ OMS 意图模式要求显式的统一配置 `trading.oms`，legacy 对应顶层 
 深市继续使用既有 daily/system 生成流程，恢复输入和十档映射保持原语义。沪市保留 Snapshot/Tick 选择、同 ExTime 去重及市场路由规则。共享配置结构不抹平这些差异；模型架构、权重和 feature contract 也必须分别锁定。
 
 统一配置 v1 的迁移字段仍以保守标记记录来源和字段存在性；这不等于完整交易运行时已经绑定。相对地，已支持的 stream profile 和 Paper strategy-intents 投影可以被 `t0_sze_stream`/`t0_sse_stream` 消费，但仍要求 `execution=disabled`，不能声称真实 TD ready。
+
+## 沪市多核推理 pipeline
+
+`sse-hardware-batch-v3` 的可选 `pipeline` 仍向后兼容旧的五字段格式：
+`book_cpus`、`inference_cpus`、`ingress_capacity`、`inference_capacity` 和
+`output_capacity`。两个 CPU 列表可以长度不同；每个非负 CPU 必须属于独立且未占用的
+L3 域，`-1` 由租约分配器自动选择。示例从 2 个 book worker 和 4 个 inference worker
+起步，属于容量起点，不是峰值吞吐承诺。
+
+可选 `inference_frequency_weights` 是六位股票代码到正有限数字的对象，表示历史预期
+采样频率。缺省权重为 `1.0`，只影响首次 inference owner 的 ChannelNo 内负载均衡；
+股票一旦分配 owner，后续 tick、snapshot 和 ChannelNo 注册都不会迁移它。snapshot-first
+股票可以先保留 owner，首个 tick 到达时只补记 ChannelNo。生成器与 CLI 对未知字段、非法
+代码、字符串/布尔值、非有限值以及非正权重严格拒绝；省略该对象保持旧行为。
+
+运行状态会保留 `inference_channel_shard_counts`（ChannelNo 主序）和可选权重，并报告每个
+inference worker 的当前队列、队列高水位、样本数、queue-wait P50/P99/最大值、batch-completion
+P50/P99/最大值以及汇总 BatchEnd completion。分位数是固定 bucket 的 inclusive upper bound，
+最大值精确；serial 模式没有 inference queue wait 数组。统计使用本地 monotonic clock，
+只用于观测该离线/受控 pipeline 的排队和交付边界，不是交易时延 SLO，也不构成生产部署说明。

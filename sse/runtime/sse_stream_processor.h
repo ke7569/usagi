@@ -27,10 +27,24 @@ struct PipelineConfig {
     ProcessingContract contract;
     std::vector<int> book_cpus;
     std::vector<int> inference_cpus;
+    // Optional historical sample-frequency weights used only by the
+    // inference owner planner.  An absent symbol has weight one.
+    std::map<std::string, double> inference_frequency_weights;
     std::size_t ingress_capacity;
     std::size_t inference_capacity;
     std::size_t output_capacity;
     PipelineConfig();
+};
+
+// Percentiles are returned as inclusive upper bounds of fixed log2/16
+// latency buckets.  max_ns is exact; an empty summary has all fields zero.
+struct PipelineLatencyStats {
+    std::uint64_t count;
+    std::uint64_t p50_ns;
+    std::uint64_t p99_ns;
+    std::uint64_t max_ns;
+    bool percentile_upper_bound;
+    PipelineLatencyStats();
 };
 
 struct PipelineStats {
@@ -38,6 +52,15 @@ struct PipelineStats {
     std::uint64_t retained_rows, retained_row_high_water;
     std::vector<int> book_cpus, inference_cpus;
     std::vector<std::vector<std::size_t> > channel_shard_counts;
+    std::vector<std::vector<std::size_t> > inference_channel_shard_counts;
+    std::vector<std::size_t> inference_queue_sizes, inference_queue_high_water;
+    std::vector<std::uint64_t> inference_samples;
+    std::vector<PipelineLatencyStats> inference_queue_wait;
+    // Per-owner close-to-final-BatchEnd-delivery observations, one per owner
+    // participating in each delivered batch.
+    std::vector<PipelineLatencyStats> inference_batch_completion;
+    // One observation per delivered BatchEnd marker across all owners.
+    PipelineLatencyStats batch_completion;
     PipelineStats();
 };
 

@@ -65,6 +65,19 @@ class StreamProcessingCli {
                 throw std::runtime_error("unsupported processing contract value: " + it.key());
         }
     }
+#ifndef T0_STREAM_SZE
+    static Json latency_json(const sse_stream::PipelineLatencyStats& value) {
+        return Json{{"count", value.count}, {"p50_ns", value.p50_ns},
+                    {"p99_ns", value.p99_ns}, {"max_ns", value.max_ns},
+                    {"percentile_upper_bound", value.percentile_upper_bound}};
+    }
+    static Json latency_vector_json(const std::vector<sse_stream::PipelineLatencyStats>& values) {
+        Json result = Json::array();
+        for (std::size_t i = 0; i < values.size(); ++i)
+            result.push_back(latency_json(values[i]));
+        return result;
+    }
+#endif
 public:
     StreamProcessingCli(const std::string& path, bool capture,
                         const std::string& recording, std::size_t channels,
@@ -165,7 +178,8 @@ public:
                 throw std::runtime_error("SSE pipeline requires hardware-batch-v3");
             const Json& settings = profile_.at("pipeline");
             stream_input::fields(settings, {"book_cpus", "inference_cpus", "ingress_capacity",
-                                           "inference_capacity", "output_capacity"});
+                                           "inference_capacity", "output_capacity",
+                                           "inference_frequency_weights"});
             for (const char* key : {"book_cpus", "inference_cpus"}) {
                 const Json& cpus = settings.at(key);
                 if (!cpus.is_array() || cpus.empty() || cpus.size() > 64)
@@ -185,6 +199,19 @@ public:
                 if (std::string(key) == "ingress_capacity") pipeline.ingress_capacity = value;
                 else if (std::string(key) == "inference_capacity") pipeline.inference_capacity = value;
                 else pipeline.output_capacity = value;
+            }
+            if (settings.count("inference_frequency_weights")) {
+                const Json& weights = settings.at("inference_frequency_weights");
+                if (!weights.is_object())
+                    throw std::runtime_error("SSE pipeline inference_frequency_weights must be an object");
+                for (auto it = weights.begin(); it != weights.end(); ++it) {
+                    if (it.key().size() != 6U ||
+                        it.key().find_first_not_of("0123456789") != std::string::npos)
+                        throw std::runtime_error("SSE pipeline inference weight key must be six digits");
+                    if (!it->is_number() || !std::isfinite(it->get<double>()) || it->get<double>() <= 0.0)
+                        throw std::runtime_error("SSE pipeline inference weight must be finite and positive");
+                    pipeline.inference_frequency_weights[it.key()] = it->get<double>();
+                }
             }
         }
         Json sampling = Json::parse(R"json({"mode":"hardware-gap-batch","threshold_ns":5000,
@@ -360,7 +387,17 @@ public:
                 {"retained_rows", pipeline.retained_rows},
                 {"retained_row_high_water", pipeline.retained_row_high_water},
                 {"book_cpus", pipeline.book_cpus}, {"inference_cpus", pipeline.inference_cpus},
-                {"channel_shard_counts", pipeline.channel_shard_counts}};
+                {"channel_shard_counts", pipeline.channel_shard_counts},
+                {"inference_channel_shard_counts", pipeline.inference_channel_shard_counts},
+                {"inference_queue_sizes", pipeline.inference_queue_sizes},
+                {"inference_queue_high_water", pipeline.inference_queue_high_water},
+                {"inference_samples", pipeline.inference_samples},
+                {"inference_queue_wait", latency_vector_json(pipeline.inference_queue_wait)},
+                {"inference_batch_completion", latency_vector_json(pipeline.inference_batch_completion)},
+                {"batch_completion", latency_json(pipeline.batch_completion)}};
+            if (profile_.count("pipeline") && profile_.at("pipeline").count("inference_frequency_weights"))
+                result["pipeline"]["inference_frequency_weights"] =
+                    profile_.at("pipeline").at("inference_frequency_weights");
         }
 #endif
         if (strategy_) {

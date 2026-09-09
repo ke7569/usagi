@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <iostream>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -31,6 +32,68 @@ void check_balanced(const sse_pipeline::ShardPlan& plan,
     }
     check(total == expected && maximum - minimum <= 1U,
           "channel stock counts are not balanced");
+}
+
+void test_inference_plan() {
+    std::map<std::string, double> weights;
+    weights["600001"] = 4.0;
+    weights["600002"] = 1.0;
+    weights["600003"] = 1.0;
+    sse_pipeline::InferenceShardPlan weighted(2, weights);
+    std::string error;
+    std::uint32_t first = 99;
+    check(weighted.assign(1, "600001", &first, &error) && first == 0U,
+          "weighted inference first owner was not deterministic");
+    std::uint32_t second = 99;
+    check(weighted.assign(1, "600002", &second, &error) && second == 1U,
+          "weighted inference did not spread the second owner");
+    std::uint32_t third = 99;
+    check(weighted.assign(1, "600003", &third, &error) && third == 1U,
+          "weighted inference ignored expected frequency");
+    check(weighted.counts()[0][0] == 1U && weighted.counts()[0][1] == 2U,
+          "inference channel counts were not recorded");
+    check(weighted.weighted_counts()[0][0] == 4.0 &&
+              weighted.weighted_counts()[0][1] == 2.0,
+          "inference frequency weights were not recorded");
+
+    // Snapshot-first routing reserves an owner without a ChannelNo. The
+    // later tick registers its channel without moving that stock.
+    std::uint32_t snapshot_owner = 99;
+    check(weighted.assign("600010", &snapshot_owner, &error),
+          "snapshot-only inference assignment failed");
+    std::uint32_t channel = 99;
+    std::uint32_t looked_up = 99;
+    check(weighted.lookup("600010", &channel, &looked_up) && channel == 0U &&
+              looked_up == snapshot_owner,
+          "snapshot-only inference route was not retained");
+    std::uint32_t registered_owner = 99;
+    check(weighted.register_channel(3, "600010", &registered_owner, &error) &&
+              registered_owner == snapshot_owner,
+          "snapshot-first inference route moved at channel registration");
+    check(weighted.lookup("600010", &channel, &looked_up) && channel == 3U &&
+              looked_up == snapshot_owner,
+          "snapshot-first channel registration was not serialized");
+    check(!weighted.register_channel(4, "600010", &registered_owner, &error),
+          "inference route accepted a changed channel");
+
+    // The no-weight path remains deterministic and balances each channel by
+    // count, while a malformed optional map makes the plan inert.
+    sse_pipeline::InferenceShardPlan balanced(4);
+    for (unsigned int i = 0; i < 9U; ++i) {
+        std::uint32_t owner = 99;
+        check(balanced.assign(5, symbol(610000U + i), &owner, &error),
+              "unweighted inference assignment failed");
+    }
+    const std::vector<std::size_t>& counts = balanced.counts()[4];
+    check(counts[0] == 3U && counts[1] == 2U && counts[2] == 2U && counts[3] == 2U,
+          "unweighted inference owners were not balanced within ChannelNo");
+
+    std::map<std::string, double> invalid_weights;
+    invalid_weights["600011"] = 0.0;
+    sse_pipeline::InferenceShardPlan invalid(2, invalid_weights);
+    std::uint32_t owner = 0;
+    check(!invalid.assign(1, "600011", &owner, &error),
+          "non-positive inference frequency weight was accepted");
 }
 }  // namespace
 
@@ -105,6 +168,8 @@ int main() {
               "restored route lookup failed");
         check(!plan.lookup("999999", &restored_channel, &restored_shard),
               "unknown route lookup succeeded");
+
+        test_inference_plan();
 
         std::cout << "sse_shard_plan_test: PASS\n";
         return 0;

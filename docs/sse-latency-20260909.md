@@ -7,7 +7,7 @@
 | 工作项 | 实现责任 | 关键验收 |
 |---|---|---|
 | 增量盘口、订单年龄统计和因子缓冲复用 | book_factor_opt（luna-max） | 与旧实现对照，含部分成交、撤单、30 秒边界、首次查询和时间回退 |
-| ChannelNo 内分片、BatchEnd 屏障、独立推理队列 | sse_compute_pipeline | 6 个 Channel 内均分、同股顺序、串并行因子和预测一致、慢推理期间订单簿继续更新 |
+| ChannelNo 内分片、BatchEnd 屏障、独立推理队列 | sse_compute_pipeline | 6 个 Channel 内固定均分 owner、可选历史采样频率权重、同股顺序、串并行因子和预测一致、慢推理期间订单簿继续更新 |
 | 逐笔模型 AVX2 和预打包权重 | decoder_cost_audit（luna-max） | 真实模型完整序列误差、吞吐、无 AVX2 时保持原路径 |
 | 空读等待、批末和退出衔接 | decoder_cost_audit（luna-max） | owner 线程输出、已封批排空、未封批不做 EOF 推理、journal/SHM 衔接 |
 | 正式无分配解析器、合并、完整回归和基准 | 主 agent | 真实 UDP 字段一致、零解析堆分配、组件总耗时和整条计算链路验证 |
@@ -16,11 +16,11 @@
 
 硬件路径显式使用 `sse-hardware-batch-v3`。每个 UDP 订阅独立使用同一 PHC 的相邻包时间差，差值大于等于 5000 ns 时封闭前批；`recvmmsg` 返回次数和每次最多取包数量不定义业务批次。快照订阅不会提前封闭逐笔订阅。
 
-股票固定属于一个订单簿 shard，每个线缆 ChannelNo 1–6 内的股票均衡分配。非关注股票仍参加完整序列检查；全行情中出现不属于这些 A 股通道的证券不会仅因不参与分片而使预测退出。一个股票的模型状态由固定推理线程推进，不跳过中间获准样本。
+股票固定属于一个订单簿 shard，每个线缆 ChannelNo 1–6 内的股票均衡分配。非关注股票仍参加完整序列检查；全行情中出现不属于这些 A 股通道的证券不会仅因不参与分片而使预测退出。一个股票的模型状态由固定推理线程推进，不跳过中间获准样本。推理 worker 数量可以独立多于订单簿 worker；每个 ChannelNo 内的 owner 在首次分配后固定。可选的 `inference_frequency_weights` 只把历史预期采样频率作为初始均衡负载，snapshot-first 股票先分 owner、后登记 ChannelNo 时不迁移。
 
 订单簿线程在 BatchEnd 后构建因子和盘口输出，交给推理线程后继续处理后续逐笔；推理线程只读取已经固定的因子和盘口。策略收到整批输出及其 BatchEnd 后使用结果。队列溢出和缺失硬件时间戳会明确使预测失效。容量同时约束待保留的数据行，避免只限制队列指针而允许每个任务积攒无界快照。
 
-低延迟线程通过 L3 域租约分配 CPU，接收、分发、journal、订单簿和推理 CPU 不能占用同一个 L3 域。深圳继续使用原有默认接口和采样合同。软件上海路径保留 `sse-per-instrument-v2`，按每股 `CLOCK_MONOTONIC` 的严格大于 100 μs 规则运行，不因输入偶然带有硬件时间戳而自动换合同。
+低延迟线程通过 L3 域租约分配 CPU，接收、分发、journal、订单簿和推理 CPU 不能占用同一个 L3 域。状态输出包含 ChannelNo/owner 计数、可选权重、每个推理 worker 的队列当前值/高水位/样本数、queue wait 和 batch completion P50/P99/最大值，以及串行 BatchEnd completion 汇总。分位数是固定 bucket 的上界，使用本地 monotonic clock 观测排队和交付，不是实盘延迟承诺。深圳继续使用原有默认接口和采样合同。软件上海路径保留 `sse-per-instrument-v2`，按每股 `CLOCK_MONOTONIC` 的严格大于 100 μs 规则运行，不因输入偶然带有硬件时间戳而自动换合同。
 
 ## 等待与终止
 
@@ -63,6 +63,6 @@ AVX2 模型验证覆盖完整递归状态序列，旧路径与新路径最大绝
 
 完整构建成功，上海服务器注册的 50 项 CTest 全部通过，包含深圳兼容性、上海处理器、策略、收包、时间戳、CPU 分配、journal 恢复与新增的硬件批末并行衔接测试。
 
-在已有 Python 3.6 的 research 服务器复制独立构建产物进行 CLI 验证：行情处理 10/10、运行接口 11/11、配置生成 31/31、策略 capture/replay 5/5，通过共 57 项。多次策略信号的测试显式关闭 single-flight；生产默认保护保持开启。capture 和 replay 均产生 6 个样本、5 次策略调用、1 次订单意图和 1 次撤单意图，意图 CRC 相同。
+在已有 Python 3.6 的 research 服务器复制独立构建产物进行 CLI 验证：行情处理 10/10、运行接口 11/11、配置生成 32/32、策略 capture/replay 5/5，通过共 58 项。多次策略信号的测试显式关闭 single-flight；生产默认保护保持开启。capture 和 replay 均产生 6 个样本、5 次策略调用、1 次订单意图和 1 次撤单意图，意图 CRC 相同。
 
 新增 `sse_pipeline_journal_handoff_test` 从 journal 消费首包，切至 SHM 消费尚未落 journal 的下一包，再补写 journal。异步计算只输出已经封闭的一批，缺失硬件时间戳被拒绝，末尾未封批不会在 `finish()` 时补出预测。其线缆字节和时间戳为合成测试数据，不是实际 NIC 采样。
