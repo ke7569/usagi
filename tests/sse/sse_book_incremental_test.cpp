@@ -2,6 +2,7 @@
 #include "sse/market_data/sse_tick_order_book.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <cstdint>
 #include <iostream>
@@ -278,11 +279,17 @@ int main() {
         return 1;
     }
     streamed.take_flow_window(&window);
+    const double expected_positive =
+        1000.0 * (1.0 - std::tanh((10000.0 / 9990.0 - 1.0) * 100.0)) +
+        500.0 * (1.0 - std::tanh(0.0));
+    const double expected_negative =
+        1000.0 * (1.0 - std::tanh((10020.0 / 10010.0 - 1.0) * 100.0));
     if (window.buy_order_qty != 1500000ULL || window.sell_order_qty != 1000000ULL ||
         window.buy_filled_qty != 500000ULL || window.sell_filled_qty != 0ULL ||
         window.positive_trade_flow != 500.0 || window.negative_trade_flow != 0.0 ||
-        window.market_flow != 0.0 || window.positive_order_flow <= 0.0 ||
-        window.negative_order_flow <= 0.0) {
+        window.market_flow != 0.0 ||
+        std::fabs(window.positive_order_flow - expected_positive) > 1e-3 ||
+        std::fabs(window.negative_order_flow - expected_negative) > 1e-3) {
         std::cerr << "streaming flow counters mismatch\n";
         return 1;
     }
