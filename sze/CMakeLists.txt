@@ -1,4 +1,8 @@
 if(T0_BUILD_SZE_STREAM_PROCESSOR)
+  add_executable(sze_factor_incremental_test ${USAGI_ROOT}/tests/sze/sze_factor_incremental_test.cpp)
+  target_include_directories(sze_factor_incremental_test PRIVATE ${USAGI_ROOT})
+  target_compile_options(sze_factor_incremental_test PRIVATE -UNDEBUG -ffp-contract=off)
+  add_test(NAME sze_factor_incremental_test COMMAND sze_factor_incremental_test)
   add_library(sze_stream_processing STATIC
     ${USAGI_ROOT}/sze/runtime/sze_stream_processor.cpp
     ${USAGI_ROOT}/sze/runtime/sze_recovery_driver.cpp
@@ -8,6 +12,10 @@ if(T0_BUILD_SZE_STREAM_PROCESSOR)
   target_include_directories(sze_stream_processing PUBLIC ${USAGI_ROOT} ${USAGI_ROOT}/sze/market_data ${DEEPWIN_INCLUDE})
   target_compile_options(sze_stream_processing PRIVATE -ffp-contract=off)
   target_link_libraries(sze_stream_processing PUBLIC deepwin_market_data_runtime common_mix153060_model)
+  add_executable(sze_factor_benchmark EXCLUDE_FROM_ALL ${USAGI_ROOT}/tests/sze/sze_factor_benchmark.cpp)
+  target_link_libraries(sze_factor_benchmark PRIVATE sze_stream_processing)
+  add_executable(sze_factor_journal_probe EXCLUDE_FROM_ALL ${USAGI_ROOT}/tests/sze/sze_factor_journal_probe.cpp)
+  target_link_libraries(sze_factor_journal_probe PRIVATE sze_stream_processing)
   add_executable(sze_stream_processor_test ${USAGI_ROOT}/tests/sze/sze_stream_processor_test.cpp)
   target_link_libraries(sze_stream_processor_test PRIVATE sze_stream_processing)
   target_compile_options(sze_stream_processor_test PRIVATE -UNDEBUG)

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <ctime>
 #include <functional>
 #include <limits>
@@ -111,10 +112,12 @@ struct NativeOrder {
 struct NativeLevel {
     int tick;
     int64_t volume;
+    __int128 insert_sum_us;
+    int64_t young_volume;
     std::unordered_map<int64_t, NativeOrder> orders;
 
     explicit NativeLevel(int value = 0)
-        : tick(value), volume(0), orders() {
+        : tick(value), volume(0), insert_sum_us(0), young_volume(0), orders() {
         orders.reserve(32);
     }
 };
@@ -190,12 +193,14 @@ struct Cut {
 
 class NativeBook {
 public:
-    NativeBook() : bids_(), asks_(), locators_() {}
+    NativeBook() : bids_(), asks_(), locators_(), young_entries_(), young_cutoff_us_(0) {}
 
     void clear() {
         bids_.clear();
         asks_.clear();
         locators_.clear();
+        young_entries_.clear();
+        young_cutoff_us_ = 0;
     }
 
     bool add(const OrderEvent& event) {
@@ -219,6 +224,7 @@ public:
         if (locators_.find(event.app_sequence) != locators_.end()) {
             return false;
         }
+        advance_age(event.exchange_time_us);
         NativeOrder order;
         order.id = event.app_sequence;
         order.buy = event.buy;
@@ -238,10 +244,12 @@ public:
         locator.buy = event.buy;
         locator.tick = tick;
         locators_[event.app_sequence] = locator;
+        young_entries_.push_back(AgeEntry{order.id, order.insert_us, order.buy, order.tick});
         return true;
     }
 
     bool fill(const TradeEvent& event) {
+        advance_age(event.exchange_time_us);
         if (event.kind == TradeKind::kCancel) {
             const int64_t id = std::max(event.buy_order_id, event.sell_order_id);
             return remove(id, -1);
@@ -312,8 +320,34 @@ public:
     }
 
 private:
+    struct AgeEntry {
+        int64_t id;
+        int64_t insert_us;
+        bool buy;
+        int tick;
+    };
     typedef std::map<int, NativeLevel, std::greater<int> > BuyMap;
     typedef std::map<int, NativeLevel> SellMap;
+
+    template <typename Map>
+    static void expire(Map& side, const AgeEntry& entry) {
+        const auto level = side.find(entry.tick);
+        if (level == side.end()) return;
+        const auto order = level->second.orders.find(entry.id);
+        if (order == level->second.orders.end() || order->second.insert_us != entry.insert_us) return;
+        level->second.young_volume -= order->second.remaining;
+    }
+
+    void advance_age(int64_t now_us) {
+        // Runtime validates nondecreasing exchange timestamps before book mutation.
+        // Exactly 30 seconds remains young; retain full microsecond precision.
+        young_cutoff_us_ = now_us - 30000000LL;
+        while (!young_entries_.empty() && young_entries_.front().insert_us < young_cutoff_us_) {
+            const AgeEntry entry = young_entries_.front();
+            if (entry.buy) expire(bids_, entry); else expire(asks_, entry);
+            young_entries_.pop_front();
+        }
+    }
 
     template <typename Map>
     static bool add_to_side(Map* side, int tick, const NativeOrder& order) {
@@ -327,6 +361,8 @@ private:
         level.tick = tick;
         level.orders[order.id] = order;
         level.volume += order.remaining;
+        level.insert_sum_us += order.insert_us;
+        level.young_volume += order.remaining;
         return true;
     }
 
@@ -381,7 +417,9 @@ private:
                                     : std::min(order.remaining, std::max<int64_t>(quantity, 0));
         order.remaining -= removed;
         level.volume -= removed;
+        if (order.insert_us >= young_cutoff_us_) level.young_volume -= removed;
         if (order.remaining <= 0) {
+            level.insert_sum_us -= order.insert_us;
             level.orders.erase(order_it);
             locators_.erase(locator_it);
         }
@@ -394,6 +432,8 @@ private:
     BuyMap bids_;
     SellMap asks_;
     std::unordered_map<int64_t, Locator> locators_;
+    std::deque<AgeEntry> young_entries_;
+    int64_t young_cutoff_us_;
 };
 
 // Helpers that work with the two differently ordered side maps without
@@ -860,6 +900,8 @@ int64_t recover_monotonic_receive_time_us(std::uint64_t receive_mono_ns,
 struct Runtime::Impl {
     StaticInputs inputs;
     NativeBook book;
+    mutable std::vector<LevelSnapshot> factor_bids;
+    mutable std::vector<LevelSnapshot> factor_asks;
     std::unordered_map<int64_t, double> order_prices;
     bool pending_order;
     OrderEvent pending;
@@ -1370,8 +1412,10 @@ void Runtime::Impl::fill_book_factors(const Cut& current,
     if (mid_tick <= 0.0) {
         return;
     }
-    std::vector<LevelSnapshot> bids;
-    std::vector<LevelSnapshot> asks;
+    std::vector<LevelSnapshot>& bids = factor_bids;
+    std::vector<LevelSnapshot>& asks = factor_asks;
+    bids.clear();
+    asks.clear();
     bids.reserve(book.level_count(true));
     asks.reserve(book.level_count(false));
     book.for_each_level(true, [&bids, &current](const NativeLevel& level) {
@@ -1379,10 +1423,8 @@ void Runtime::Impl::fill_book_factors(const Cut& current,
         value.tick = level.tick;
         value.volume = level.volume;
         value.count = static_cast<int64_t>(level.orders.size());
-        for (std::unordered_map<int64_t, NativeOrder>::const_iterator it = level.orders.begin();
-             it != level.orders.end(); ++it) {
-            value.age_sum_us += current.exchange_time_us - it->second.insert_us;
-        }
+        value.age_sum_us = static_cast<int64_t>(
+            static_cast<__int128>(current.exchange_time_us) * value.count - level.insert_sum_us);
         bids.push_back(value);
     });
     book.for_each_level(false, [&asks, &current](const NativeLevel& level) {
@@ -1390,10 +1432,8 @@ void Runtime::Impl::fill_book_factors(const Cut& current,
         value.tick = level.tick;
         value.volume = level.volume;
         value.count = static_cast<int64_t>(level.orders.size());
-        for (std::unordered_map<int64_t, NativeOrder>::const_iterator it = level.orders.begin();
-             it != level.orders.end(); ++it) {
-            value.age_sum_us += current.exchange_time_us - it->second.insert_us;
-        }
+        value.age_sum_us = static_cast<int64_t>(
+            static_cast<__int128>(current.exchange_time_us) * value.count - level.insert_sum_us);
         asks.push_back(value);
     });
     const double span_10 = mid_tick * 0.1;
@@ -1563,13 +1603,7 @@ void Runtime::Impl::fill_book_factors(const Cut& current,
             return;
         }
         const double weight = 1.0 - delta / young_max;
-        for (std::unordered_map<int64_t, NativeOrder>::const_iterator it = level.orders.begin();
-             it != level.orders.end(); ++it) {
-            if (static_cast<double>(current.exchange_time_us - it->second.insert_us) / 1000000.0 <=
-                kYoungAgeSeconds) {
-                ask_young += it->second.remaining * weight;
-            }
-        }
+        ask_young += level.young_volume * weight;
     });
     book.for_each_level(true, [&bid_young, &current, mid_tick, young_max](const NativeLevel& level) {
         if (level.tick > mid_tick) {
@@ -1580,13 +1614,7 @@ void Runtime::Impl::fill_book_factors(const Cut& current,
             return;
         }
         const double weight = 1.0 - delta / young_max;
-        for (std::unordered_map<int64_t, NativeOrder>::const_iterator it = level.orders.begin();
-             it != level.orders.end(); ++it) {
-            if (static_cast<double>(current.exchange_time_us - it->second.insert_us) / 1000000.0 <=
-                kYoungAgeSeconds) {
-                bid_young += it->second.remaining * weight;
-            }
-        }
+        bid_young += level.young_volume * weight;
     });
     if (ask_young != 0.0 || bid_young != 0.0) {
         (*output)[38] = static_cast<float>(imbalance(ask_young, bid_young));

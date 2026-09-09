@@ -1,0 +1,497 @@
+{
+  "baseline_commit": "467e1c1",
+  "compiler": "GCC 4.8.5 -O3 -march=x86-64 -mtune=generic -ffp-contract=off",
+  "cpu": 44,
+  "ctest_passed": 45,
+  "first_100M": {
+    "baseline": {
+      "book_mutation": {
+        "max_ns": 367658,
+        "mean_ns": 318.337758487608,
+        "n": 742347,
+        "p50_ns": 270,
+        "p95_ns": 590,
+        "p99_ns": 890
+      },
+      "records": 100000000,
+      "sample_work": {
+        "max_ns": 639608,
+        "mean_ns": 41210.7561123682,
+        "n": 36238,
+        "p50_ns": 33650,
+        "p95_ns": 92310,
+        "p99_ns": 128740
+      },
+      "samples": 36238,
+      "seconds_with_io": 56.418375632,
+      "selected": 742347,
+      "total_runtime": {
+        "max_ns": 828618,
+        "mean_ns": 2833.95581850536,
+        "n": 742347,
+        "p50_ns": 800,
+        "p95_ns": 2839,
+        "p99_ns": 59910
+      }
+    },
+    "candidate": {
+      "book_mutation": {
+        "max_ns": 873519,
+        "mean_ns": 427.655273073105,
+        "n": 742347,
+        "p50_ns": 340,
+        "p95_ns": 870,
+        "p99_ns": 1250
+      },
+      "records": 100000000,
+      "sample_work": {
+        "max_ns": 46850,
+        "mean_ns": 4680.74868922126,
+        "n": 36238,
+        "p50_ns": 4400,
+        "p95_ns": 6870,
+        "p99_ns": 15000
+      },
+      "samples": 36238,
+      "seconds_with_io": 54.701636722,
+      "selected": 742347,
+      "total_runtime": {
+        "max_ns": 1364298,
+        "mean_ns": 1171.24276517585,
+        "n": 742347,
+        "p50_ns": 880,
+        "p95_ns": 3130,
+        "p99_ns": 6560
+      }
+    }
+  },
+  "full_day": {
+    "baseline": {
+      "book_mutation": {
+        "max_ns": 596649,
+        "mean_ns": 313.679858482076,
+        "n": 2033382,
+        "p50_ns": 280,
+        "p95_ns": 580,
+        "p99_ns": 780
+      },
+      "records": 277910376,
+      "sample_work": {
+        "max_ns": 1102188,
+        "mean_ns": 56440.5075981024,
+        "n": 89167,
+        "p50_ns": 45970,
+        "p95_ns": 126369,
+        "p99_ns": 186170
+      },
+      "samples": 89167,
+      "seconds_with_io": 155.778652788,
+      "selected": 2033382,
+      "total_runtime": {
+        "max_ns": 1103598,
+        "mean_ns": 3306.18423886904,
+        "n": 2033382,
+        "p50_ns": 810,
+        "p95_ns": 1980,
+        "p99_ns": 81600
+      }
+    },
+    "candidate": {
+      "book_mutation": {
+        "max_ns": 849139,
+        "mean_ns": 456.418200810276,
+        "n": 2033382,
+        "p50_ns": 370,
+        "p95_ns": 940,
+        "p99_ns": 1300
+      },
+      "records": 277910376,
+      "sample_work": {
+        "max_ns": 224259,
+        "mean_ns": 4897.75434858187,
+        "n": 89167,
+        "p50_ns": 4550,
+        "p95_ns": 7940,
+        "p99_ns": 17620
+      },
+      "samples": 89167,
+      "seconds_with_io": 150.806893762,
+      "selected": 2033382,
+      "total_runtime": {
+        "max_ns": 1399187,
+        "mean_ns": 1223.85149912805,
+        "n": 2033382,
+        "p50_ns": 940,
+        "p95_ns": 2630,
+        "p99_ns": 6740
+      }
+    },
+    "parity": {
+      "absolute_tolerance": 0.0,
+      "changed_values": 0,
+      "factor_values": 4458350,
+      "identity_equal": true,
+      "max_absolute_error": 0.0,
+      "max_error_by_factor": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "passed": true,
+      "samples": 89167,
+      "violations": 0
+    }
+  },
+  "reference_branch": "sse-factor-opt-20260909",
+  "reference_commit": "9129ed31ea205746f569db3397bef5468456f9ef",
+  "scope": "offline component timing, exchange receive fallback, no model or broker",
+  "synthetic": {
+    "baseline": [
+      {
+        "all_event_total_runtime_ns": {
+          "count": 600,
+          "max_ns": 3720,
+          "mean_ns": 1329.715,
+          "p50_ns": 630,
+          "p95_ns": 3000,
+          "p99_ns": 3020
+        },
+        "all_event_wall_runtime_ns": {
+          "count": 600,
+          "max_ns": 3870,
+          "mean_ns": 1481.9316666666666,
+          "p50_ns": 780,
+          "p95_ns": 3150,
+          "p99_ns": 3170
+        },
+        "benchmark": "sze_factor_benchmark_v1",
+        "dump_format": "JSONL sample identity and 50 factors",
+        "events": 1660,
+        "factor_count": 50,
+        "factor_digest": "10a0464d591aa835",
+        "identity_digest": "2fb1b5e8712e02d6",
+        "input_preconstructed": true,
+        "live_orders": 1000,
+        "measured_rounds": 200,
+        "non_sample_total_runtime_ns": {
+          "count": 400,
+          "max_ns": 720,
+          "mean_ns": 507.2,
+          "p50_ns": 440,
+          "p95_ns": 660,
+          "p99_ns": 680
+        },
+        "price_levels": 100,
+        "sample_events": 200,
+        "sample_work_ns": {
+          "count": 200,
+          "max_ns": 3260,
+          "mean_ns": 2511.095,
+          "p50_ns": 2510,
+          "p95_ns": 2540,
+          "p99_ns": 2560
+        },
+        "samples": 200,
+        "timing_source": "Runtime::EventTiming plus CLOCK_MONOTONIC_RAW wall",
+        "warmup_rounds": 20,
+        "warmup_sample_events": 19
+      },
+      {
+        "all_event_total_runtime_ns": {
+          "count": 600,
+          "max_ns": 64179,
+          "mean_ns": 19497.181666666667,
+          "p50_ns": 730,
+          "p95_ns": 59310,
+          "p99_ns": 60230
+        },
+        "all_event_wall_runtime_ns": {
+          "count": 600,
+          "max_ns": 64349,
+          "mean_ns": 19657.081666666665,
+          "p50_ns": 890,
+          "p95_ns": 59470,
+          "p99_ns": 60390
+        },
+        "benchmark": "sze_factor_benchmark_v1",
+        "dump_format": "JSONL sample identity and 50 factors",
+        "events": 10660,
+        "factor_count": 50,
+        "factor_digest": "2198d30534157abe",
+        "identity_digest": "8d56553bb53b6f62",
+        "input_preconstructed": true,
+        "live_orders": 10000,
+        "measured_rounds": 200,
+        "non_sample_total_runtime_ns": {
+          "count": 400,
+          "max_ns": 880,
+          "mean_ns": 583.375,
+          "p50_ns": 650,
+          "p95_ns": 760,
+          "p99_ns": 790
+        },
+        "price_levels": 100,
+        "sample_events": 200,
+        "sample_work_ns": {
+          "count": 200,
+          "max_ns": 63619,
+          "mean_ns": 56751.995,
+          "p50_ns": 56150,
+          "p95_ns": 59520,
+          "p99_ns": 61600
+        },
+        "samples": 200,
+        "timing_source": "Runtime::EventTiming plus CLOCK_MONOTONIC_RAW wall",
+        "warmup_rounds": 20,
+        "warmup_sample_events": 19
+      },
+      {
+        "all_event_total_runtime_ns": {
+          "count": 600,
+          "max_ns": 283509,
+          "mean_ns": 93696.87,
+          "p50_ns": 770,
+          "p95_ns": 281210,
+          "p99_ns": 282399
+        },
+        "all_event_wall_runtime_ns": {
+          "count": 600,
+          "max_ns": 283679,
+          "mean_ns": 93864.18666666666,
+          "p50_ns": 930,
+          "p95_ns": 281389,
+          "p99_ns": 282568
+        },
+        "benchmark": "sze_factor_benchmark_v1",
+        "dump_format": "JSONL sample identity and 50 factors",
+        "events": 50660,
+        "factor_count": 50,
+        "factor_digest": "e71e3c4b4e4aa171",
+        "identity_digest": "f668dcb1bdc36fed",
+        "input_preconstructed": true,
+        "live_orders": 50000,
+        "measured_rounds": 200,
+        "non_sample_total_runtime_ns": {
+          "count": 400,
+          "max_ns": 990,
+          "mean_ns": 624.4,
+          "p50_ns": 690,
+          "p95_ns": 820,
+          "p99_ns": 960
+        },
+        "price_levels": 100,
+        "sample_events": 200,
+        "sample_work_ns": {
+          "count": 200,
+          "max_ns": 282879,
+          "mean_ns": 279199.11,
+          "p50_ns": 279260,
+          "p95_ns": 281259,
+          "p99_ns": 282099
+        },
+        "samples": 200,
+        "timing_source": "Runtime::EventTiming plus CLOCK_MONOTONIC_RAW wall",
+        "warmup_rounds": 20,
+        "warmup_sample_events": 19
+      }
+    ],
+    "candidate": [
+      {
+        "all_event_total_runtime_ns": {
+          "count": 600,
+          "max_ns": 14120,
+          "mean_ns": 1059.3966666666668,
+          "p50_ns": 680,
+          "p95_ns": 2020,
+          "p99_ns": 2080
+        },
+        "all_event_wall_runtime_ns": {
+          "count": 600,
+          "max_ns": 14270,
+          "mean_ns": 1215.8466666666666,
+          "p50_ns": 830,
+          "p95_ns": 2180,
+          "p99_ns": 2240
+        },
+        "benchmark": "sze_factor_benchmark_v1",
+        "dump_format": "JSONL sample identity and 50 factors",
+        "events": 1660,
+        "factor_count": 50,
+        "factor_digest": "10a0464d591aa835",
+        "identity_digest": "2fb1b5e8712e02d6",
+        "input_preconstructed": true,
+        "live_orders": 1000,
+        "measured_rounds": 200,
+        "non_sample_total_runtime_ns": {
+          "count": 400,
+          "max_ns": 2799,
+          "mean_ns": 549.1975,
+          "p50_ns": 620,
+          "p95_ns": 730,
+          "p99_ns": 790
+        },
+        "price_levels": 100,
+        "sample_events": 200,
+        "sample_work_ns": {
+          "count": 200,
+          "max_ns": 8549,
+          "mean_ns": 1531.245,
+          "p50_ns": 1490,
+          "p95_ns": 1520,
+          "p99_ns": 1530
+        },
+        "samples": 200,
+        "timing_source": "Runtime::EventTiming plus CLOCK_MONOTONIC_RAW wall",
+        "warmup_rounds": 20,
+        "warmup_sample_events": 19
+      },
+      {
+        "all_event_total_runtime_ns": {
+          "count": 600,
+          "max_ns": 73880,
+          "mean_ns": 1149.3166666666666,
+          "p50_ns": 700,
+          "p95_ns": 2020,
+          "p99_ns": 2050
+        },
+        "all_event_wall_runtime_ns": {
+          "count": 600,
+          "max_ns": 74050,
+          "mean_ns": 1305.9833333333333,
+          "p50_ns": 840,
+          "p95_ns": 2180,
+          "p99_ns": 2210
+        },
+        "benchmark": "sze_factor_benchmark_v1",
+        "dump_format": "JSONL sample identity and 50 factors",
+        "events": 10660,
+        "factor_count": 50,
+        "factor_digest": "2198d30534157abe",
+        "identity_digest": "8d56553bb53b6f62",
+        "input_preconstructed": true,
+        "live_orders": 10000,
+        "measured_rounds": 200,
+        "non_sample_total_runtime_ns": {
+          "count": 400,
+          "max_ns": 1340,
+          "mean_ns": 551.375,
+          "p50_ns": 470,
+          "p95_ns": 740,
+          "p99_ns": 790
+        },
+        "price_levels": 100,
+        "sample_events": 200,
+        "sample_work_ns": {
+          "count": 200,
+          "max_ns": 1740,
+          "mean_ns": 1499.65,
+          "p50_ns": 1500,
+          "p95_ns": 1520,
+          "p99_ns": 1530
+        },
+        "samples": 200,
+        "timing_source": "Runtime::EventTiming plus CLOCK_MONOTONIC_RAW wall",
+        "warmup_rounds": 20,
+        "warmup_sample_events": 19
+      },
+      {
+        "all_event_total_runtime_ns": {
+          "count": 600,
+          "max_ns": 397409,
+          "mean_ns": 1695.3633333333332,
+          "p50_ns": 700,
+          "p95_ns": 2040,
+          "p99_ns": 2110
+        },
+        "all_event_wall_runtime_ns": {
+          "count": 600,
+          "max_ns": 397599,
+          "mean_ns": 1851.3466666666666,
+          "p50_ns": 850,
+          "p95_ns": 2200,
+          "p99_ns": 2270
+        },
+        "benchmark": "sze_factor_benchmark_v1",
+        "dump_format": "JSONL sample identity and 50 factors",
+        "events": 50660,
+        "factor_count": 50,
+        "factor_digest": "e71e3c4b4e4aa171",
+        "identity_digest": "f668dcb1bdc36fed",
+        "input_preconstructed": true,
+        "live_orders": 50000,
+        "measured_rounds": 200,
+        "non_sample_total_runtime_ns": {
+          "count": 400,
+          "max_ns": 850,
+          "mean_ns": 549.875,
+          "p50_ns": 490,
+          "p95_ns": 750,
+          "p99_ns": 790
+        },
+        "price_levels": 100,
+        "sample_events": 200,
+        "sample_work_ns": {
+          "count": 200,
+          "max_ns": 1790,
+          "mean_ns": 1496.095,
+          "p50_ns": 1490,
+          "p95_ns": 1520,
+          "p99_ns": 1530
+        },
+        "samples": 200,
+        "timing_source": "Runtime::EventTiming plus CLOCK_MONOTONIC_RAW wall",
+        "warmup_rounds": 20,
+        "warmup_sample_events": 19
+      }
+    ],
+    "sample_files_identical": true
+  },
+  "trading_day": 20260909
+}
