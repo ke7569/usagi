@@ -180,8 +180,6 @@ int run(const std::string& config_path, const std::string& profile_path,
         cpu_lease.cpus().size() != 1U)
         throw std::runtime_error(affinity_error.empty()
             ? "prediction CPU lease failed" : affinity_error);
-    if (!sse_cpu::bind_current_thread(cpu_lease.cpus()[0].id, &affinity_error))
-        throw std::runtime_error(affinity_error);
 
     std::unique_ptr<sze_recovery::ReplayHandoffConsumer> consumer(
         new sze_recovery::ReplayHandoffConsumer());
@@ -198,9 +196,14 @@ int run(const std::string& config_path, const std::string& profile_path,
 
     // The prediction process consumes source-89 records as a live application
     // stream. It does not create a MarketDataStream and never writes capture
-    // files; journal and SHM ownership stays with the producer.
+    // files; journal and SHM ownership stays with the producer. Construct it
+    // before binding the owner so eager SSE workers inherit the original
+    // process affinity while discovering their explicit book/inference CPU
+    // sets.
     application.reset(new sse_application::StreamProcessingCli(
         profile_path, true, config.journal.directory, 2U, healthy, "raw"));
+    if (!sse_cpu::bind_current_thread(cpu_lease.cpus()[0].id, &affinity_error))
+        throw std::runtime_error(affinity_error);
     if (!consumer->open(config.journal, config.ring.path, false)) {
         std::ostringstream message;
         message << "Shanghai journal handoff open failed status="

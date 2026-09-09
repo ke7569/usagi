@@ -104,3 +104,13 @@ GitHub 分支为 `sse-latency-20260909`，包含快速解析、增量订单簿�
 两阶段追赶能够进入 live、当天 Auction59 和快照模型有效。
 当前 service 默认 monitor、订单关闭；是否开启订单仍由当天交易准备流程决定。
 本次工作不更改 production service、开盘定时任务或实盘订单开关。
+
+## 提交前验证
+
+目标机器的 sysfs L3 拓扑检查确认上表 32 个 CPU 分属 32 个不同 L3 域。
+实际 profile 生成函数保留了完整 4+20 配置和 hardware-v3 合同。
+修复 journal predictor 的启动顺序：先租用入口核，创建工作线程，
+最后绑定入口线程，避免工作线程只继承入口的单核可用范围。
+修复后 `t0_sse_journal_predict` 构建成功，现有 CTest 50/50 全部通过，
+包含 journal/SHM 衔接、计算管线、CPU 分配、模型与深圳兼容性测试。
+这些验证不替代上文尚未完成的生产 Auction59/TD 集成验收。
