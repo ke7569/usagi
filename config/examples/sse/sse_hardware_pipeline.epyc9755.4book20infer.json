@@ -1,0 +1,7 @@
+{
+  "book_cpus": [32, 48, 56, 64],
+  "inference_cpus": [72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224],
+  "ingress_capacity": 65536,
+  "inference_capacity": 4096,
+  "output_capacity": 4096
+}
