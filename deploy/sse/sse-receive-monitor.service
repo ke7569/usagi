@@ -1,0 +1,13 @@
+[Unit]
+Description=SSE receive loss and resource evidence
+After=network-online.target
+Before=sse-journal-capture.service
+[Service]
+Type=simple
+ExecStart=/usr/bin/python2 /home/zane/usagi-sse-dev/tools/sse/sse_receive_ops.py monitor
+CPUAffinity=128
+Nice=10
+IOSchedulingClass=idle
+Restart=on-failure
+RestartSec=5
+UMask=0027

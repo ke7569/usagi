@@ -85,7 +85,7 @@ add_test(NAME strategy_session_test COMMAND strategy_session_test)
 
 if(T0_BUILD_SZE_STREAM_PROCESSOR)
   add_executable(sze_recoverable_test
-    ${USAGI_ROOT}/tests/sze/sze_recoverable_test.cpp ${USAGI_ROOT}/sze/market_data/SZERecoverable.cpp)
+    ${USAGI_ROOT}/tests/sze/sze_recoverable_test.cpp ${USAGI_ROOT}/common/recovery/SZERecoverable.cpp)
   target_include_directories(sze_recoverable_test PRIVATE ${USAGI_ROOT}/sze/market_data)
   target_link_libraries(sze_recoverable_test PRIVATE pthread rt)
   target_compile_options(sze_recoverable_test PRIVATE -UNDEBUG)
@@ -93,7 +93,7 @@ if(T0_BUILD_SZE_STREAM_PROCESSOR)
   
   add_executable(sze_health_state_test
     ${USAGI_ROOT}/tests/sze/sze_health_state_test.cpp
-    ${USAGI_ROOT}/sze/market_data/SZEHealthState.cpp ${USAGI_ROOT}/sze/market_data/SZERecoverable.cpp)
+    ${USAGI_ROOT}/sze/market_data/SZEHealthState.cpp ${USAGI_ROOT}/common/recovery/SZERecoverable.cpp)
   target_include_directories(sze_health_state_test PRIVATE ${USAGI_ROOT}/sze/market_data)
   target_link_libraries(sze_health_state_test PRIVATE pthread rt)
   target_compile_options(sze_health_state_test PRIVATE -UNDEBUG)
@@ -102,7 +102,7 @@ if(T0_BUILD_SZE_STREAM_PROCESSOR)
   if(SZE_BUILD_DIRECT_SHARDED_RING)
     add_executable(sze_direct_sharded_ring_test
       ${USAGI_ROOT}/tests/sze/sze_direct_sharded_ring_test.cpp
-      ${USAGI_ROOT}/sze/market_data/SZEDirectShardedRing.cpp ${USAGI_ROOT}/sze/market_data/SZERecoverable.cpp)
+      ${USAGI_ROOT}/sze/market_data/SZEDirectShardedRing.cpp ${USAGI_ROOT}/common/recovery/SZERecoverable.cpp)
     target_include_directories(sze_direct_sharded_ring_test PRIVATE ${USAGI_ROOT}/sze/market_data)
     target_link_libraries(sze_direct_sharded_ring_test PRIVATE pthread rt)
     target_compile_options(sze_direct_sharded_ring_test PRIVATE -UNDEBUG)
@@ -111,7 +111,7 @@ if(T0_BUILD_SZE_STREAM_PROCESSOR)
   
   add_executable(sze_protocol_test
     ${USAGI_ROOT}/tests/sze/sze_protocol_test.cpp ${USAGI_ROOT}/sze/market_data/SZEProtocol.cpp
-    ${USAGI_ROOT}/sze/market_data/SZERecoverable.cpp)
+    ${USAGI_ROOT}/common/recovery/SZERecoverable.cpp)
   target_include_directories(sze_protocol_test PRIVATE ${USAGI_ROOT}/sze/market_data ${DEEPWIN_INCLUDE})
   target_link_libraries(sze_protocol_test PRIVATE pthread rt)
   target_compile_options(sze_protocol_test PRIVATE -UNDEBUG)
@@ -134,6 +134,11 @@ if(T0_BUILD_SZE_STREAM_PROCESSOR)
 endif()
 
 if(T0_BUILD_SSE_STREAM_PROCESSOR)
+  add_executable(sse_crc_ring_test ${USAGI_ROOT}/tests/sse/sse_crc_ring_test.cpp)
+  target_include_directories(sse_crc_ring_test PRIVATE ${BOOST_INCLUDE})
+  target_link_libraries(sse_crc_ring_test PRIVATE sse_journal_core)
+  add_test(NAME sse_crc_ring_test COMMAND sse_crc_ring_test)
+  set_tests_properties(sse_crc_ring_test PROPERTIES TIMEOUT 120)
   add_executable(sse_journal_handoff_test ${USAGI_ROOT}/tests/sse/sse_journal_handoff_test.cpp)
   target_link_libraries(sse_journal_handoff_test PRIVATE sse_journal_core)
   target_compile_options(sse_journal_handoff_test PRIVATE -UNDEBUG)
@@ -255,4 +260,77 @@ if(T0_STREAM_PYTHON)
   add_test(NAME unified_config_test COMMAND ${T0_STREAM_PYTHON} -B -m unittest discover -s ${USAGI_ROOT}/tests/common -p "test_unified_config*.py")
   add_test(NAME processing_config_test COMMAND ${T0_STREAM_PYTHON} -B ${USAGI_ROOT}/tests/common/test_prepare_stream_processing.py)
   add_test(NAME sze_daily_config_test COMMAND ${T0_STREAM_PYTHON} -B ${USAGI_ROOT}/tests/sze/test_prepare_sze_runtime.py)
+endif()
+
+# Keep ATP cancel objects separate from their original OMS order.
+add_executable(atp_order_report_mapping_test ${USAGI_ROOT}/tests/oms/atp_order_report_mapping_test.cpp)
+target_compile_options(atp_order_report_mapping_test PRIVATE -UNDEBUG)
+add_test(NAME atp_order_report_mapping_test COMMAND atp_order_report_mapping_test)
+add_executable(atp_cancel_lifecycle_test ${USAGI_ROOT}/tests/oms/atp_cancel_lifecycle_test.cpp)
+target_link_libraries(atp_cancel_lifecycle_test PRIVATE t0_oms_core)
+target_compile_options(atp_cancel_lifecycle_test PRIVATE -UNDEBUG)
+add_test(NAME atp_cancel_lifecycle_test COMMAND atp_cancel_lifecycle_test)
+
+if(TARGET sse_stream_processing)
+  add_executable(sse_owner_dispatch_test ${USAGI_ROOT}/tests/sse/sse_owner_dispatch_test.cpp)
+  target_link_libraries(sse_owner_dispatch_test PRIVATE sse_stream_processing t0_strategy_core)
+  target_compile_options(sse_owner_dispatch_test PRIVATE -UNDEBUG)
+  add_test(NAME sse_owner_dispatch_test COMMAND sse_owner_dispatch_test)
+  set_tests_properties(sse_owner_dispatch_test PROPERTIES TIMEOUT 60)
+endif()
+
+add_executable(atp_snapshot_order_test ${USAGI_ROOT}/tests/oms/atp_snapshot_order_test.cpp)
+target_link_libraries(atp_snapshot_order_test PRIVATE t0_oms_core)
+target_compile_options(atp_snapshot_order_test PRIVATE -UNDEBUG)
+add_test(NAME atp_snapshot_order_test COMMAND atp_snapshot_order_test)
+
+add_executable(async_diagnostic_log_test ${USAGI_ROOT}/tests/common/async_diagnostic_log_test.cpp)
+target_include_directories(async_diagnostic_log_test PRIVATE ${USAGI_ROOT})
+target_link_libraries(async_diagnostic_log_test PRIVATE pthread)
+target_compile_options(async_diagnostic_log_test PRIVATE -UNDEBUG)
+add_test(NAME async_diagnostic_log_test COMMAND async_diagnostic_log_test)
+set_tests_properties(async_diagnostic_log_test PROPERTIES TIMEOUT 15)
+find_program(T0_OPS_PYTHON NAMES python3 python2 python)
+if(T0_OPS_PYTHON)
+  add_test(NAME sse_receive_cpu_policy_test COMMAND ${T0_OPS_PYTHON} -B ${USAGI_ROOT}/tests/sse/test_receive_cpu_policy.py)
+endif()
+if(TARGET v06_model_golden_test)
+  set(T0_V06_GOLDEN_DIR "" CACHE PATH "Directory containing v06.bin and the golden model fixtures")
+  if(T0_V06_GOLDEN_DIR)
+    add_test(NAME v06_model_golden_test COMMAND v06_model_golden_test ${T0_V06_GOLDEN_DIR})
+  else()
+    message(STATUS "v06 model golden test requires explicit T0_V06_GOLDEN_DIR")
+  endif()
+endif()
+
+if(TARGET sse_journal_core)
+  add_executable(sse_capture_history_test ${USAGI_ROOT}/tests/sse/sse_capture_history_test.cpp)
+  target_link_libraries(sse_capture_history_test PRIVATE sse_journal_core deepwin_market_data_runtime)
+  target_compile_options(sse_capture_history_test PRIVATE -UNDEBUG)
+  add_test(NAME sse_capture_history_test COMMAND sse_capture_history_test)
+endif()
+
+if(TARGET sse_journal_core)
+  add_executable(crc_compatibility_test ${USAGI_ROOT}/tests/sse/crc_compatibility_test.cpp)
+  target_link_libraries(crc_compatibility_test PRIVATE sse_journal_core)
+  target_compile_options(crc_compatibility_test PRIVATE -UNDEBUG)
+  add_test(NAME crc_compatibility_test COMMAND crc_compatibility_test)
+endif()
+
+# Reproducible paced SHM replay with optional timing hooks in the same sources.
+if(TARGET sse_stream_processing)
+  add_executable(sse_latency_replay EXCLUDE_FROM_ALL
+    ${USAGI_ROOT}/tests/sse/latency_replay.cpp
+    ${USAGI_ROOT}/tests/sse/latency_wrappers.cpp
+    ${USAGI_ROOT}/sse/runtime/sse_stream_processor.cpp
+    ${USAGI_ROOT}/sse/runtime/sse_strategy_session.cpp)
+  target_include_directories(sse_latency_replay PRIVATE
+    ${USAGI_ROOT}/common/strategy ${USAGI_ROOT}/common/model/legacy)
+  target_compile_definitions(sse_latency_replay PRIVATE SSE_REPLAY_PROBE=1)
+  target_compile_options(sse_latency_replay PRIVATE -ffp-contract=off)
+  target_link_libraries(sse_latency_replay PRIVATE
+    sse_stream_processing sse_journal_core sse_runtime_support
+    deepwin_market_data_runtime sse_strategy_session t0_strategy_core)
+  set_property(TARGET sse_latency_replay APPEND_STRING PROPERTY LINK_FLAGS
+    " -Wl,--wrap=_ZN8sse_tick11FactorState5buildERNS_9OrderBookEmRA10_KNS_5LevelES6_ddd -Wl,--wrap=_ZNK7sse_v065Model7predictERKSt5arrayIfLm50EEPNS_5StateEPS1_IfLm4EEPNS_6StagesE")
 endif()

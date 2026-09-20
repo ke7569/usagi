@@ -1,4 +1,5 @@
 #include "common/recovery/SZERecoverable.h"
+#include "sse/runtime/sse_shm_prefetch.h"
 
 #include <cerrno>
 #include <cstdio>
@@ -69,11 +70,13 @@ void append_and_publish(sze_recovery::JournalWriter* writer,
 
 void consume_payload(sze_recovery::ReplayHandoffConsumer* consumer,
                      std::uint64_t expected_event_id) {
-    for (unsigned attempt = 0; attempt < 10000U; ++attempt) {
+    const auto deadline=sze_recovery::monotonic_time_ns()+1000000000ULL;
+    while (sze_recovery::monotonic_time_ns()<deadline) {
         sze_recovery::CanonicalEvent event;
         std::uint64_t payload = 0U;
+        const unsigned char* borrowed=nullptr;
         const sze_recovery::ReplayReadStatus status = consumer->next(
-            &event, &payload, sizeof(payload));
+            &event, &payload, sizeof(payload), &borrowed);
         if (status == sze_recovery::kReplayReadWouldBlock) {
             std::this_thread::yield();
             continue;
@@ -82,23 +85,34 @@ void consume_payload(sze_recovery::ReplayHandoffConsumer* consumer,
               "handoff consumer did not return an event");
         check(event.event_id == expected_event_id,
               "handoff event id changed order");
+        std::memcpy(&payload,borrowed,sizeof(payload));
         check(payload == (expected_event_id ^ 0xa5a5a5a5ULL),
               "handoff payload changed");
         return;
     }
-    throw std::runtime_error("handoff consumer remained blocked");
+    throw std::runtime_error("handoff consumer remained blocked at event "+std::to_string(expected_event_id));
 }
 
 void expect_would_block(sze_recovery::ReplayHandoffConsumer* consumer,
                         const char* message) {
     sze_recovery::CanonicalEvent event;
     std::uint64_t payload = 0U;
-    check(consumer->next(&event, &payload, sizeof(payload)) ==
+    const unsigned char* borrowed=nullptr;
+    check(consumer->next(&event, &payload, sizeof(payload), &borrowed) ==
               sze_recovery::kReplayReadWouldBlock,
           message);
 }
 
-void run_handoff_test() {
+void attach_prefetch(sze_recovery::ReplayHandoffConsumer& consumer,sse_journal::ShmPrefetch* reader) {
+    consumer.set_ring_reader([reader](std::uint64_t id,sze_recovery::CanonicalEvent* e,const unsigned char** bytes){
+        const sse_journal::ShmPrefetch::Record* record=nullptr;
+        const auto status=reader->read(id,&record);
+        if(record){*e=record->event;*bytes=record->payload.data();}
+        return status;
+    });
+}
+
+void run_handoff_test(bool prefetched) {
     const std::string directory = temporary_directory();
     const std::string ring_path = directory + "/events.shm";
 
@@ -121,6 +135,7 @@ void run_handoff_test() {
 
     sze_recovery::JournalWriter writer;
     sze_recovery::ShmEventRing producer;
+    std::unique_ptr<sse_journal::ShmPrefetch> first_reader,second_reader;
     try {
         check(writer.open(journal).status == sze_recovery::kJournalOk,
               "handoff journal open failed");
@@ -139,12 +154,16 @@ void run_handoff_test() {
         sze_recovery::ReplayHandoffConsumer consumer;
         check(consumer.open(journal, ring_path, false),
               "late reader open failed");
+        if(prefetched){first_reader.reset(new sse_journal::ShmPrefetch(producer,sched_getcpu()));attach_prefetch(consumer,first_reader.get());}
         check(consumer.mode() == sze_recovery::kReplayJournal,
               "late reader did not begin with journal replay");
         check(producer.readiness_state() == sze_recovery::kReadinessLiveReady,
               "read-only consumer changed producer readiness");
         for (std::uint64_t event_id = 1U; event_id <= 3U; ++event_id)
             consume_payload(&consumer, event_id);
+        // Metrics are not a state checkpoint. A new book/model process must
+        // reconstruct its state even if another reader published a cursor.
+        producer.publish_replay_metrics(3U, 0U, 0U, 0U, 0U, 0U);
 
         expect_would_block(&consumer, "journal EOF did not wait for handoff");
         check(consumer.mode() == sze_recovery::kReplayHandoff,
@@ -157,6 +176,7 @@ void run_handoff_test() {
               "read-only consumer changed live readiness");
         append_and_publish(&writer, &producer, 5U);
         consume_payload(&consumer, 5U);
+        if(first_reader)first_reader->stop();
         consumer.close();
 
         // A restarted predictor always starts from journal event one and then
@@ -164,6 +184,9 @@ void run_handoff_test() {
         sze_recovery::ReplayHandoffConsumer restarted;
         check(restarted.open(journal, ring_path, false),
               "restarted reader open failed");
+        if(prefetched){second_reader.reset(new sse_journal::ShmPrefetch(producer,sched_getcpu()));attach_prefetch(restarted,second_reader.get());}
+        check(restarted.next_event_id() == 1U,
+              "fresh reader skipped state history using a metrics cursor");
         for (std::uint64_t event_id = 1U; event_id <= 5U; ++event_id)
             consume_payload(&restarted, event_id);
         expect_would_block(&restarted, "restarted reader skipped handoff");
@@ -176,14 +199,32 @@ void run_handoff_test() {
 
         // Let the live reader fall behind the four-slot ring. The consumer
         // must seek the journal instead of accepting a discontinuous ring read.
+        if(second_reader)second_reader->stop();
         for (std::uint64_t sequence = 7U; sequence <= 11U; ++sequence)
             append_and_publish(&writer, &producer, sequence);
-        expect_would_block(&restarted, "ring overrun did not fall back to journal");
+        for(unsigned attempt=0;restarted.mode()!=sze_recovery::kReplayJournal && attempt<10000;++attempt){
+            expect_would_block(&restarted,"ring overrun did not fall back to journal");std::this_thread::yield();
+        }
         check(restarted.mode() == sze_recovery::kReplayJournal,
               "ring overrun did not return to journal replay");
         check(restarted.ring_overruns() == 1U,
               "ring overrun metric was not recorded");
         consume_payload(&restarted, 7U);
+
+        // A borrowed slot survives capture-ring wrap and a full prefetch queue.
+        append_and_publish(&writer,&producer,12U);
+        sse_journal::ShmPrefetch held(producer,sched_getcpu(),1);
+        const sse_journal::ShmPrefetch::Record* view=nullptr;
+        for(unsigned n=0;n<100000 && !view;++n){held.read(12,&view);std::this_thread::yield();}
+        check(view && view->event.event_id==12,"prefetch did not expose first record");
+        for(std::uint64_t n=13;n<=18;++n)append_and_publish(&writer,&producer,n);
+        std::uint64_t held_payload=0;std::memcpy(&held_payload,view->payload.data(),sizeof(held_payload));
+        check(held_payload==(12U^0xa5a5a5a5ULL),"borrowed payload was overwritten");
+        held.stop(); // Must join even while the one-slot queue is full.
+        auto held_status=sze_recovery::kRingReadNotReady;
+        for(unsigned n=0;n<100000 && held_status==sze_recovery::kRingReadNotReady;++n){held_status=held.read(13,&view);std::this_thread::yield();}
+        check(held_status==sze_recovery::kRingReadOverrun,"prefetch hid a capture-ring overrun");
+        held.stop();
 
         sze_recovery::ShmRingHeader* header = const_cast<sze_recovery::ShmRingHeader*>(
             producer.header());
@@ -194,6 +235,7 @@ void run_handoff_test() {
         check(restarted.next(&event, &payload, sizeof(payload)) ==
                   sze_recovery::kReplayReadInvalid,
               "generation mismatch was accepted");
+        if(second_reader)second_reader->stop();
         restarted.close();
 
         // A configuration generation mismatch is rejected before any event is
@@ -209,6 +251,7 @@ void run_handoff_test() {
               "handoff journal clean close failed");
         producer.close();
     } catch (...) {
+        if(first_reader)first_reader->stop();if(second_reader)second_reader->stop();
         producer.close();
         (void)writer.close(false);
         remove_journal(journal, 8U);
@@ -225,7 +268,8 @@ void run_handoff_test() {
 
 int main() {
     try {
-        run_handoff_test();
+        run_handoff_test(false);
+        run_handoff_test(true);
         std::cout << "sse_journal_handoff_test: PASS\n";
         return 0;
     } catch (const std::exception& error) {

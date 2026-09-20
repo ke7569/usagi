@@ -350,7 +350,7 @@ nlohmann::json json_config(const std::string& directory,
     value["max_datagram_bytes"] = 8192;
     value["receive_batch_size"] = 4;
     value["receive_buffer_bytes"] = 1048576;
-    value["idle_gap_ns"] = 100000;
+    value["idle_gap_ns"] = sse_journal::kDefaultIdleGapNanoseconds;
     value["receive_cpu"] = -1;
     value["dispatch_cpu"] = -1;
     value["journal_cpu"] = -1;
@@ -376,19 +376,58 @@ void test_config_load(const std::string& directory) {
     sse_journal::Config v1 = sse_journal::load(path);
     check(!v1.extended_timestamps && sse_journal::stored_header_bytes(v1) == 48U &&
           v1.journal.max_payload_bytes == 8240U &&
-          v1.stream.hardware_timestamp_interface.empty(),
+          v1.stream.idle_gap_ns == sse_journal::kDefaultIdleGapNanoseconds &&
+          v1.stream.hardware_timestamp_interface.empty() && !v1.stream.receive_busy_poll && !v1.stream.dispatch_busy_poll,
           "v1 config load changed timestamp defaults");
 
     {
         std::ofstream output(path.c_str());
-        output << json_config(directory, "sse-stream-v2", "eth-test", boot).dump();
+        auto config = json_config(directory, "sse-stream-v1", "", boot);
+        config.erase("idle_gap_ns");
+        output << config.dump();
+    }
+    sse_journal::Config defaulted = sse_journal::load(path);
+    check(defaulted.stream.idle_gap_ns == sse_journal::kDefaultIdleGapNanoseconds,
+          "missing idle gap did not use the 5us capture default");
+
+    {
+        std::ofstream output(path.c_str());
+        auto config = json_config(directory, "sse-stream-v1", "", boot);
+        config["idle_gap_ns"] = sse_journal::kHistoricalIdleGapNanoseconds;
+        output << config.dump();
+    }
+    sse_journal::Config historical = sse_journal::load(path);
+    check(historical.stream.idle_gap_ns == sse_journal::kHistoricalIdleGapNanoseconds,
+          "100us historical capture configuration was rejected");
+
+    for (const std::uint64_t invalid : {0ULL, 1ULL, 4999ULL, 5001ULL,
+                                        99999ULL, 100001ULL}) {
+        {
+            std::ofstream output(path.c_str());
+            auto config = json_config(directory, "sse-stream-v1", "", boot);
+            config["idle_gap_ns"] = invalid;
+            output << config.dump();
+        }
+        expect_throw([&]() { (void)sse_journal::load(path); },
+                     "unsupported idle gap was accepted");
+    }
+
+    {
+        std::ofstream output(path.c_str());
+        auto config=json_config(directory, "sse-stream-v2", "eth-test", boot);
+        config["receive_busy_poll"]=true;config["dispatch_busy_poll"]=true;output << config.dump();
     }
     sse_journal::Config v2 = sse_journal::load(path);
     check(v2.extended_timestamps && sse_journal::stored_header_bytes(v2) == 80U &&
           v2.journal.max_payload_bytes == 8272U &&
-          v2.stream.hardware_timestamp_interface == "eth-test",
+          v2.stream.hardware_timestamp_interface == "eth-test" && v2.stream.receive_busy_poll && v2.stream.dispatch_busy_poll,
           "v2 config load did not enable extended timestamps");
 
+    for(const char* key:{"receive_busy_poll","dispatch_busy_poll"}) {
+        auto config=json_config(directory,"sse-stream-v2","eth-test",boot);config[key]="true";
+        {std::ofstream output(path.c_str());output<<config.dump();}
+        expect_throw([&]() { (void)sse_journal::load(path); }, "nonboolean busy poll accepted");
+    }
     {
         std::ofstream output(path.c_str());
         output << json_config(directory, "sse-stream-v1", "eth-test", boot).dump();

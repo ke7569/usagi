@@ -7,25 +7,30 @@ namespace sse_live {
 namespace {
 
 std::uint32_t u32(const unsigned char* p) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    std::uint32_t value;std::memcpy(&value,p,sizeof(value));return value;
+#else
     return static_cast<std::uint32_t>(p[0]) |
            (static_cast<std::uint32_t>(p[1]) << 8) |
            (static_cast<std::uint32_t>(p[2]) << 16) |
            (static_cast<std::uint32_t>(p[3]) << 24);
+#endif
 }
 
 std::uint64_t u64(const unsigned char* p) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    std::uint64_t value;std::memcpy(&value,p,sizeof(value));return value;
+#else
     std::uint64_t value = 0;
     for (int i = 7; i >= 0; --i) value = (value << 8) | p[i];
     return value;
+#endif
 }
 
-std::string ascii(const unsigned char* p, std::size_t length) {
-    std::string value;
-    for (std::size_t i = 0; i < length && p[i] != 0; ++i) {
-        if (p[i] >= '0' && p[i] <= '9') value.push_back(static_cast<char>(p[i]));
-        else if (p[i] != ' ') return std::string();
-    }
-    return value;
+bool security6(const unsigned char* p) {
+    for (std::size_t i = 0; i < 6U; ++i)
+        if (p[i] < '0' || p[i] > '9') return false;
+    return true;
 }
 
 bool hms_micros(std::uint32_t raw, bool centiseconds, std::uint64_t* result) {
@@ -54,7 +59,8 @@ void fail(const char* message, std::string* error) {
 bool is_primary_heartbeat(const unsigned char* payload, std::size_t length) {
     if (!payload || length != 32U || std::memcmp(payload, payload + 16, 16U))
         return false;
-    if (payload[8] != 0xa2U) return false;
+    // Primary tick (0xa2) and snapshot (0x8b) heartbeats share this exact ABI.
+    if (payload[8] != 0xa2U && payload[8] != 0x8bU) return false;
     for (unsigned i = 4U; i < 16U; ++i)
         if (i != 8U && payload[i] != 0U) return false;
     return true;
@@ -66,16 +72,18 @@ bool is_sse_stock(const std::string& security_id) {
             (security_id[0] == '6' && security_id[1] == '8'));
 }
 
-bool decode_primary_tick(const unsigned char* payload, std::size_t length,
-                         TickEvent* event, std::string* error, bool equities_only) {
-    if (error) error->clear();
+namespace {
+void security_assign(TickEvent* event,const unsigned char* p){event->security_id.assign(reinterpret_cast<const char*>(p),6U);}
+void security_assign(RawTickEvent* event,const unsigned char* p){std::uint32_t n=0;for(unsigned i=0;i<6;++i)n=n*10+p[i]-'0';event->security_number=n;}
+template<class Event> bool decode_tick_impl(const unsigned char* payload, std::size_t length,
+                         Event* event, std::string* error, bool equities_only) {
     if (!payload || !event || length != 72U || payload[8] != 0x3eU) {
         fail("primary tick ABI mismatch", error);
         return false;
     }
-    const std::string security = ascii(payload + 21, 8U);
+    const unsigned char* security = payload + 21;
     std::uint64_t time_of_day = 0;
-    if (security.size() != 6U || (equities_only && !is_sse_stock(security)) ||
+    if (!security6(security) || (equities_only && !(security[0] == '6' && (security[1] == '0' || security[1] == '8'))) ||
         !hms_micros(u32(payload + 30), true, &time_of_day)) {
         fail("invalid primary tick security/time", error);
         return false;
@@ -85,7 +93,7 @@ bool decode_primary_tick(const unsigned char* payload, std::size_t length,
         fail("unknown primary tick event type", error);
         return false;
     }
-    event->security_id = security;
+    security_assign(event,security);
     // EFH sse_hpf_tick_merge: m_sequence@0, m_tick_index@9,
     // m_channel_num@17 (uint16). Offset +4 is reserved.
     event->provider_sequence = u32(payload + 0);
@@ -104,24 +112,42 @@ bool decode_primary_tick(const unsigned char* payload, std::size_t length,
     return true;
 }
 
+} // namespace
+bool decode_primary_tick(const unsigned char* p,std::size_t n,TickEvent* e,std::string* error,bool equities){return decode_tick_impl(p,n,e,error,equities);}
+bool decode_primary_raw_tick(const unsigned char* p,std::size_t n,RawTickEvent* e,std::string* error,bool equities){return decode_tick_impl(p,n,e,error,equities);}
+void materialize_tick(const RawTickEvent& r,TickEvent* t){
+    char code[6];unsigned n=r.security_number;for(int i=5;i>=0;--i){code[i]='0'+n%10;n/=10;}t->security_id.assign(code,6);
+    t->channel_no=r.channel_no;
+    t->provider_sequence=r.provider_sequence;
+    t->tick_index=r.tick_index;
+    t->app_seq_num=r.app_seq_num;
+    t->time_of_day_micros=r.time_of_day_micros;
+    t->event_type=r.event_type;
+    t->buy_order_no=r.buy_order_no;
+    t->sell_order_no=r.sell_order_no;
+    t->price_raw=r.price_raw;
+    t->quantity_raw=r.quantity_raw;
+    t->amount_raw=r.amount_raw;
+    t->side=r.side;
+}
+
 bool decode_primary_snapshot(const unsigned char* payload, std::size_t length,
                              Snapshot* snapshot, std::string* error, bool equities_only) {
-    if (error) error->clear();
     if (!payload || !snapshot || length != 440U || payload[8] != 0x27U) {
         fail("primary snapshot ABI mismatch", error);
         return false;
     }
-    const std::string security = ascii(payload + 30, 8U);
+    const unsigned char* security = payload + 30;
     std::uint64_t time_of_day = 0;
     // m_send_time@16 is transport time; m_quote_update_time@26 is the
     // market-data update time.
     const std::uint32_t time_raw = u32(payload + 26);
-    if (security.size() != 6U || (equities_only && !is_sse_stock(security)) ||
+    if (!security6(security) || (equities_only && !(security[0] == '6' && (security[1] == '0' || security[1] == '8'))) ||
         !hms_micros(time_raw, false, &time_of_day)) {
         fail("invalid primary snapshot security/time", error);
         return false;
     }
-    snapshot->security_id = security;
+    snapshot->security_id.assign(reinterpret_cast<const char*>(security), 6U);
     snapshot->channel_no = 0;  // sse_hpf_lev2 contains no m_channel_num
     snapshot->provider_sequence = u32(payload + 0);
     snapshot->msg_seq_id = u32(payload + 21);

@@ -141,6 +141,7 @@ struct Processing {
 void test_burst_record_replay() {
     TemporaryDirectory temp;
     StreamOptions options;
+    options.receive_busy_poll=options.dispatch_busy_poll=std::getenv("SSE_TEST_BUSY_POLL")!=0;
     options.recording_directory = temp.path + "/capture";
     options.queue_capacity = 4096;
     options.max_datagram_bytes = 1024;
@@ -249,6 +250,7 @@ void test_burst_record_replay() {
 void test_failure_modes(bool required) {
     TemporaryDirectory temp;
     StreamOptions options;
+    options.receive_busy_poll=options.dispatch_busy_poll=std::getenv("SSE_TEST_BUSY_POLL")!=0;
     options.queue_capacity = 2;
     options.max_datagram_bytes = 128;
     options.recording_directory = temp.path + "/overflow";

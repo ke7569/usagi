@@ -30,11 +30,11 @@ if(SZE_MARCH_NATIVE)
 else()
   add_compile_options(-march=x86-64 -mtune=generic)
 endif()
-add_compile_options(-O3 -DNDEBUG)
+add_compile_options(-O3 -DNDEBUG -ffp-contract=off)
 # Preserve existing external binary/library locations and exported names.
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
-include_directories("${USAGI_ROOT}")
+include_directories("${USAGI_ROOT}" "${BOOST_INCLUDE}")
 enable_testing()
 find_program(T0_STREAM_PYTHON NAMES python3 python3.6)
 

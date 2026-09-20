@@ -8,6 +8,8 @@
 
 #include "sse/model/snapshot_ensemble.h"
 #include "common/model/legacy_midmix/sse_model_runtime.h"
+#include "sse/model/v06_model.h"
+#include "sse/model/v06_audit.h"
 
 namespace sse_hybrid_model {
 
@@ -22,6 +24,7 @@ enum Source {
 struct State {
     sse_model::State tick;
     sse_snapshot_gru::DualState snapshot;
+    sse_v06::State v06;
 
     State();
     void reset();
@@ -35,6 +38,8 @@ struct Prediction {
     float tick_pred;
     float snapshot_pred;
     float selected_pred;
+    bool multi_head;
+    sse_v06::Heads heads;
 
     Prediction();
 };
@@ -55,6 +60,8 @@ public:
               const std::string& snapshot_auction_scaler,
               std::string* error = 0);
     bool loaded() const { return loaded_; }
+    bool load_v06(const std::string& path, std::string* error);
+    bool is_v06() const { return v06_.loaded(); }
 
     bool on_tick(const std::array<float, sse_model::kFeatureCount>& factors,
                  const std::string& exchange,
@@ -77,6 +84,7 @@ public:
 private:
     sse_model::Model tick_;
     sse_snapshot_gru::Ensemble snapshot_;
+    sse_v06::Model v06_;
     bool loaded_;
 };
 

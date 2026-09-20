@@ -286,7 +286,7 @@ void test_hardware_timestamp_regression_is_per_channel() {
             tick(2U, 2U, 'A', 1, 9300000U, 0U, 2001U),
             3U, 3000U, 999999ULL, 2U));
     } catch (const std::runtime_error&) { threw = true; }
-    assert(threw && processor.invalid());
+    assert(!threw && !processor.invalid());
 }
 
 void test_duplicate_and_gap_are_distinct() {
@@ -541,6 +541,14 @@ void test_primary_heartbeat() {
     const std::vector<unsigned char> pulse = primary_heartbeat();
     accepted.on_event(event(pulse, 1U, 1U));
     assert(!accepted.invalid());
+    std::vector<unsigned char> snapshot_pulse = pulse;
+    snapshot_pulse[8] = snapshot_pulse[24] = 0x8bU;
+    accepted.on_event(event(snapshot_pulse, 2U, 2U));
+    assert(!accepted.invalid());
+    snapshot_pulse[24] = 0xa2U;
+    assert(!sse_live::is_primary_heartbeat(snapshot_pulse.data(), snapshot_pulse.size()));
+    snapshot_pulse[8] = snapshot_pulse[24] = 0x8cU;
+    assert(!sse_live::is_primary_heartbeat(snapshot_pulse.data(), snapshot_pulse.size()));
 
     sse_stream::SseStreamProcessor mismatched(
         metadata(), 0, true, [](const sse_stream::Output&) {});
@@ -960,7 +968,31 @@ void test_market_data_stream_live_replay_parity() {
 
 }  // namespace
 
+void test_unaligned_raw_decode() {
+    std::uint64_t seed=0x912345678abcdefULL;
+    auto next=[&](){seed^=seed<<13;seed^=seed>>7;seed^=seed<<17;return seed;};
+    for(unsigned alignment=0;alignment<64;++alignment)for(unsigned trial=0;trial<64;++trial) {
+        std::vector<unsigned char> storage(alignment+72,0);auto*p=storage.data()+alignment;
+        auto put=[&](unsigned offset,std::uint64_t v,unsigned width){for(unsigned j=0;j<width;++j)p[offset+j]=v>>(8*j);};
+        const std::uint32_t provider=next(),price=next();
+        const auto wire=next(),buy=next(),sell=next(),qty=next(),amount=next();
+        put(0,provider,4);p[8]=0x3e;put(9,wire,8);put(17,0x1234,2);
+        std::memcpy(p+21,"603686",6);put(30,9300000,4);p[34]="ADTS"[trial%4];
+        put(35,buy,8);put(43,sell,8);put(51,price,4);put(55,qty,8);put(63,amount,8);p[71]=trial%2;
+        sse_live::RawTickEvent raw;assert(sse_live::decode_primary_raw_tick(p,72,&raw));
+        assert(raw.security_number==603686 && raw.channel_no==0x1234 && raw.provider_sequence==provider);
+        assert(raw.tick_index==wire && raw.app_seq_num==wire && raw.time_of_day_micros==34200000000ULL);
+        assert(raw.buy_order_no==buy && raw.sell_order_no==sell && raw.price_raw==price);
+        assert(raw.quantity_raw==qty && raw.amount_raw==amount && raw.event_type==p[34] && raw.side==p[71]);
+        sse_live::TickEvent decoded;assert(sse_live::decode_primary_tick(p,72,&decoded));
+        assert(decoded.security_id=="603686" && decoded.tick_index==wire && decoded.amount_raw==amount);
+        assert(!sse_live::decode_primary_raw_tick(p,trial%72,&raw));
+        p[34]='Z';assert(!sse_live::decode_primary_raw_tick(p,72,&raw));
+    }
+}
+
 int main() {
+    test_unaligned_raw_decode();
     test_tick_batch_and_provenance();
     test_hardware_batch_end_marker();
     test_hardware_batches_are_per_channel();

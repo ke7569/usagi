@@ -149,12 +149,12 @@ private:
     double global_bias_factor_base_line_ = 0.0;
 
     double getCurPosition();
-    int insertOrder(RT_Order order);
-    void maybe_send_test_order();
+    int insertOrder(RT_Order order, const std::string& signal_id);
+    void maybe_send_test_order(const std::string& signal_id);
     void calcTheo(double prediction);
-    void handleT0();
-    void hitBuy();
-    void hitSell();
+    void handleT0(const std::string& signal_id);
+    void hitBuy(const std::string& signal_id);
+    void hitSell(const std::string& signal_id);
     void cancelBuy();
     void cancelSell();
     int32_t maxCanBuy();

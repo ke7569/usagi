@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <atomic>
 #include <mutex>
+#include <functional>
 #include <string>
 
 namespace sze_recovery {
@@ -466,9 +467,16 @@ public:
     ReplayReadStatus next(CanonicalEvent* event,
                           void* payload,
                           std::size_t payload_capacity);
+    // Optional validated SHM reader. Borrowed bytes stay valid until the next
+    // read; journal replay continues using the caller's ordinary payload buffer.
+    typedef std::function<RingReadStatus(std::uint64_t,CanonicalEvent*,const unsigned char**)> BorrowedRingReader;
+    void set_ring_reader(const BorrowedRingReader& reader) { borrowed_ring_reader_=reader; }
+    ReplayReadStatus next(CanonicalEvent* event, void* payload,
+                          std::size_t payload_capacity, const unsigned char** borrowed);
     void publish_metrics(std::uint64_t replay_rate_milli,
                          std::uint64_t recovery_elapsed_ms);
 
+    const ShmEventRing& live_ring() const { return ring_; }
     ReplayMode mode() const { return mode_; }
     ReplayOpenStatus last_open_status() const { return last_open_status_; }
     const JournalOpenResult& journal_open_result() const {
@@ -505,7 +513,8 @@ public:
 private:
     ReplayReadStatus read_ring(CanonicalEvent* event,
                                void* payload,
-                               std::size_t payload_capacity);
+                               std::size_t payload_capacity, const unsigned char** borrowed);
+    BorrowedRingReader borrowed_ring_reader_;
     void invalidate();
 
     JournalReader reader_;

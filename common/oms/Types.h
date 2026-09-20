@@ -128,6 +128,9 @@ struct Config {
     // cancels every restored open order and keeps the account not ready until
     // those cancels are terminal (restart-cancel-then-trade, OMS-3).
     bool restart_cancel_open_orders = false;
+    // False: reserve order IDs durably at startup, reconcile on restart,
+    // and enqueue individual order records without waiting for disk sync.
+    bool durable_order_intents = true;
     std::map<Instrument, InstrumentRules> instruments;
     Limits limits;
 };

@@ -23,11 +23,13 @@ public:
     void begin_stop();
     bool owns_request(short source, int request_id, const std::string& instrument) const override;
     bool managed() const override { return backend_->managed(); }
-    void signal_context(const std::string& signal_id) override { backend_->signal_context(signal_id); }
     bool read_position(short, const std::string&, const std::string&, oms::Position*) const override;
+    bool read_order(short, int, oms::OrderView*) const override;
+    bool read_day_fills(short, const std::string&, const std::string&, oms::Quantity*, oms::Money*) const override;
     bool has_working_order(const std::string& instrument) const override;
     int submit_managed(short, const std::string&, const std::string&, double, int, char, char,
-                       oms::OrderType, long long, const std::function<bool()>&) override;
+                       oms::OrderType, long long, const std::function<bool()>&,
+                       const std::string& signal_id = std::string()) override;
     bool permits_new_orders() const override;
     long long now_ns() const override;
     int submit_limit(short, const std::string&, const std::string&,

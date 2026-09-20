@@ -59,6 +59,31 @@ class LauncherTest(unittest.TestCase):
         first = p['strategy_runtime']['td']['epoch']
         code, out, error = self.run_launcher(); self.assertEqual(0, code, error)
         self.assertGreater(json.loads(out.strip().splitlines()[-1])['value']['strategy_runtime']['td']['epoch'], first)
+    def test_v06_selects_four_head_strategy_without_snapshot_weights(self):
+        self.live['model_version']='v0.6'
+        for key in list(self.live):
+            if key.startswith('snapshot_'): del self.live[key]
+        code,out,error=self.run_launcher();self.assertEqual(0,code,error)
+        profile=json.loads(out.strip().splitlines()[-1])['value']
+        self.assertEqual('v0.6',profile['prediction']['model_version'])
+        self.assertEqual({'enabled':False},profile['prediction']['auction59'])
+        self.assertEqual('v0.6',profile['strategy_runtime']['legacy_config']['model_version'])
+        self.assertNotIn('snapshot_baseline_model_path',profile['prediction'])
+        self.live['model_version']='unknown'
+        code,out,error=self.run_launcher();self.assertNotEqual(0,code)
+
+    def test_async_intent_policy_preserves_order_gate(self):
+        self.live['durable_order_intents']=False
+        code,out,error=self.run_launcher('--live-orders');self.assertEqual(0,code,error)
+        report=json.loads(out.strip().splitlines()[-1])
+        self.assertFalse(report['value']['strategy_runtime']['oms']['durable_order_intents'])
+        self.assertEqual('YES',report['order_env'])
+        self.live['production_approval']=False
+        code,out,error=self.run_launcher('--live-orders');self.assertNotEqual(0,code)
+        self.live['production_approval']=True
+        self.live['durable_order_intents']='false'
+        code,out,error=self.run_launcher('--live-orders');self.assertNotEqual(0,code)
+
     def test_query_only_requires_no_model_or_capture(self):
         self.live.pop('model_path'); self.daily.pop('global_params'); self.capture['trading_day']=20000101
         code, out, error = self.run_launcher('--query-only'); self.assertEqual(0, code, error)

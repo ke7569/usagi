@@ -97,6 +97,8 @@ def next_epoch(path):
     value=max(int(old or '0')+1, int(time.time()*1000000)); lock.seek(0,os.SEEK_END); lock.write(str(value)+'\n'); lock.flush(); os.fsync(lock.fileno())
     fcntl.fcntl(lock.fileno(), fcntl.F_SETFD, 0); return lock, value
 def project(live, daily, day, mode, epoch, journal):
+    version=live.get('model_version','legacy')
+    if version not in ('legacy','v0.6'): raise ValueError('unknown model_version')
     params=daily.get('ins_params'); globals_=daily.get('global_params')
     if not isinstance(params,dict) or not params: raise ValueError('daily ins_params is empty')
     validate_global_params(globals_)
@@ -112,6 +114,9 @@ def project(live, daily, day, mode, epoch, journal):
         for key in ('listing_date', 'is_ipo_first_day'):
             if key in p: instruments[-1][key] = p[key]
     legacy={'market':'SH','trading_day':day,'global_params':copy.deepcopy(globals_),'ins_params':copy.deepcopy(params)}
+    if version == 'v0.6':
+        legacy['model_version']=version
+        legacy['v06_strategy']=copy.deepcopy(live.get('v06_strategy',{}))
     for p in legacy['ins_params'].values(): p.pop('last_position',None)
     td={'library':abs_setting(live,'td_library'),'config_path':abs_setting(live,'td_config'),'trading_enabled':mode=='live' and live.get('trading_enabled') is True,'production_approval':mode=='live' and live.get('production_approval') is True,'epoch':epoch}
     if 'td_cpu' in live:
@@ -119,7 +124,13 @@ def project(live, daily, day, mode, epoch, journal):
         if td['cpu'] < -1 or td['cpu']>254: raise ValueError('td_cpu must be -1 or in [0,254]')
     if finite(live.get('fee_reserve_per_order'),'fee_reserve_per_order')<0: raise ValueError('negative fee reserve')
     runtime={'mode':mode,'account_reference':live['account_reference'],'legacy_config':legacy,'oms':{'journal_path':journal,'fee_reserve_per_order':live['fee_reserve_per_order']},'td':td}
-    prediction=dict((k,abs_setting(live,k)) for k in MODELS)
+    prediction=dict((k,abs_setting(live,k)) for k in (('model_path',) if version=='v0.6' else MODELS))
+    if version == 'v0.6':
+        prediction['model_version']=version
+        prediction['auction59']={'enabled':False}
+    if 'durable_order_intents' in live:
+        if type(live['durable_order_intents']) is not bool: raise ValueError('durable_order_intents must be boolean')
+        runtime['oms']['durable_order_intents'] = live['durable_order_intents']
     if 'auction59' in live: prediction['auction59'] = copy.deepcopy(live['auction59'])
     profile={'schema_version':1,'market':'SH','execution':mode,'processing_mode':'prediction','processing_contract':'sse-per-instrument-v2','trading_day':day,'processing_sha256':hashlib.sha256(json.dumps({'prediction':prediction,'instruments':instruments},sort_keys=True).encode('utf-8')).hexdigest(),'environment':{'execution':mode,'mode':'live','clock':'host'},'prediction':prediction,'instruments':instruments,'strategy_runtime':runtime}
     return profile
@@ -130,6 +141,7 @@ def main():
     os.environ['TZ']='Asia/Shanghai'; time.tzset(); live=load(a.live_config); a.daily_config=a.daily_config or time.strftime(abs_setting(live,'daily_config_pattern')); daily=load(a.daily_config); day=int(time.strftime('%Y%m%d'))
     if a.duration_ms is not None and (a.duration_ms<0 or a.query_only): raise ValueError('--duration-ms requires monitor/live and a nonnegative value')
     if int(daily.get('trading_day',0))!=day: raise ValueError('daily config is not today')
+    mkdir('/run/usagi/oms/accounts')
     root=abs_setting(live,'runtime_root'); epoch_lock,epoch=next_epoch(os.path.join(root,'td.epoch'))
     if a.live_orders and (live.get('trading_enabled') is not True or live.get('production_approval') is not True or os.environ.get('SSE_ENABLE_LIVE_ORDER')!='YES'): raise ValueError('live orders require two config gates and SSE_ENABLE_LIVE_ORDER=YES')
     if not a.live_orders: os.environ['SSE_ENABLE_LIVE_ORDER']='NO'
@@ -144,6 +156,12 @@ def main():
         journal=os.path.join(root,str(day),'td' if a.live_orders else 'td-monitor','oms.journal'); mkdir(os.path.dirname(journal)); fd,path=inherited(project(live,daily,day,'live' if a.live_orders else 'monitor',epoch,journal)); command=[a.binary,capture,path]
         if a.duration_ms is not None: command.extend(['--duration-ms',str(a.duration_ms)])
     if live.get('library_path'): os.environ['LD_LIBRARY_PATH']=abs_setting(live,'library_path')
+    if live.get('model_version')=='v0.6' and not a.query_only:
+        audit_dir=os.path.join(root,str(day),'v06');mkdir(audit_dir)
+        os.environ['SSE_V06_AUDIT_PATH']=os.path.join(audit_dir,'audit-'+str(epoch)+'.jsonl')
+        latency_path=os.path.join(audit_dir,'order-latency-'+str(epoch)+'.jsonl')
+        latency_fd=os.open(latency_path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600);os.close(latency_fd)
+        os.environ['SSE_ORDER_LATENCY_PATH']=latency_path
     print('SSE trading launcher mode='+('query-only' if a.query_only else ('live' if a.live_orders else 'monitor'))+' day='+str(day)); sys.stdout.flush(); os.execv(a.binary,command)
 if __name__=='__main__':
     try: main()

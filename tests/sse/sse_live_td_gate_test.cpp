@@ -5,6 +5,9 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <chrono>
+#include <thread>
+#include <sched.h>
 #include <unistd.h>
 
 namespace {
@@ -116,6 +119,63 @@ void monitor_reconciles_without_orders(const Json& base, const std::string& dir)
     ::unlink((dir + "/monitor.trace").c_str());
     ::unlink((dir + "/monitor.oms").c_str());
 }
+
+void async_monitor_progresses_without_clock_messages(const Json& base, const std::string& dir) {
+    cpu_set_t allowed;CPU_ZERO(&allowed);
+    require(!sched_getaffinity(0,sizeof(allowed),&allowed),"read test CPU affinity");
+    std::vector<int> cpus;
+    for(int i=0;i<CPU_SETSIZE && cpus.size()<3;++i)if(CPU_ISSET(i,&allowed))cpus.push_back(i);
+    require(cpus.size()==3,"async monitor test requires three allowed CPUs");
+    struct Environment {
+        std::string key,value;bool present;
+        Environment(const char* name,const std::string& setting):key(name),present(std::getenv(name)!=0) {
+            if(present)value=std::getenv(name);::setenv(name,setting.c_str(),1);
+        }
+        ~Environment(){if(present)::setenv(key.c_str(),value.c_str(),1);else ::unsetenv(key.c_str());}
+    } workers("SSE_PREDICTION_CPUS",std::to_string(cpus[0])+","+std::to_string(cpus[1])),
+      strategy("SSE_STRATEGY_CPU",std::to_string(cpus[2]));
+    const std::string model=dir+"/v06.bin";
+    {std::ofstream out(model.c_str(),std::ios::binary);out.write("SSEV06M1",8);
+     const unsigned sizes[]={50,50,6400,128,49152,49152,384,384,49152,49152,384,384,512,4};
+     for(unsigned size:sizes){std::vector<float> zero(size,0);out.write(reinterpret_cast<const char*>(zero.data()),size*4);}}
+    Json config=base;
+    config["execution"]="monitor";config["environment"]["execution"]="monitor";
+    config["strategy_runtime"]["mode"]="monitor";
+    config["strategy_runtime"]["legacy_config"]["model_version"]="v0.6";
+    config["strategy_runtime"]["legacy_config"]["ins_params"]["600001.SH"]=
+        config["strategy_runtime"]["legacy_config"]["ins_params"]["600000.SH"];
+    Json second=config["instruments"][0];second["instrument"]="600001";
+    config["instruments"].push_back(second);
+    config["prediction"]={{"model_path",model},{"model_version","v0.6"},{"auction59",{{"enabled",false}}}};
+    config["strategy_runtime"]["td"]["config_path"]=dir+"/async-monitor.trace";
+    config["strategy_runtime"]["td"]["trading_enabled"]=false;
+    config["strategy_runtime"]["td"]["production_approval"]=false;
+    config["strategy_runtime"]["oms"]["journal_path"]=dir+"/async-monitor.oms";
+    config["strategy_runtime"]["account_reference"]="FAKE-ASYNC-MONITOR-"+std::to_string(::getpid());
+    {std::ofstream out((dir+"/profile.json").c_str());out<<config.dump();}
+    {
+        sse_application::StreamProcessingCli app(dir+"/profile.json",true,dir,2,
+            [](){return true;},"raw",true);
+        Json status;
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+        do {
+            status=app.runtime_status();
+            if(status["strategy"]["ready"].get<bool>())break;
+            std::this_thread::yield();
+        }while(std::chrono::steady_clock::now()<deadline);
+        require(status["strategy"]["ready"].get<bool>(),"owner failed to reconcile without market input");
+        require(status["strategy_consumer"]["enabled"].get<bool>(),"async monitor not using owner");
+        const auto published=status["strategy_consumer"]["published"].get<std::uint64_t>();
+        for(unsigned i=0;i<1000;++i)app.poll();
+        auto after=app.runtime_status();
+        require(after["strategy_consumer"]["published"]==published,"idle polling published clock tasks");
+        require(after["strategy"]["order_intents"]==0 && !after["strategy"]["orders_enabled"].get<bool>(),
+                "monitor must remain query-only");
+        app.begin_stop();
+    }
+    for(const auto& suffix:{"v06.bin","async-monitor.trace","async-monitor.oms"})
+        require(!::unlink((dir+"/"+suffix).c_str()),"remove async monitor fixture");
+}
 }
 
 int main(int argc, char** argv) {
@@ -158,6 +218,7 @@ int main(int argc, char** argv) {
         rejects(changed, dir, true, false, "journal handoff strategy entry point");
         rejects(changed, dir, false, true, "journal handoff strategy entry point");
         monitor_reconciles_without_orders(base, dir);
+        async_monitor_progresses_without_clock_messages(base, dir);
         rejects(base, dir, true, true, "fake TD factory reached", true);
         const char* files[] = {"tick.bin", "baseline.bin", "auction.bin", "baseline.json",
             "auction.json", "profile.json", "reject-after-gates"};

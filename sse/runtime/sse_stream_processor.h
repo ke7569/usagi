@@ -94,7 +94,7 @@ struct Output {
     Output();
 };
 
-typedef std::function<void(const Output&)> OutputCallback;
+typedef std::function<void(Output&&)> OutputCallback;
 typedef std::function<bool(const std::string&, std::uint64_t,
                            std::vector<float>*, std::string*)> Auction59Provider;
 
@@ -122,6 +122,17 @@ public:
     bool instrument_static_valid(const std::string& code) const;
 
 private:
+    // The owner dispatcher alone validates channel sequence and determines
+    // batch boundaries; workers use the same book/sampling/model methods.
+    friend class SseParallelProcessor;
+    bool delegated_sequence_;
+    bool defer_model_=false;
+    std::function<void(const sse_live::TickEvent&, const deepwin_market_data::StreamEvent&, std::size_t)> route_tick_;
+    std::function<void(const sse_live::RawTickEvent&, const deepwin_market_data::StreamEvent&, std::size_t, std::uint64_t)> route_raw_tick_;
+    std::function<void(const deepwin_market_data::StreamEvent&, std::uint64_t)> route_packet_;
+    std::function<void(const unsigned char*, const deepwin_market_data::StreamEvent&, std::size_t)> route_raw_snapshot_;
+    std::function<void(const sse_live::Snapshot&, const deepwin_market_data::StreamEvent&, std::size_t)> route_snapshot_;
+    std::function<void(std::uint32_t, const sse_live_sampling::BatchEnd&)> route_close_;
     struct InstrumentState {
         InstrumentState(const std::string& code,
                         const sse_tick::DailyStaticMetadata& metadata,
@@ -146,6 +157,9 @@ private:
 
     struct ChannelSequence {
         std::uint64_t last_tick;
+        std::uint64_t last_provider;
+        deepwin_market_data::StreamEvent last_event;
+        std::size_t last_offset;
         bool have_tick;
         ChannelSequence() : last_tick(0ULL), have_tick(false) {}
     };
@@ -186,13 +200,23 @@ private:
                                    const sse_live_sampling::Candidate& candidate);
     sse_live_sampling::TickCut book_cut(const InstrumentState& state,
                                       const sse_live::TickEvent& tick) const;
+    sse_live_sampling::TickCut book_cut(const InstrumentState& state,
+                                      const sse_live::TickEvent& tick,
+                                      const sse_tick::Level* bid,
+                                      const sse_tick::Level* ask) const;
     void initialize_window(InstrumentState& state, const sse_live::TickEvent& tick);
     Provenance provenance(const deepwin_market_data::StreamEvent& event,
                           std::uint32_t wire_channel,
                           std::uint64_t wire_sequence,
                           std::size_t record_offset) const;
     InstrumentState* state_for(const std::string& code);
-    bool valid_tick_sequence(const sse_live::TickEvent& tick);
+    bool valid_tick_sequence(const sse_live::TickEvent& tick,
+                             const deepwin_market_data::StreamEvent& event,
+                             std::size_t record_offset);
+    bool valid_tick_sequence(std::uint32_t channel, std::uint64_t wire,
+                             std::uint64_t provider,
+                             const deepwin_market_data::StreamEvent& event,
+                             std::size_t record_offset);
     void select_snapshot_mode(const std::string& code, InstrumentState& state);
     void report_auction_state(const std::string& code, InstrumentState& state);
     static bool valid_auction59(const std::vector<float>& factors);

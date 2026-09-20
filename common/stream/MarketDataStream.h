@@ -47,6 +47,8 @@ struct StreamOptions {
     std::size_t queue_capacity;
     std::size_t max_datagram_bytes;
     std::size_t receive_batch_size;
+    bool receive_busy_poll;
+    bool dispatch_busy_poll;
     int receive_buffer_bytes;
     std::uint64_t idle_gap_ns;
     std::uint64_t segment_bytes;
@@ -77,6 +79,9 @@ struct StreamStats {
     StreamStats();
     std::uint64_t received_datagrams;
     std::uint64_t receive_batches;
+    std::uint64_t full_receive_batches;
+    std::uint64_t max_receive_syscall_ns;
+    std::uint64_t max_full_batch_gap_ns;
     std::uint64_t dispatched_events;
     std::uint64_t written_sequence;
     std::uint64_t durable_sequence;

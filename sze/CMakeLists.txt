@@ -4,7 +4,7 @@ if(T0_BUILD_SZE_STREAM_PROCESSOR)
     ${USAGI_ROOT}/sze/runtime/sze_recovery_driver.cpp
     ${USAGI_ROOT}/sze/sampling/mix153060_runtime.cpp
     ${USAGI_ROOT}/sze/runtime/mix153060_live_adapter.cpp
-    ${USAGI_ROOT}/sze/market_data/SZEProtocol.cpp ${USAGI_ROOT}/sze/market_data/SZERecoverable.cpp)
+    ${USAGI_ROOT}/sze/market_data/SZEProtocol.cpp ${USAGI_ROOT}/common/recovery/SZERecoverable.cpp)
   target_include_directories(sze_stream_processing PUBLIC ${USAGI_ROOT} ${USAGI_ROOT}/sze/market_data ${DEEPWIN_INCLUDE})
   target_compile_options(sze_stream_processing PRIVATE -ffp-contract=off)
   target_link_libraries(sze_stream_processing PUBLIC deepwin_market_data_runtime common_mix153060_model)

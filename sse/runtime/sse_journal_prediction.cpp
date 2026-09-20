@@ -1,9 +1,14 @@
 #include "sse/runtime/sse_journal_transport.h"
+#include "sse/runtime/sse_capture_history.h"
+#include "sse/runtime/sse_shm_prefetch.h"
 #include "sse/runtime/sse_cpu_affinity.h"
 #include "apps/StreamProcessingCli.h"
 #include "common/execution/LiveTd.h"
 #include "sse/market_data/sse_tick_static_metadata.h"
 #include <sys/stat.h>
+#include <glob.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -27,7 +32,42 @@ namespace {
 typedef nlohmann::json Json;
 typedef std::chrono::steady_clock Clock;
 
-volatile std::sig_atomic_t stop_requested = 0;
+static_assert(ATOMIC_INT_LOCK_FREE == 2, "signal stop flag must be lock-free");
+std::atomic<int> stop_requested(0);
+
+// Fault-only lookup: never scan journal files on the prediction hot path.
+Json fault_location(const std::string& directory, std::uint64_t event_id) {
+    Json result{{"event_id", event_id}, {"journal_directory", directory}};
+    glob_t paths = {};
+    if (::glob((directory + "/*.szej").c_str(), 0, 0, &paths) == 0) {
+        for (std::size_t i = 0; i < paths.gl_pathc; ++i) {
+            const int fd = ::open(paths.gl_pathv[i], O_RDONLY);
+            if (fd < 0) continue;
+            struct stat info = {};
+            ::fstat(fd, &info);
+            off_t offset = 4096;
+            unsigned char header[72];
+            while (::pread(fd, header, sizeof(header), offset) == sizeof(header)) {
+                std::uint32_t bytes = 0;
+                std::uint64_t id = 0;
+                std::memcpy(&bytes, header + 8, sizeof(bytes));
+                std::memcpy(&id, header + 16, sizeof(id));
+                if (bytes < 88 || offset + bytes > info.st_size) break;
+                if (id == event_id) {
+                    result["journal_file"] = paths.gl_pathv[i];
+                    result["journal_offset"] = offset;
+                    break;
+                }
+                if (id > event_id) break;
+                offset += bytes;
+            }
+            ::close(fd);
+            if (result.count("journal_file")) break;
+        }
+    }
+    ::globfree(&paths);
+    return result;
+}
 
 void request_stop(int) {
     stop_requested = 1;
@@ -186,25 +226,82 @@ int run(const std::string& config_path, const std::string& profile_path,
         }
         requested_cpus.push_back(td_cpu);
     }
+    int strategy_cpu = -1;
+    const char* strategy_cpu_text = std::getenv("SSE_STRATEGY_CPU");
+    if (strategy_cpu_text && *strategy_cpu_text) {
+        std::vector<int> selected;
+        std::string why;
+        if (!sse_cpu::parse_cpu_list(strategy_cpu_text, &selected, &why) || selected.size()!=1)
+            throw std::runtime_error("SSE_STRATEGY_CPU requires one valid CPU: " + why);
+        strategy_cpu = selected[0];
+    }
     // Select before narrowing owner affinity. Both leases survive until the
     // application and every SDK worker have stopped.
     sse_cpu::Lease cpu_lease;
     std::string affinity_error;
+    const char* shard_env=std::getenv("SSE_PREDICTION_CPUS");
+    std::vector<int> shard_cpus;
+    if (shard_env && *shard_env) {
+        if (!sse_cpu::parse_cpu_list(shard_env,&shard_cpus,&affinity_error))
+            throw std::runtime_error(affinity_error);
+        requested_cpus.insert(requested_cpus.end(),shard_cpus.begin(),shard_cpus.end());
+    }
+    int shm_reader_cpu=-1;
+    const char* reader_cpu_text=std::getenv("SSE_SHM_READER_CPU");
+    if(reader_cpu_text && *reader_cpu_text) {
+        std::vector<int> selected;
+        if(!sse_cpu::parse_cpu_list(reader_cpu_text,&selected,&affinity_error) || selected.size()!=1)
+            throw std::runtime_error("SSE_SHM_READER_CPU requires one valid CPU");
+        shm_reader_cpu=selected[0];
+        requested_cpus.push_back(shm_reader_cpu);
+    }
+    bool strategy_shares_owner_l3=false;
+    if(strategy_cpu>=0) {
+        if(std::find(requested_cpus.begin(),requested_cpus.end(),strategy_cpu)!=requested_cpus.end())
+            throw std::runtime_error("strategy CPU must be distinct from ingress, TD and workers");
+        std::vector<sse_cpu::Cpu> topology;
+        if(!sse_cpu::discover(&topology,&affinity_error))throw std::runtime_error(affinity_error);
+        std::string owner_domain,strategy_domain;
+        for(const auto& cpu:topology) {
+            if(cpu.id==requested_cpus[0])owner_domain=cpu.l3;
+            if(cpu.id==strategy_cpu)strategy_domain=cpu.l3;
+        }
+        if(strategy_domain.empty())throw std::runtime_error("strategy CPU is unavailable");
+        // Two distinct physical cores may intentionally share the ingress
+        // owner's already-exclusive L3 lease; prediction workers keep theirs.
+        strategy_shares_owner_l3=!owner_domain.empty() && strategy_domain==owner_domain;
+        if(!strategy_shares_owner_l3)requested_cpus.push_back(strategy_cpu);
+    }
     if (!cpu_lease.acquire(requested_cpus, &affinity_error) ||
         cpu_lease.cpus().size() != requested_cpus.size())
         throw std::runtime_error(affinity_error.empty()
             ? "prediction CPU lease failed" : affinity_error);
+    if(!shard_cpus.empty() && profile.at("prediction").value("model_version",std::string("legacy"))=="v0.6") {
+        std::vector<sse_cpu::Cpu> topology;
+        if(!sse_cpu::discover(&topology,&affinity_error))throw std::runtime_error(affinity_error);
+        for(int worker_cpu:shard_cpus) {
+            const int model_cpu=worker_cpu+1;
+            std::string worker_l3,model_l3;
+            for(const auto& cpu:topology){if(cpu.id==worker_cpu)worker_l3=cpu.l3;if(cpu.id==model_cpu)model_l3=cpu.l3;}
+            if(model_l3.empty() || worker_l3!=model_l3 || model_cpu==strategy_cpu ||
+               std::find(requested_cpus.begin(),requested_cpus.end(),model_cpu)!=requested_cpus.end())
+                throw std::runtime_error("SSE model helper must use a distinct core in its worker L3");
+        }
+    }
     std::unique_ptr<sze_recovery::ReplayHandoffConsumer> consumer(
         new sze_recovery::ReplayHandoffConsumer());
+    std::atomic<bool> ingress_live(false);
     std::unique_ptr<sse_application::StreamProcessingCli> application;
+    bool draining_transition = false;
+    // Only the ingress owner accesses the mutable handoff consumer. The
+    // strategy owner sees a release/acquire gate, never consumer internals.
+    const auto publish_live = [&](bool value) {
+        if (ingress_live.load(std::memory_order_relaxed)!=value)
+            ingress_live.store(value,std::memory_order_release);
+    };
     const std::function<bool()> healthy = [&]() {
-        return stop_requested == 0 && consumer->mode() == sze_recovery::kReplayLive &&
-            consumer->producer_alive() &&
-            consumer->ring_trading_day() == config.journal.trading_day &&
-            consumer->ring_source_id() == config.journal.source_id &&
-            consumer->generation() == config.journal.generation &&
-            consumer->ring_generation() == config.journal.generation &&
-            (!application || application->processing_valid());
+        return stop_requested.load(std::memory_order_relaxed)==0 &&
+            ingress_live.load(std::memory_order_acquire);
     };
 
     // The prediction process consumes source-89 records as a live application
@@ -217,16 +314,96 @@ int run(const std::string& config_path, const std::string& profile_path,
         throw std::runtime_error(message.str());
     }
     validate_transport_health(config, host_boot, *consumer);
+    std::unique_ptr<sse_journal::ShmPrefetch> prefetch;
+    if(shm_reader_cpu>=0) {
+        prefetch.reset(new sse_journal::ShmPrefetch(consumer->live_ring(),shm_reader_cpu));
+        consumer->set_ring_reader([&](std::uint64_t expected,sze_recovery::CanonicalEvent* event,const unsigned char** bytes) {
+            const sse_journal::ShmPrefetch::Record* record=nullptr;
+            const auto status=prefetch->read(expected,&record);
+            if(status==sze_recovery::kRingReadOk){*event=record->event;*bytes=record->payload.data();}
+            return status;
+        });
+    }
     const int td_cpu = native_td ? cpu_lease.cpus()[1].id : -1;
     if (td_cpu >= 255) throw std::runtime_error("leased TD CPU exceeds ATP's supported CPU range");
-    if (!sse_cpu::bind_current_thread(native_td ? td_cpu : cpu_lease.cpus()[0].id, &affinity_error))
+    if(native_td && setenv("SSE_LEASED_TD_CPU",std::to_string(td_cpu).c_str(),1))
+        throw std::runtime_error("cannot pass leased TD CPU");
+    // First-touch model/owner queues on the prediction node. Only SDK
+    // initialization temporarily switches to the leased callback CPU.
+    if (!sse_cpu::bind_current_thread(cpu_lease.cpus()[0].id, &affinity_error))
         throw std::runtime_error(affinity_error);
     application.reset(new sse_application::StreamProcessingCli(
         profile_path, true, config.journal.directory, 2U, healthy, "raw", true));
     if (!sse_cpu::bind_current_thread(cpu_lease.cpus()[0].id, &affinity_error))
         throw std::runtime_error(affinity_error);
+    std::signal(SIGINT, request_stop);
+    std::signal(SIGTERM, request_stop);
+    sse_journal::OverlapFilter active_overlap;
+    bool chained_history=false;
+    const char* chain_path=std::getenv("SSE_HISTORY_CHAIN");
+    const char* chain_day=std::getenv("SSE_HISTORY_CHAIN_DAY");
+    if(chain_path && *chain_path && chain_day && std::to_string(config.journal.trading_day)==chain_day) {
+        const Json chain=load_stream_json(chain_path);
+        if(chain.at("trading_day").get<std::uint32_t>()==config.journal.trading_day) {
+            if(chain.at("active_generation").get<std::uint64_t>()!=config.journal.generation)
+                throw std::runtime_error("capture history active generation mismatch");
+            chained_history=true;
+            std::set<std::uint64_t> generations;generations.insert(config.journal.generation);
+            for(const auto& segment:chain.at("segments")) {
+                const auto history=sse_journal::load(segment.at("capture_config").get<std::string>(),true);
+                if(history.journal.trading_day!=config.journal.trading_day || history.journal.source_id!=config.journal.source_id ||
+                   history.boot!=config.boot || !generations.insert(history.journal.generation).second || history.channels.size()!=config.channels.size())
+                    throw std::runtime_error("capture history identity mismatch");
+                for(std::size_t c=0;c<config.channels.size();++c)
+                    if(history.channels[c].group!=config.channels[c].group || history.channels[c].port!=config.channels[c].port || history.channels[c].interface_ip!=config.channels[c].interface_ip)
+                        throw std::runtime_error("capture history subscription mismatch");
+                const auto limit=segment.at("last_event_id").get<std::uint64_t>();
+                if(!limit)throw std::runtime_error("empty capture history segment");
+                sse_journal::OverlapFilter filter;
+                if(segment.count("overlap"))filter.configure(segment.at("overlap"),config.channels.size());
+                sze_recovery::JournalReader reader;
+                if(reader.open(history.journal).status!=sze_recovery::kJournalOk)throw std::runtime_error("capture history journal open failed");
+                std::vector<unsigned char> bytes(history.journal.max_payload_bytes);sze_recovery::CanonicalEvent record={};
+                std::uint64_t accepted=0,last_mono=0;
+                for(std::uint64_t n=1;n<=limit;++n) {
+                    if(stop_requested)throw std::runtime_error("capture history replay interrupted");
+                    if(reader.next(&record,bytes.data(),bytes.size())!=sze_recovery::kJournalOk || record.event_id!=n)
+                        throw std::runtime_error("capture history prefix incomplete or corrupt");
+                    const auto e=sse_journal::decode(record,bytes.data(),history);
+                    if(filter.accept(e,n)){application->on_event(e);last_mono=e.monotonic_ns;++accepted;}
+                    if(n%1000000==0)std::cerr<<Json{{"event","capture_history_replay"},{"generation",history.journal.generation},{"events",n},{"accepted",accepted}}.dump()<<'\n';
+                }
+                filter.complete();
+                if(accepted)application->begin_transport_epoch(last_mono);
+                std::cerr<<Json{{"event","capture_history_segment_complete"},{"generation",history.journal.generation},{"events",limit},{"accepted",accepted}}.dump()<<'\n';
+            }
+            active_overlap.configure(chain.at("active_overlap"),config.channels.size());
+        }
+    }
+    const char* history_path=std::getenv("SSE_HISTORY_CAPTURE");
+    const char* history_day=std::getenv("SSE_HISTORY_DAY");
+    if(!chained_history && history_path && *history_path && history_day && std::to_string(config.journal.trading_day)==history_day) {
+        const auto history=sse_journal::load(history_path,true);
+        if(history.journal.trading_day!=config.journal.trading_day || history.journal.source_id!=config.journal.source_id || history.journal.generation==config.journal.generation)
+            throw std::runtime_error("invalid prior capture replay boundary");
+        sze_recovery::JournalReader prior;
+        if(prior.open(history.journal).status!=sze_recovery::kJournalOk)throw std::runtime_error("cannot open prior capture journal");
+        std::vector<unsigned char> bytes(history.journal.max_payload_bytes);sze_recovery::CanonicalEvent record={};
+        std::uint64_t count=0,last_mono=0;
+        const char* limit_text=std::getenv("SSE_HISTORY_LAST_EVENT");
+        const std::uint64_t history_limit=limit_text?std::stoull(limit_text):0;
+        for(;;){if(history_limit && count==history_limit)break;const auto result=prior.next(&record,bytes.data(),bytes.size());if(result==sze_recovery::kJournalWouldBlock || result==sze_recovery::kJournalEnd)break;
+            if(result!=sze_recovery::kJournalOk)throw std::runtime_error("prior journal corruption");
+            const auto event=sse_journal::decode(record,bytes.data(),history);application->on_event(event);last_mono=event.monotonic_ns;++count;
+            if(count%1000000==0)std::cerr<<Json{{"event","prior_capture_replay"},{"events",count}}.dump()<<'\n';
+        }
+        if(!count || (history_limit && count!=history_limit))throw std::runtime_error("prior journal prefix incomplete");
+        application->begin_transport_epoch(last_mono);
+        std::cerr<<Json{{"event","prior_capture_replay_complete"},{"events",count}}.dump()<<'\n';
+    }
     std::cerr << Json{{"event", "journal_prediction_cpu"},
-        {"prediction_cpu", cpu_lease.cpus()[0].id}, {"td_cpu", td_cpu}}.dump() << '\n';
+        {"prediction_cpu", cpu_lease.cpus()[0].id}, {"td_cpu", td_cpu}, {"shm_reader_cpu", shm_reader_cpu},
+        {"prediction_worker_cpus",shard_cpus},{"strategy_cpu",strategy_cpu},{"strategy_shares_owner_l3",strategy_shares_owner_l3}}.dump() << '\n';
 
     std::signal(SIGINT, request_stop);
     std::signal(SIGTERM, request_stop);
@@ -244,17 +421,27 @@ int run(const std::string& config_path, const std::string& profile_path,
     while (!stop_requested) {
         const std::uint64_t now = monotonic_ns();
         if (config.duration_ms > 0 && now >= deadline_ns) break;
-        try {
-            validate_transport_health(config, host_boot, *consumer);
-        } catch (const std::exception& exception) {
-            ok = false;
-            error = exception.what();
-            break;
-        }
-
         sze_recovery::CanonicalEvent canonical = {};
+        const auto previous_mode = consumer->mode();
+        const unsigned char* input_payload=payload.data();
         const sze_recovery::ReplayReadStatus status = consumer->next(
-            &canonical, payload.data(), payload.size());
+            &canonical, payload.data(), payload.size(), &input_payload);
+        if (consumer->mode() != previous_mode) {
+            // Deliver every buffered historical output while the execution
+            // gate is closed, before admitting the first live event.
+            publish_live(false);
+            draining_transition = true;
+            try { active_overlap.complete();application->flush_processing(); }
+            catch (const std::exception& e) { ok=false;error=e.what();break; }
+            draining_transition = false;
+            application->enable_live_latency(consumer->mode()==sze_recovery::kReplayLive);
+        }
+        // next() has validated producer identity/aliveness and continuity.
+        // A live transition is published only after every historical strategy
+        // message has drained above, including its OMS work.
+        publish_live(!draining_transition && consumer->mode()==sze_recovery::kReplayLive &&
+            (status==sze_recovery::kReplayReadEvent || status==sze_recovery::kReplayReadWouldBlock) &&
+            application->processing_valid());
         if (status == sze_recovery::kReplayReadWouldBlock) {
             try { application->poll(); }
             catch (const std::exception& exception) {
@@ -274,7 +461,13 @@ int run(const std::string& config_path, const std::string& profile_path,
                 last_status_ns = now;
                 next_status_ns = add_ms(now, 5000L);
             }
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            // Dedicated prediction/strategy owner core. No 100us idle sleep:
+            // poll the journal and TD again as soon as this iteration ends.
+#if defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+#else
+            std::this_thread::yield();
+#endif
             continue;
         }
         if (status != sze_recovery::kReplayReadEvent) {
@@ -287,14 +480,19 @@ int run(const std::string& config_path, const std::string& profile_path,
 
         try {
             deepwin_market_data::StreamEvent event = sse_journal::decode(
-                canonical, payload.data(), config);
-            application->on_event(event);
+                canonical, input_payload, config);
+            if(active_overlap.accept(event,canonical.event_id))application->on_event(event);
             ++events;
             payload_bytes += event.size;
         } catch (const std::exception& exception) {
             ok = false;
+            publish_live(false);
             error = std::string("Shanghai journal prediction consumer failed: ") +
                     exception.what();
+            Json fault = fault_location(config.journal.directory, canonical.event_id);
+            fault["event"] = "journal_prediction_fault";
+            fault["error"] = error;
+            std::cerr << fault.dump() << '\n';
             break;
         } catch (...) {
             ok = false;
@@ -304,6 +502,7 @@ int run(const std::string& config_path, const std::string& profile_path,
 
         const std::uint64_t after_event = monotonic_ns();
         if (after_event >= next_status_ns) {
+            application->poll();
             const std::uint64_t interval_ns = after_event - last_status_ns;
             const std::uint64_t delta_events = events - last_status_events;
             const std::uint64_t rate_milli = interval_ns
@@ -317,13 +516,25 @@ int run(const std::string& config_path, const std::string& profile_path,
         }
     }
 
+    publish_live(false);
+    if (ok) {
+        try { application->flush_processing(); }
+        catch (const std::exception& e) { ok=false;error=e.what(); }
+    }
     if (!error.empty()) ok = false;
+    // Join delivery even on a processing fault before reading final statistics.
+    // Otherwise a failed queue could throw again during summary and turn a
+    // deterministic gap (exit 65) into an automatic restart loop.
+    try { application->begin_stop(); }
+    catch(const std::exception& e) { ok=false;if(error.empty())error=e.what(); }
     const Json result = final_status(config, *consumer, application.get(),
                                      events, payload_bytes, started_ns, ok,
                                      host_boot, error);
-    application->begin_stop();
+    if(prefetch)prefetch->stop();
     consumer->close();
     std::cout << result.dump() << '\n';
+    // A deterministic data fault must not replay the same gap every 30 seconds.
+    if (!ok && error.find("SSE tick sequence gap") != std::string::npos) return 65;
     return ok ? 0 : 1;
 }
 
@@ -405,6 +616,7 @@ int run_td_query_only(const std::string& public_path) {
         if (!sse_tick::load_daily_static_metadata_json(daily_path, scope.day, &metadata, &error))
             throw std::runtime_error(error);
         if (metadata.empty()) throw std::runtime_error("TD query daily universe is empty");
+        const Json daily = load_stream_json(daily_path);
         oms::Config config;
         config.scope = scope;
         config.scope.epoch = 0;
@@ -461,11 +673,17 @@ int run_td_query_only(const std::string& public_path) {
         }
         account = runtime.engine->account();
         std::size_t positions = 0, nonzero = 0;
+        Json holdings = Json::array();
         for (const auto& instrument : universe) {
             oms::Position position;
             if (runtime.engine->position(instrument, &position)) {
                 ++positions;
                 if (position.total || position.sellable) ++nonzero;
+                if (position.total || position.sellable ||
+                    daily.at("ins_params").at(instrument.code + ".SH").value("static_position", 0LL) > 0)
+                    holdings.push_back(Json{{"instrument", instrument.code},
+                        {"total", position.total}, {"sellable", position.sellable},
+                        {"working_buy", position.working_buy}, {"working_sell", position.working_sell}});
             }
         }
         result["connected"] = account.connected;
@@ -473,6 +691,9 @@ int run_td_query_only(const std::string& public_path) {
         result["positions"] = positions;
         result["nonzero_positions"] = nonzero;
         result["positions_scope"] = "daily_universe";
+        result["holdings"] = holdings;
+        result["available_cash"] = double(account.available_cash) / oms::kMoneyScale;
+        result["cash_reserved"] = double(account.cash_reserved) / oms::kMoneyScale;
         result["orders"] = account.orders;
         result["trades"] = account.trade_ids;
         result["reason"] = stop_requested ? "interrupted" :

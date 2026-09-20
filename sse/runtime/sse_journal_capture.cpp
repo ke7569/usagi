@@ -254,7 +254,7 @@ bool Capture::open(std::string* error) {
         config_.ring.max_payload_bytes != config_.journal.max_payload_bytes ||
         config_.stream.max_datagram_bytes == 0U ||
         config_.stream.max_datagram_bytes > sse_journal::kMaxDatagram ||
-        config_.stream.idle_gap_ns != 100000U ||
+        !sse_journal::is_supported_idle_gap_ns(config_.stream.idle_gap_ns) ||
         !config_.journal_queue_capacity || config_.journal_queue_capacity > kMaxQueueCapacity ||
         config_.journal_queue_capacity >
             (std::numeric_limits<std::size_t>::max)() / sizeof(sse_journal::StoredEvent)) {
@@ -305,7 +305,6 @@ bool Capture::open(std::string* error) {
         std::lock_guard<std::mutex> lock(error_mutex_);
         error_.clear();
     }
-    queue_.reset(new Queue(config_.journal_queue_capacity));
 
     std::string lease_error;
     const std::vector<int> requested = {
@@ -323,6 +322,21 @@ bool Capture::open(std::string* error) {
     config_.stream.receive_cpu = cpu_affinity_[0].id;
     config_.stream.dispatch_cpu = cpu_affinity_[1].id;
     config_.journal_cpu = cpu_affinity_[2].id;
+
+    // Allocate producer-owned buffers on the dispatcher's node, then restore
+    // the caller mask before creating control and journal threads.
+    struct InitializerAffinity {
+        cpu_set_t previous;bool active;
+        explicit InitializerAffinity(int cpu):active(false){
+            if(pthread_getaffinity_np(pthread_self(),sizeof(previous),&previous))throw std::runtime_error("capture initializer affinity read");
+            cpu_set_t selected;CPU_ZERO(&selected);CPU_SET(cpu,&selected);
+            if(pthread_setaffinity_np(pthread_self(),sizeof(selected),&selected))throw std::runtime_error("capture initializer affinity bind");
+            active=true;
+        }
+        void restore(){if(active){if(pthread_setaffinity_np(pthread_self(),sizeof(previous),&previous))std::abort();active=false;}}
+        ~InitializerAffinity(){restore();}
+    } initializer_affinity(config_.stream.dispatch_cpu);
+    queue_.reset(new Queue(config_.journal_queue_capacity));
 
     const sze_recovery::JournalOpenResult journal = writer_.open(config_.journal);
     if (journal.status != sze_recovery::kJournalOk || journal.existing ||
@@ -345,6 +359,7 @@ bool Capture::open(std::string* error) {
     ring_.publish_state(sze_recovery::kContinuityInitializing,
                         sze_recovery::kReadinessNotReady,
                         sze_recovery::kInvalidNone, 0U, 0U);
+    initializer_affinity.restore();
     open_.store(true, std::memory_order_release);
     accepting_.store(true, std::memory_order_release);
     try {
@@ -718,6 +733,9 @@ int run_cli(const std::string& config_path) {
         output["journal_overflows"] = capture_status.journal_overflows;
         output["last_receive_ns"] = capture_status.last_receive_ns;
         output["stats"]["receive_batches"] = stream_stats.receive_batches;
+        output["stats"]["full_receive_batches"] = stream_stats.full_receive_batches;
+        output["stats"]["max_receive_syscall_ns"] = stream_stats.max_receive_syscall_ns;
+        output["stats"]["max_full_batch_gap_ns"] = stream_stats.max_full_batch_gap_ns;
         output["stats"]["ingress_high_water"] = stream_stats.ingress_high_water;
         output["stats"]["kernel_drops"] = stream_stats.kernel_drops;
         output["stats"]["journal_queue_high_water"] = capture_status.queue_high_water;

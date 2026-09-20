@@ -407,12 +407,13 @@ void validate_options(const StreamOptions& options, std::size_t channels, long d
 
 StreamOptions::StreamOptions()
     : queue_capacity(4096), max_datagram_bytes(8192), receive_batch_size(64),
-      receive_buffer_bytes(16 << 20), idle_gap_ns(100000), segment_bytes(256ULL << 20),
+      receive_busy_poll(false), dispatch_busy_poll(false), receive_buffer_bytes(16 << 20), idle_gap_ns(100000), segment_bytes(256ULL << 20),
       flush_interval_ms(100), receive_cpu(-1), dispatch_cpu(-1), writer_cpu(-1),
       recording_required(true) {}
 
 StreamStats::StreamStats()
-    : received_datagrams(0), receive_batches(0), dispatched_events(0), written_sequence(0),
+    : received_datagrams(0), receive_batches(0), full_receive_batches(0),
+      max_receive_syscall_ns(0), max_full_batch_gap_ns(0), dispatched_events(0), written_sequence(0),
       durable_sequence(0), ingress_high_water(0), recording_high_water(0),
       ingress_overflows(0), recording_overflows(0), kernel_drops(0), clean_recording(false) {}
 
@@ -476,6 +477,7 @@ struct MarketDataStream::Impl {
             std::vector<mmsghdr> messages(count);
             std::vector<iovec> vectors(count);
             std::vector<std::uint32_t> dropped(channels.size(), 0);
+            std::vector<std::uint64_t> last_full(channels.size(), 0);
             for (std::size_t i = 0; i < count; ++i) {
                 vectors[i].iov_base = &packets[i * options.max_datagram_bytes];
                 vectors[i].iov_len = options.max_datagram_bytes;
@@ -488,7 +490,7 @@ struct MarketDataStream::Impl {
             const std::uint64_t deadline = duration_ms ? start + static_cast<std::uint64_t>(duration_ms) * 1000000ULL
                                                       : std::numeric_limits<std::uint64_t>::max();
             std::uint64_t sequence = 0, last_receive = 0;
-            bool idle_armed = false;
+            bool idle_armed = false, drain_ready = false;
             if (!stopping.load()) receiver_ready.store(true, std::memory_order_release);
             while (!stopping.load(std::memory_order_acquire)) {
                 const std::uint64_t now = clock_ns(CLOCK_MONOTONIC);
@@ -502,7 +504,16 @@ struct MarketDataStream::Impl {
                     wait = std::min(wait, now >= idle_due ? 0 : idle_due - now);
                 }
                 timespec timeout = {static_cast<time_t>(wait / 1000000000ULL), static_cast<long>(wait % 1000000000ULL)};
-                const int ready = ::ppoll(sockets.data(), sockets.size(), &timeout, 0);
+                // A full batch warrants another fair sweep without a poll syscall.
+                // Each socket still receives at most one batch per sweep.
+                int ready;
+                if (drain_ready || options.receive_busy_poll) {
+                    for (pollfd& socket : sockets) socket.revents = POLLIN;
+                    ready = static_cast<int>(sockets.size());
+                } else {
+                    ready = ::ppoll(sockets.data(), sockets.size(), &timeout, 0);
+                }
+                drain_ready = false;
                 if (ready < 0 && errno == EINTR) continue;
                 if (ready < 0) throw std::runtime_error(io_error("UDP ppoll"));
                 if (!ready && idle_armed) {
@@ -521,6 +532,7 @@ struct MarketDataStream::Impl {
                         idle_armed = false;
                     }
                 }
+                bool sweep_received=false;
                 for (std::size_t channel = 0; channel < sockets.size() && !stopping.load(); ++channel) {
                     if (sockets[channel].revents & (POLLERR | POLLHUP | POLLNVAL))
                         throw std::runtime_error("UDP poll error");
@@ -530,11 +542,23 @@ struct MarketDataStream::Impl {
                         messages[i].msg_hdr.msg_controllen = control_bytes;
                         messages[i].msg_hdr.msg_flags = 0;
                     }
+                    const std::uint64_t syscall_start = clock_ns(CLOCK_MONOTONIC);
+                    if (last_full[channel]) stats.max_full_batch_gap_ns = std::max(
+                        stats.max_full_batch_gap_ns, syscall_start - last_full[channel]);
+                    last_full[channel] = 0;
                     const int received = ::recvmmsg(sockets[channel].fd, messages.data(), count, MSG_DONTWAIT, 0);
                     if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) continue;
                     if (received < 0) throw std::runtime_error(io_error("UDP recvmmsg"));
                     if (!received) continue;
+                    sweep_received=true;
+                    if (static_cast<std::size_t>(received) == count) drain_ready = true;
                     const std::uint64_t receive_time = clock_ns(CLOCK_MONOTONIC);
+                    stats.max_receive_syscall_ns = std::max(stats.max_receive_syscall_ns,
+                                                           receive_time - syscall_start);
+                    if (static_cast<std::size_t>(received) == count) {
+                        ++stats.full_receive_batches;
+                        last_full[channel] = receive_time;
+                    }
                     const std::uint64_t realtime = clock_ns(CLOCK_REALTIME);
                     const std::uint64_t batch = ++stats.receive_batches;
                     for (int i = 0; i < received; ++i) {
@@ -579,6 +603,23 @@ struct MarketDataStream::Impl {
                     }
                     last_receive = receive_time;
                     idle_armed = options.idle_gap_ns != 0;
+                }
+                // A dedicated receiving CPU polls both nonblocking sockets fairly.
+                // Publish the same idle fence only after a sweep finds no data;
+                // never wait for a receive batch to fill and never sleep to wake it.
+                if(options.receive_busy_poll && !sweep_received) {
+                    if(idle_armed) {
+                        const std::uint64_t time=clock_ns(CLOCK_MONOTONIC);
+                        if(time>last_receive+options.idle_gap_ns && time<deadline) {
+                            RecordHeader idle={};idle.magic=kRecordMagic;idle.kind=kIdleEvent;
+                            idle.sequence=++sequence;idle.monotonic_ns=time;idle.realtime_ns=clock_ns(CLOCK_REALTIME);
+                            if(!ingress->push(idle,0)) {++stats.ingress_overflows;throw std::runtime_error("ingress queue overflow; stream incomplete");}
+                            idle_armed=false;
+                        }
+                    }
+#if defined(__x86_64__) || defined(__i386__)
+                    __builtin_ia32_pause();
+#endif
                 }
             }
         } catch (const std::exception& exception) { fail(exception.what(), kInputInvalid); }
@@ -655,6 +696,13 @@ bool MarketDataStream::run(const std::vector<ChannelSpec>& channels, const Strea
     try {
         validate_options(options, channels.size(), duration_ms);
         if (!callback) throw std::runtime_error("stream callback required");
+        // First-touch the handoff buffers on the dispatcher NUMA node.
+        if (options.dispatch_cpu >= 0) {
+            const int status = ::pthread_getaffinity_np(::pthread_self(), sizeof(previous_affinity), &previous_affinity);
+            if (status) throw std::runtime_error("cannot save dispatcher CPU affinity");
+            restore_affinity = true;
+            pin(options.dispatch_cpu);
+        }
         const std::vector<ChannelHeader> table = channel_headers(channels);
         impl_->channels = channels;
         ingress.reset(new Queue(options.queue_capacity, options.max_datagram_bytes,
@@ -669,19 +717,18 @@ bool MarketDataStream::run(const std::vector<ChannelSpec>& channels, const Strea
             }
         }
         receiver = std::thread(&Impl::receive, impl_.get(), std::cref(channels), std::cref(options), ingress.get(), duration_ms);
-        if (options.dispatch_cpu >= 0) {
-            const int status = ::pthread_getaffinity_np(::pthread_self(), sizeof(previous_affinity), &previous_affinity);
-            if (status) throw std::runtime_error("cannot save dispatcher CPU affinity");
-            restore_affinity = true;
-            pin(options.dispatch_cpu);
-        }
         while (!impl_->failed.load(std::memory_order_acquire)) {
             const unsigned char* payload;
             const ReceiveClockInfo* clocks = 0;
             const RecordHeader* header = ingress->front(&payload, &clocks);
             if (!header) {
                 if (impl_->receiver_done.load(std::memory_order_acquire) && ingress->empty()) break;
+#if defined(__x86_64__) || defined(__i386__)
+                if(options.dispatch_busy_poll)__builtin_ia32_pause();
+                else std::this_thread::yield();
+#else
                 std::this_thread::yield();
+#endif
                 continue;
             }
             if (recording && !impl_->recording_failed()) {

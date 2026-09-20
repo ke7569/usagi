@@ -1,3 +1,6 @@
+#ifdef SSE_APP_LATENCY_PROBE
+#include "common/oms/OrderLatency.h"
+#endif
 #ifndef T0_STREAM_PROCESSING_CLI_H
 #define T0_STREAM_PROCESSING_CLI_H
 
@@ -23,6 +26,7 @@
 #include "sze/market_data/SZERecoverable.h"
 #else
 #include "sse/runtime/sse_stream_processor.h"
+#include "sse/runtime/sse_parallel_processor.h"
 #include "sse/auction/auction_static_metadata.h"
 #include "sse/runtime/sse_strategy_session.h"
 #endif
@@ -32,6 +36,9 @@ namespace sze_application {
 typedef sze_strategy::Session MarketStrategySession;
 #else
 namespace sse_application {
+#ifdef SSE_REPLAY_PROBE
+void opt_order_intent(const nlohmann::json&);
+#endif
 typedef sse_strategy::Session MarketStrategySession;
 #endif
 
@@ -149,7 +156,14 @@ public:
                 if (output.prediction_valid) ++predictions_;
                 last_sequence_ = output.ingress_sequence;
                 crc_.process_bytes(output.sample.factors.data(), sizeof(float) * output.sample.factors.size());
+#ifdef SSE_APP_LATENCY_PROBE
+                sse_app_latency_probe(output);
+                const auto strategy_start=order_latency::now_ns();
+#endif
                 if (strategy_) strategy_->on_output(output);
+#ifdef SSE_APP_LATENCY_PROBE
+                sse_probe_add(3,order_latency::now_ns()-strategy_start);
+#endif
             }, input_driver_ == "raw" ? 88 : recovery_config_.source_id));
         if (input_driver_ != "raw") {
             recovery_.reset(new sze_stream::SzeRecoveryDriver(processor_.get()));
@@ -169,7 +183,11 @@ public:
         const Json routing = Json::parse(R"json({"clock":"exchange-time-of-day-micros",
             "snapshot_selected_window":"[09:30:00,09:35:00)","tick_selected_window":"[09:35:00,24:00:00)",
             "tick_warm_before_switch":true,"silent_fallback":false})json");
-        bool auction59_enabled = true;
+        const std::string model_version = prediction.value("model_version", std::string("legacy"));
+        if (model_version != "legacy" && model_version != "v0.6")
+            throw std::runtime_error("unknown SSE model version");
+        const bool v06 = model_version == "v0.6";
+        bool auction59_enabled = !v06;
         if (prediction.count("auction59")) {
             const Json& auction = prediction.at("auction59");
             stream_input::fields(auction, {"enabled"});
@@ -223,52 +241,142 @@ public:
             }
         }
         if (!factors_only) {
-            if (!model_.load(string(prediction, "model_path"),
+            if (v06) {
+                if (!model_.load_v06(string(prediction,"model_path"), &error))
+                    throw std::runtime_error(error);
+            } else if (!model_.load(string(prediction, "model_path"),
                              string(prediction, "snapshot_baseline_model_path"),
                              string(prediction, "snapshot_baseline_scaler_path"),
                              string(prediction, "snapshot_auction59_model_path"),
                              string(prediction, "snapshot_auction59_scaler_path"), &error))
                 throw std::runtime_error(error);
         }
-        processor_.reset(new sse_stream::SseStreamProcessor(metadata, factors_only ? 0 : &model_, factors_only,
-            [&](const sse_stream::Output& output) {
-                if (output.kind == sse_stream::kTickOutput) {
-                    ++rows_;
-                    if (output.tick.prediction_valid) ++predictions_;
-                    last_sequence_ = output.tick.provenance.stream_sequence;
-                    crc_.process_bytes(output.tick.factors.values.data(), sizeof(float) * output.tick.factors.values.size());
-                } else if (output.kind == sse_stream::kSnapshotOutput) {
-                    ++rows_;
-                    if (output.snapshot.prediction_valid) ++predictions_;
-                    last_sequence_ = output.snapshot.provenance.stream_sequence;
-                    crc_.process_bytes(output.snapshot.snapshot36.data(), sizeof(float) * output.snapshot.snapshot36.size());
+        processor_.reset(new sse_stream::SseParallelProcessor(metadata, factors_only ? 0 : &model_, factors_only,
+            [&](const std::vector<sse_stream::Output>& outputs) {
+                for (const auto& output : outputs) {
+                    if (output.kind == sse_stream::kTickOutput) {
+                        ++rows_;
+                        if (output.tick.prediction_valid) ++predictions_;
+                        if (output.tick.prediction_valid && output.tick.prediction.multi_head) {
+                            const auto& p=output.tick.prediction;
+                            sse_v06::audit_prediction(output.tick.event.security_id,
+                                output.tick.event.time_of_day_micros,output.tick.provenance.stream_sequence,
+                                output.tick.event.tick_index,p.heads,p.selected);
+                        }
+                        last_sequence_ = output.tick.provenance.stream_sequence;
+                        crc_.process_bytes(output.tick.factors.values.data(), sizeof(float) * output.tick.factors.values.size());
+                    } else if (output.kind == sse_stream::kSnapshotOutput) {
+                        ++rows_;
+                        if (output.snapshot.prediction_valid) ++predictions_;
+                        last_sequence_ = output.snapshot.provenance.stream_sequence;
+                        crc_.process_bytes(output.snapshot.snapshot36.data(), sizeof(float) * output.snapshot.snapshot36.size());
+                    }
+                    if (live_ || monitor_) {
+                        if (output.kind == sse_stream::kTickOutput)
+                            signal_times_[output.tick.event.security_id] = output.tick.event.time_of_day_micros;
+                        else if (output.kind == sse_stream::kSnapshotOutput)
+                            signal_times_[output.snapshot.snapshot.security_id] = output.snapshot.snapshot.time_of_day_micros;
+                        if (strategy_) strategy_->set_ready(oms_->ready(), true, true);
+                    }
+#ifdef SSE_APP_LATENCY_PROBE
+                    sse_app_latency_probe(output);
+#endif
                 }
-                if (live_ || monitor_) {
-                    if (output.kind == sse_stream::kTickOutput)
-                        signal_times_[output.tick.event.security_id] = output.tick.event.time_of_day_micros;
-                    else if (output.kind == sse_stream::kSnapshotOutput)
-                        signal_times_[output.snapshot.snapshot.security_id] = output.snapshot.snapshot.time_of_day_micros;
-                    if (strategy_) strategy_->set_ready(oms_->account().ready, true, true);
+#ifdef SSE_APP_LATENCY_PROBE
+                const auto strategy_start=order_latency::now_ns();
+#endif
+                if (strategy_ && !outputs.empty()) {
+                    if (outputs.back().kind == sse_stream::kBatchEndOutput)
+                        strategy_->on_completed_batch(outputs);
+                    else
+                        for (const auto& output : outputs) {
+                            if(processor_->parallel_enabled() && output.kind==sse_stream::kTickOutput)
+                                strategy_->on_closed_prediction(output);
+                            else strategy_->on_output(output);
+                        }
                 }
-                if (strategy_) strategy_->on_output(output);
+#ifdef SSE_APP_LATENCY_PROBE
+                sse_probe_add(3,order_latency::now_ns()-strategy_start);
+#endif
             }, sse_stream::Auction59Provider(), auction_metadata, auction59_enabled));
 #endif
         initialize_strategy(healthy);
+#ifndef T0_STREAM_SZE
+        if ((live_ || monitor_) && processor_->strategy_consumer_enabled()) {
+            processor_->set_strategy_poll([this]() {
+                if (!stopped_.load(std::memory_order_acquire)) advance_clock(0);
+            });
+        }
+#endif
+    }
+    ~StreamProcessingCli() { try { begin_stop(); } catch (...) {} }
+    void begin_transport_epoch(std::uint64_t last_monotonic) {
+#ifndef T0_STREAM_SZE
+        processor_->begin_transport_epoch(last_monotonic);
+#endif
+    }
+    void enable_live_latency(bool enabled) {
+#ifndef T0_STREAM_SZE
+        processor_->wait_strategy();
+        if(strategy_)strategy_->enable_live_latency(enabled);
+#endif
     }
     void on_event(const deepwin_market_data::StreamEvent& event) {
         try {
+#ifdef SSE_APP_LATENCY_PROBE
+            const auto clock_start=order_latency::now_ns();
+#endif
+#ifdef T0_STREAM_SZE
             advance_clock(event.monotonic_ns);
+#else
+            if (live_ || monitor_) {
+                if (!processor_->strategy_consumer_enabled()) advance_clock(0);
+            } else {
+                // Virtual replay time is input data and keeps its FIFO order.
+                const auto ns=event.monotonic_ns;
+                processor_->post_strategy([this,ns](){ advance_clock(ns); });
+            }
+#endif
+#ifdef SSE_APP_LATENCY_PROBE
+            sse_probe_add(0,order_latency::now_ns()-clock_start);
+#endif
             processor_->on_event(event);
         }
         catch (...) { begin_stop(); throw; }
     }
     // TD reports and cancel timers must progress even when market data is idle.
+    void flush_processing() {
+#ifndef T0_STREAM_SZE
+        processor_->flush();
+#endif
+    }
     void poll() {
+#ifndef T0_STREAM_SZE
+        // Live polling must not wait for unrelated queued work. Explicit
+        // replay/live transitions and shutdown still use flush_processing().
+        processor_->poll_completed();
+#else
+        flush_processing();
+#endif
         if ((!live_ && !monitor_) || stopped_.load()) return;
-        try { advance_clock(0); }
+        try {
+#ifdef T0_STREAM_SZE
+            advance_clock(0);
+#else
+            if (!processor_->strategy_consumer_enabled()) advance_clock(0);
+#endif
+        }
         catch (...) { begin_stop(); throw; }
     }
     void begin_stop() {
+        // Close the send gate before draining/joining delivery. Once joined,
+        // teardown may safely take ownership of Session and OMS on this thread.
+        stopped_.store(true,std::memory_order_release);
+        std::exception_ptr delivery_error;
+#ifndef T0_STREAM_SZE
+        try { if(processor_)processor_->stop_strategy(); }
+        catch (...) { delivery_error=std::current_exception(); }
+#endif
         if (strategy_) strategy_->begin_stop();
         if (oms_) oms_->begin_stop();
         stopped_.store(true);
@@ -276,6 +384,7 @@ public:
 #ifdef T0_STREAM_SZE
         if (recovery_) recovery_->request_stop();
 #endif
+        if(delivery_error)std::rethrow_exception(delivery_error);
     }
     bool recovery_ready() const { return reached_live_.load() && !stopped_.load(); }
     bool recovery_available() const {
@@ -289,7 +398,7 @@ public:
 #ifdef T0_STREAM_SZE
         return processor_->available();
 #else
-        return !processor_->invalid();
+        return !processor_->invalid() && processor_->strategy_consumer_valid();
 #endif
     }
     bool run_recovery() {
@@ -326,21 +435,44 @@ public:
     // Constant-size status for the five-second journal heartbeat. Avoid
     // copying the OMS audit history or the instrument universe in this path.
     Json runtime_status() const {
+#ifndef T0_STREAM_SZE
+        if(!stopped_.load(std::memory_order_acquire))processor_->wait_strategy();
+        if (model_.is_v06()) sse_v06::audit_flush();
+#endif
         Json result{{"rows", rows_}, {"predictions", predictions_},
             {"execution", live_ ? "live" : monitor_ ? "monitor" : "disabled"}};
+        result["model_version"]=profile_.at("prediction").value("model_version",std::string("legacy"));
+#ifndef T0_STREAM_SZE
+        result["prediction_workers"]=processor_->worker_count();
+        result["strategy_consumer"]={{"enabled",processor_->strategy_consumer_enabled()},
+            {"cpu",processor_->strategy_consumer_cpu()},
+            {"published",processor_->strategy_consumer_published()},
+            {"consumed",processor_->strategy_consumer_consumed()},
+            {"high_water",processor_->strategy_consumer_high_water()},
+            {"full_waits",processor_->strategy_consumer_full_waits()}};
+        result["pending_processing_events"]=processor_->pending_events();
+        if(strategy_)result["live_signal_latency"]=strategy_->live_latency();
+        result["owner_cpu"]=sched_getcpu();
+        if(model_.is_v06())result["audit_pending_records"]=sse_v06::audit_sink().pending();
+#endif
         if (strategy_) {
             const oms::AccountView account = oms_->account();
             result["strategy"] = Json{
                 {"mode", live_ ? "live" : monitor_ ? "monitor" : "paper-intents"},
-                {"orders_enabled", live_}, {"connected", account.connected},
+                {"orders_enabled", live_}, {"durable_order_intents", profile_.at("strategy_runtime").at("oms").value("durable_order_intents",true)}, {"connected", account.connected},
                 {"ready", account.ready}, {"reason", account.reason},
                 {"order_intents", (live_ || monitor_) ? account.admissions : order_intents_}};
         }
         return result;
     }
     Json summary() const {
+#ifndef T0_STREAM_SZE
+        if(!stopped_.load(std::memory_order_acquire))processor_->wait_strategy();
+        if (model_.is_v06()) sse_v06::audit_flush();
+#endif
         Json result;
         result["contract"] = profile_.at("processing_contract");
+        result["model_version"] = profile_.at("prediction").value("model_version",std::string("legacy"));
         result["mode"] = profile_.at("processing_mode");
         result["processing_sha256"] = profile_.at("processing_sha256");
         result["samples"] = rows_;
@@ -405,6 +537,11 @@ private:
         (void)healthy;
         throw std::runtime_error("live TD is only wired to the Shanghai journal entry point");
 #else
+        struct TdInitAffinity {
+            cpu_set_t previous;bool active;
+            TdInitAffinity():active(false){const char*p=std::getenv("SSE_LEASED_TD_CPU");if(!p||!*p)return;char*end=0;long cpu=std::strtol(p,&end,10);if(*end||cpu<0||cpu>=255||sched_getaffinity(0,sizeof(previous),&previous))throw std::runtime_error("invalid leased TD CPU");cpu_set_t selected;CPU_ZERO(&selected);CPU_SET(cpu,&selected);if(sched_setaffinity(0,sizeof(selected),&selected))throw std::runtime_error("cannot bind SDK initialization CPU");active=true;}
+            ~TdInitAffinity(){if(active&&sched_setaffinity(0,sizeof(previous),&previous))std::abort();}
+        } td_affinity;
         const Json& runtime = profile_.at("strategy_runtime");
         stream_input::fields(runtime, {"mode", "account_reference", "legacy_config", "oms", "td"});
         if (string(runtime, "mode") != (monitor_ ? "monitor" : "live") || !healthy)
@@ -421,7 +558,7 @@ private:
             legacy.at("ins_params").size() != profile_.at("instruments").size())
             throw std::runtime_error("live strategy and processing date/universe differ");
         const Json& settings = runtime.at("oms");
-        stream_input::fields(settings, {"journal_path", "fee_reserve_per_order"});
+        stream_input::fields(settings, {"journal_path", "fee_reserve_per_order", "durable_order_intents"});
         oms::Config config;
         config.scope.account.broker = "guoxin"; config.scope.account.account = string(runtime, "account_reference");
         config.scope.gateway = "sse_td"; config.scope.source = 190;
@@ -431,6 +568,10 @@ private:
         config.lock_directory = "/run/usagi/oms/accounts";
         config.journal_path = string(settings, "journal_path");
         config.restart_cancel_open_orders = !monitor_;
+        if(settings.count("durable_order_intents")) {
+            if(!settings.at("durable_order_intents").is_boolean())throw std::runtime_error("durable_order_intents must be boolean");
+            config.durable_order_intents=settings.at("durable_order_intents").get<bool>();
+        }
         if (config.journal_path.empty() || config.journal_path[0] != '/' ||
             !oms::money_from_double(number(settings, "fee_reserve_per_order"), &config.limits.fee_reserve_per_order))
             throw std::runtime_error("live OMS journal and explicit fee reserve required");
@@ -460,7 +601,7 @@ private:
         if (!oms_->start_epoch(scope.epoch, false)) throw std::runtime_error("cannot start live OMS epoch");
         execution_.reset(new strategy_runtime::OmsStrategyExecution(oms_, config.instance));
         const std::function<bool()> gate = [this, healthy]() {
-            return live_ && !stopped_.load() && oms_->account().ready && healthy();
+            return live_ && !stopped_.load() && oms_->ready() && healthy();
         };
         strategy_.reset(new MarketStrategySession(legacy, 190, execution_, gate));
         strategy_->set_instrument_gate([this](const std::string& code) {
@@ -469,8 +610,11 @@ private:
         strategy_->set_ready(false, true, true);
         std::string error;
         if (!live_td_->session().connect(5000000000LL, &error)) throw std::runtime_error(error);
-        advance_clock(0); // Delivers the SDK connection event on the strategy owner thread.
-        if (!oms_->begin_reconcile(1)) throw std::runtime_error("cannot start ATP account reconciliation");
+        processor_->post_strategy([this](){
+            advance_clock(0); // Deliver SDK connection and begin account query on the owner.
+            if (!oms_->begin_reconcile(1)) throw std::runtime_error("cannot start ATP account reconciliation");
+        });
+        processor_->wait_strategy();
 #endif
     }
     void advance_clock(std::uint64_t ns) {
@@ -551,13 +695,16 @@ private:
                 {"exchange", command.intent.instrument.market}, {"price", command.intent.price / double(oms::kMoneyScale)},
                 {"volume", command.intent.quantity}, {"direction", std::string(1, buy ? LF_CHAR_Buy : LF_CHAR_Sell)},
                 {"offset", std::string(1, buy ? LF_CHAR_Open : LF_CHAR_Close)} };
+#ifdef SSE_REPLAY_PROBE
+            opt_order_intent(value);
+#endif
             const std::string encoded = value.dump();
             intent_crc_.process_bytes(encoded.data(), encoded.size());
         }));
         oms_ = oms::Engine::create(config, backend);
         execution_.reset(new strategy_runtime::OmsStrategyExecution(oms_, config.instance));
         const std::function<bool()> gate = [this, healthy]() {
-            if (stopped_.load() || !oms_->account().ready || !healthy()) return false;
+            if (stopped_.load() || !oms_->ready() || !healthy()) return false;
 #ifdef T0_STREAM_SZE
             if (input_driver_ != "raw") return recovery_ && recovery_->live_ready();
 #endif
@@ -576,7 +723,7 @@ private:
         snapshot.trades_success = snapshot.all_day_orders = snapshot.all_day_trades = true;
         if (!oms_->complete_snapshot(snapshot))
             throw std::runtime_error("incomplete explicit paper account snapshot");
-        strategy_->set_ready(oms_->account().ready, true, true);
+        strategy_->set_ready(oms_->ready(), true, true);
     }
 #ifdef T0_STREAM_SZE
     void load_recovery_config(const std::string& recording, bool capture, double day) {
@@ -649,7 +796,7 @@ private:
     std::unique_ptr<sze_stream::SzeRecoveryDriver> recovery_;
 #else
     sse_hybrid_model::Model model_;
-    std::unique_ptr<sse_stream::SseStreamProcessor> processor_;
+    std::unique_ptr<sse_stream::SseParallelProcessor> processor_;
 #endif
 };
 

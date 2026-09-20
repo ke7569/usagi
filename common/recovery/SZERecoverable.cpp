@@ -1,4 +1,5 @@
-#include "sze/market_data/SZERecoverable.h"
+#include "common/recovery/Crc32Pclmul.h"
+#include "common/recovery/SZERecoverable.h"
 
 #include <cerrno>
 #include <climits>
@@ -205,25 +206,47 @@ std::uint32_t slot_crc(const CanonicalEvent& event, const void* payload)
 
 std::uint32_t crc32(const void* data, std::size_t bytes)
 {
+    // IEEE CRC32, slicing by eight. The polynomial, seed and final XOR
+    // remain identical to existing journal and shared-memory records.
     struct CrcTable {
-        CrcTable()
-        {
-        for (std::uint32_t i = 0; i < 256U; ++i) {
-            std::uint32_t value = i;
-            for (unsigned bit = 0; bit < 8U; ++bit) {
-                value = (value >> 1U) ^ ((value & 1U) ? 0xedb88320U : 0U);
+        std::uint32_t table[8][256];
+        CrcTable() {
+            for (std::uint32_t i=0;i<256;++i) {
+                std::uint32_t v=i;
+                for(unsigned bit=0;bit<8;++bit)
+                    v=(v>>1)^((v&1)?0xedb88320U:0U);
+                table[0][i]=v;
             }
-            table[i] = value;
+            for(unsigned n=1;n<8;++n)
+                for(unsigned i=0;i<256;++i) {
+                    const std::uint32_t v=table[n-1][i];
+                    table[n][i]=table[0][v&255]^(v>>8);
+                }
         }
-        }
-        std::uint32_t table[256];
     };
     static const CrcTable crc_table;
-    const unsigned char* cursor = static_cast<const unsigned char*>(data);
-    std::uint32_t value = 0xffffffffU;
-    for (std::size_t i = 0; i < bytes; ++i) {
-        value = crc_table.table[(value ^ cursor[i]) & 0xffU] ^ (value >> 8U);
+    const auto& t=crc_table.table;
+    const unsigned char* cursor=static_cast<const unsigned char*>(data);
+    std::uint32_t value=0xffffffffU;
+#if defined(__x86_64__) && defined(__GNUC__) && !defined(USAGI_CRC_FORCE_PORTABLE)
+    // Same IEEE polynomial/seed/final XOR as all existing records. SSE4.2's
+    // crc32 instruction is CRC32C and must NOT be used for these records.
+    if (bytes>=64 && crc_detail::pclmul_available()) {
+        const std::size_t folded=bytes & ~std::size_t(15);
+        value=crc_detail::fold(cursor,folded,value);
+        cursor+=folded;bytes-=folded;
     }
+#endif
+    while(bytes>=8) {
+        const std::uint32_t first=std::uint32_t(cursor[0])|
+            (std::uint32_t(cursor[1])<<8)|(std::uint32_t(cursor[2])<<16)|
+            (std::uint32_t(cursor[3])<<24);
+        const std::uint32_t v=value^first;
+        value=t[7][v&255]^t[6][(v>>8)&255]^t[5][(v>>16)&255]^t[4][v>>24]^
+              t[3][cursor[4]]^t[2][cursor[5]]^t[1][cursor[6]]^t[0][cursor[7]];
+        cursor+=8;bytes-=8;
+    }
+    while(bytes--) value=t[0][(value^*cursor++)&255]^(value>>8);
     return value ^ 0xffffffffU;
 }
 
@@ -1240,8 +1263,11 @@ bool ShmEventRing::publish(const CanonicalEvent& event, const void* payload)
     destination->slot_crc32 = slot_crc(event, payload_destination);
     atomic_store_release(&destination->published_event_id, event.event_id);
     atomic_store_release(&header_->latest_feed_sequence, event.feed_sequence);
-    __atomic_add_fetch(&header_->publish_count,
-                       static_cast<std::uint64_t>(1U), __ATOMIC_RELAXED);
+    // The ring has one publisher. A relaxed atomic load/store keeps metrics
+    // readers race-free without a locked read-modify-write on every packet.
+    __atomic_store_n(&header_->publish_count,
+        __atomic_load_n(&header_->publish_count, __ATOMIC_RELAXED) + 1U,
+        __ATOMIC_RELAXED);
     atomic_store_release(&header_->latest_event_id, event.event_id);
     return true;
 }
@@ -1525,6 +1551,7 @@ bool ReplayHandoffConsumer::open(const JournalConfig& journal_config,
 
 void ReplayHandoffConsumer::close()
 {
+    borrowed_ring_reader_=BorrowedRingReader();
     if (ring_.is_open() && publish_legacy_shared_readiness_) {
         ring_.set_readiness(kReadinessNotReady);
     }
@@ -1547,15 +1574,16 @@ void ReplayHandoffConsumer::invalidate()
 ReplayReadStatus ReplayHandoffConsumer::read_ring(
     CanonicalEvent* event,
     void* payload,
-    std::size_t payload_capacity)
+    std::size_t payload_capacity, const unsigned char** borrowed)
 {
     if (ring_.continuity_state() == kContinuityInvalid ||
         ring_.generation() != generation_ || !ring_.producer_alive()) {
         invalidate();
         return kReplayReadInvalid;
     }
-    const RingReadStatus status = ring_.read(
-        next_event_id_, event, payload, payload_capacity);
+    const RingReadStatus status = borrowed && borrowed_ring_reader_
+        ? borrowed_ring_reader_(next_event_id_,event,borrowed)
+        : ring_.read(next_event_id_,event,payload,payload_capacity);
     if (status == kRingReadNotReady) {
         return kReplayReadWouldBlock;
     }
@@ -1593,16 +1621,24 @@ ReplayReadStatus ReplayHandoffConsumer::next(CanonicalEvent* event,
                                              void* payload,
                                              std::size_t payload_capacity)
 {
+    return next(event,payload,payload_capacity,nullptr);
+}
+
+ReplayReadStatus ReplayHandoffConsumer::next(CanonicalEvent* event, void* payload,
+    std::size_t payload_capacity, const unsigned char** borrowed)
+{
+    if (borrowed) *borrowed=static_cast<const unsigned char*>(payload);
     if (!event || mode_ == kReplayInvalid) {
         return kReplayReadInvalid;
+    }
+    // read_ring performs the same producer/generation/continuity check.
+    if (mode_ == kReplayLive || mode_ == kReplayHandoff) {
+        return read_ring(event, payload, payload_capacity, borrowed);
     }
     if (ring_.continuity_state() == kContinuityInvalid ||
         ring_.generation() != generation_ || !ring_.producer_alive()) {
         invalidate();
         return kReplayReadInvalid;
-    }
-    if (mode_ == kReplayLive || mode_ == kReplayHandoff) {
-        return read_ring(event, payload, payload_capacity);
     }
 
     const JournalStatus status = reader_.next(event, payload, payload_capacity);
@@ -1623,7 +1659,7 @@ ReplayReadStatus ReplayHandoffConsumer::next(CanonicalEvent* event,
         if (publish_legacy_shared_readiness_) {
             ring_.set_readiness(kReadinessHandoff);
         }
-        return read_ring(event, payload, payload_capacity);
+        return read_ring(event, payload, payload_capacity, borrowed);
     }
     return kReplayReadWouldBlock;
 }

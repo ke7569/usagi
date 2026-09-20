@@ -398,10 +398,48 @@ void test_live_journal_failure_blocks_new_risk_but_allows_owned_cancel() {
             "journal partial-write failure remains fail-closed with owned cancels");
 }
 
+void test_async_intent_loss_reconciles_and_never_reuses_id() {
+    TempDir temp;Config settings=config(temp);settings.durable_order_intents=false;
+    off_t durable_prefix=0;OrderId sent_id=0;
+    {
+        auto backend=std::make_shared<ScriptedBackend>(capabilities());
+        auto engine=Engine::create(settings,backend);
+        struct stat st;require(::stat(temp.journal.c_str(),&st)==0,"journal stat");durable_prefix=st.st_size;
+        require(engine->start_epoch(1),"async epoch");
+        require(!engine->submit(buy("owner","before-reconcile")).accepted,"no submit before account reconciliation");
+        reconcile(engine,backend,1);require(engine->account().ready,"async ready");
+        require(!engine->submit(buy("owner","historical-signal"),[](){return false;}).accepted,"replay gate blocks new orders");
+        auto result=engine->submit(buy("owner","sent-but-tail-lost",100));
+        require(result.accepted,"async submit accepted");sent_id=result.id;
+    }
+    // Simulate loss of every record after startup's durable ID reservation,
+    // including the intent of an order already accepted by the broker.
+    require(::truncate(temp.journal.c_str(),durable_prefix)==0,"simulate undurable tail loss");
+    auto backend=std::make_shared<ScriptedBackend>(capabilities());
+    auto engine=create(settings,backend,2);
+    require(!engine->account().ready,"restarted account remains gated");
+    require(engine->begin_reconcile(1,false),"snapshot start");
+    Snapshot working=snapshot_for(engine,1);
+    working.orders.push_back(snapshot_order(sent_id,"owner","broker-tail",kSze,Side::Buy,100,0,100,OrderState::Accepted));
+    require(!engine->complete_snapshot(working),"unknown broker working order blocks restart");
+    require(!engine->submit(buy("owner","blocked-new")).accepted,"cannot trade through unknown working order");
+    require(engine->begin_reconcile(2,false),"terminal snapshot start");
+    Snapshot final=snapshot_for(engine,2);final.positions[0].total+=100;
+    final.orders.push_back(snapshot_order(sent_id,"owner","broker-tail",kSze,Side::Buy,100,100,0,OrderState::Filled));
+    Report trade;trade.scope=final.scope;trade.broker_id="broker-tail";trade.instrument=kSze;trade.side=Side::Buy;
+    trade.kind=ReportKind::Trade;trade.trade_id="tail-fill";trade.trade_quantity=100;trade.trade_price=100000;trade.cumulative_after=100;
+    final.trades.push_back(trade);
+    require(engine->complete_snapshot(final),"complete authoritative terminal snapshot");
+    Quantity qty=0;Money amount=0;require(engine->day_fills(kSze,&qty,&amount)&&qty==100&&amount==10000000,"lost intent fill restored from broker");
+    auto fresh=engine->submit(buy("owner","fresh",100));
+    require(fresh.accepted && fresh.id>sent_id && fresh.id>=1+settings.limits.max_orders,"reserved ID block skipped after loss");
+}
+
 }  // namespace
 
 int main() {
     try {
+        test_async_intent_loss_reconciles_and_never_reuses_id();
         test_durable_active_order_recovery();
         test_unknown_send_is_not_replayed();
         test_query_tokens_restart_in_new_epoch();

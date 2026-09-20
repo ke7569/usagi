@@ -1,25 +1,37 @@
 {
-  "schema_version": 1,
-  "payload_format": "sse-stream-v2",
-  "source_id": 89,
   "journal_prefix": "sse",
-  "segment_bytes": 268435456,
-  "min_free_bytes_after_allocate": 10737418240,
-  "ring_capacity": 65536,
   "journal_queue_capacity": 32768,
-  "queue_capacity": 32768,
-  "max_datagram_bytes": 8192,
-  "receive_batch_size": 64,
   "receive_buffer_bytes": 67108864,
-  "idle_gap_ns": 100000,
-  "receive_cpu": -1,
-  "dispatch_cpu": -1,
-  "journal_cpu": -1,
-  "prediction_cpu": -1,
-  "flush_interval_ms": 100,
+  "receive_busy_poll": true,
+  "receive_cpu": 8,
+  "payload_format": "sse-stream-v2",
+  "segment_bytes": 268435456,
+  "max_datagram_bytes": 8192,
+  "schema_version": 1,
+  "idle_gap_ns": 5000,
+  "dispatch_busy_poll": true,
   "hardware_timestamp_interface": "hqh-p1-k2",
+  "min_free_bytes_after_allocate": 10737418240,
+  "receive_batch_size": 128,
+  "flush_interval_ms": 100,
+  "dispatch_cpu": 16,
+  "journal_cpu": 24,
   "channels": [
-    {"name": "sse_tick", "group": "239.35.80.9", "port": 37109, "interface_ip": "11.11.11.11"},
-    {"name": "sse_snapshot", "group": "239.35.80.5", "port": 37105, "interface_ip": "11.11.11.11"}
-  ]
+    {
+      "interface_ip": "11.11.11.11",
+      "group": "239.35.80.9",
+      "name": "sse_tick",
+      "port": 37109
+    },
+    {
+      "interface_ip": "11.11.11.11",
+      "group": "239.35.80.5",
+      "name": "sse_snapshot",
+      "port": 37105
+    }
+  ],
+  "queue_capacity": 32768,
+  "ring_capacity": 65536,
+  "prediction_cpu": 136,
+  "source_id": 89
 }

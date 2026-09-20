@@ -10,6 +10,7 @@
 #include "atp_quant_api.h"
 #include "adapters/td/atp/GxbseDirectApi.h"
 #include "adapters/td/atp/OmsAtpBackend.h"
+#include "adapters/td/atp/AtpOmsRequests.h"
 #include "common/execution/AtpSnapshotCollector.h"
 #include "common/execution/LiveTd.h"
 #include <map>
@@ -232,11 +233,21 @@ private:
     std::condition_variable login_cv_;
 
     std::mutex route_mutex_;
+    friend struct AtpSendTest;
     std::map<int, std::weak_ptr<oms::AtpBackend> > oms_backends_;
-    std::map<std::pair<int, long>, OrderRoute> oms_routes_;
-    oms::SendResult send_oms_command(int account_index, const oms::Command& command);
+    // Pointers are protected by route_mutex_; unordered_map rehash preserves
+    // element addresses. Sent routes live in request_to_route_, recovered
+    // routes in clord_to_route_; neither store is pruned while referenced.
+    std::map<std::pair<int, long>, const OrderRoute*> oms_routes_;
+    oms::SendResult send_oms_command(int account_index, const oms::Command& command,
+                                    atp_oms::Requests& requests);
     void publish_oms_order(const OrderRoute& route, const atp::quant_api::ATPRtnCashAuctionOrderMsg& msg);
+    // A sent order owns one full route record keyed by ATP request id.  The
+    // callback indexes below carry only ids; snapshot/reconciliation code
+    // still uses the legacy maps above for routes that have no sent request.
     std::unordered_map<int64_t, OrderRoute> request_to_route_;
+    std::unordered_map<int64_t, int64_t> clord_to_request_;
+    std::map<std::pair<int, long>, int64_t> order_ref_to_request_;
     std::unordered_map<int64_t, OrderRoute> clord_to_route_;
     std::unordered_map<long, int64_t> order_ref_to_clord_;
     std::unordered_map<int64_t, int> limit_price_request_account_;
@@ -307,6 +318,7 @@ private:
     void bind_clord_route(int64_t cl_ord_no, const OrderRoute& route);
     bool lookup_route_by_request_id(int64_t request_id, OrderRoute* route);
     bool lookup_route_by_clord(int64_t cl_ord_no, OrderRoute* route);
+    bool lookup_route_by_order_ref(int account_index, long order_ref, OrderRoute* route);
     bool lookup_clord_by_order_ref(long order_ref, int64_t* cl_ord_no);
 
     void respond_bypass_account(const AccountUnitGXBSE& unit, int request_id);

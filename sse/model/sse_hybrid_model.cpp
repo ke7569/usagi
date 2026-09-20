@@ -16,14 +16,20 @@ State::State() { reset(); }
 void State::reset() {
     tick.reset();
     snapshot.reset();
+    v06.reset();
 }
 
 Prediction::Prediction()
     : tick_generated(false), snapshot_generated(false), selected(false),
       selected_source(kNoSource), tick_pred(0.0f), snapshot_pred(0.0f),
-      selected_pred(0.0f) {}
+      selected_pred(0.0f), multi_head(false), heads() {}
 
 Model::Model() : loaded_(false) {}
+
+bool Model::load_v06(const std::string& path, std::string* error) {
+    loaded_ = v06_.load(path,error);
+    return loaded_;
+}
 
 bool Model::load(const std::string& tick_artifact,
                  const std::string& snapshot_baseline_artifact,
@@ -32,6 +38,7 @@ bool Model::load(const std::string& tick_artifact,
                  const std::string& snapshot_auction_scaler,
                  std::string* error) {
     loaded_ = false;
+    v06_ = sse_v06::Model();
     if (error) error->clear();
     if (!tick_.load(tick_artifact, error)) return false;
     if (!snapshot_.load(snapshot_baseline_artifact, snapshot_baseline_scaler,
@@ -64,6 +71,18 @@ bool Model::on_tick(const std::array<float, sse_model::kFeatureCount>& factors,
         return false;
     }
     *output = Prediction();
+    if (is_v06()) {
+        if (time_of_day_micros < kSseOpenMicros) return true;
+        if (!v06_.predict(factors, &state->v06, &output->heads)) {
+            if (error) *error = "v06 model rejected factor row";
+            return false;
+        }
+        output->multi_head = true;
+        output->tick_generated = output->selected = true;
+        output->selected_source = kTickSource;
+        output->tick_pred = output->selected_pred = output->heads[0];
+        return true;
+    }
     float prediction = 0.0f;
     if (!tick_.predict(factors, &state->tick, &prediction) || !finite(prediction)) {
         if (error) *error = "SSE tick model rejected factor row";
@@ -87,6 +106,10 @@ bool Model::on_snapshot(const std::vector<float>& snapshot36,
                         Prediction* output,
                         std::string* error) const {
     if (error) error->clear();
+    if (is_v06()) {
+        if (output) *output = Prediction();
+        return true;
+    }
     // Preserve the reviewed SSE branch's overlap window; selection still
     // switches to tick at 09:35, independently of snapshot generation.
     const std::uint64_t kSnapshotGenerationCloseMicros = 34860000000ULL;

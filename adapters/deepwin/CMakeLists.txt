@@ -229,3 +229,19 @@ if(SSE_BUILD_TD)
     BUILD_WITH_INSTALL_RPATH TRUE
     INSTALL_RPATH "\$ORIGIN;${SZE_TD_API_DIR}/lib;${WC_LIB};${YJJ_LIB};${TPWC_LIB};${BOOST_LIB}")
 endif()
+
+# Exercise real SDK request encoding and the complete TD adapter without any
+# network connection. Only atp_send_path_test interposes the gateway send calls.
+if(TARGET sse_td)
+  add_executable(atp_request_reuse_test ${USAGI_ROOT}/tests/oms/atp_request_reuse_test.cpp)
+  target_include_directories(atp_request_reuse_test PRIVATE ${SZE_TD_API_DIR}/include)
+  target_link_libraries(atp_request_reuse_test PRIVATE ${SZE_TD_API_DIR}/lib/libatpquantapi.so)
+  add_test(NAME atp_request_reuse_test COMMAND atp_request_reuse_test)
+  get_target_property(atp_test_includes sse_td INCLUDE_DIRECTORIES)
+  get_target_property(atp_test_libraries sse_td LINK_LIBRARIES)
+  add_executable(atp_send_path_test ${USAGI_ROOT}/tests/oms/atp_send_path_test.cpp)
+  target_include_directories(atp_send_path_test PRIVATE ${atp_test_includes})
+  target_link_libraries(atp_send_path_test PRIVATE sse_td ${atp_test_libraries} ${TPWC_LIB}/libpython3.6m.so.1.0)
+  add_test(NAME atp_send_path_test COMMAND atp_send_path_test)
+  set_tests_properties(atp_request_reuse_test atp_send_path_test PROPERTIES TIMEOUT 30)
+endif()

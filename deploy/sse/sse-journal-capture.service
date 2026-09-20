@@ -1,13 +1,15 @@
 [Unit]
 Description=SSE raw tick and snapshot journal capture
-Wants=network-online.target
-After=network-online.target
+Wants=network-online.target sse-receive-monitor.service
+After=network-online.target sse-receive-monitor.service
 
 [Service]
 Type=simple
 WorkingDirectory=/home/zane/usagi-sse-dev
+ExecStartPre=/usr/bin/python2 /home/zane/usagi-sse-dev/tools/sse/sse_receive_ops.py tune
 ExecStartPre=/home/zane/usagi-bin/sse_hwstamp_ctl hqh-p1-k2 enable-rx-all
 ExecStart=/usr/bin/python2 /home/zane/usagi-sse-dev/tools/sse/run_journal_capture.py --config /home/zane/usagi-sse-dev/deploy/sse/journal_capture.live.json --binary /home/zane/usagi-bin/t0_sse_journal_capture --runtime-root /home/zane/usagi-runtime
+ExecStartPost=/usr/bin/python2 /home/zane/usagi-sse-dev/tools/sse/sse_receive_ops.py bind-control
 Restart=on-failure
 RestartSec=30
 StartLimitInterval=0

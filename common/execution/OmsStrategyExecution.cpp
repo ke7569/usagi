@@ -6,29 +6,32 @@
 namespace strategy_runtime {
 
 OmsStrategyExecution::OmsStrategyExecution(const std::shared_ptr<oms::Engine>& engine, const std::string& owner)
-    : engine_(engine), owner_(owner), sequence_(0) {
+    : engine_(engine), owner_(owner), source_(engine ? engine->scope().source : 0), sequence_(0) {
     if (!engine || owner.empty() || owner.size() > 96) throw std::invalid_argument("OMS strategy requires engine and owner");
 }
-bool OmsStrategyExecution::permits_new_orders() const { return engine_->account().ready; }
-void OmsStrategyExecution::signal_context(const std::string& signal_id) {
-    if (signal_id.size() > 128) throw std::invalid_argument("strategy signal identity too long");
-    std::lock_guard<std::mutex> guard(signal_mutex_);
-    signal_id_ = signal_id;
-}
-long long OmsStrategyExecution::now_ns() const { return engine_->account().now_ns; }
+bool OmsStrategyExecution::permits_new_orders() const { return engine_->ready(); }
+long long OmsStrategyExecution::now_ns() const { return engine_->now_ns(); }
 bool OmsStrategyExecution::owns_request(short source, int id, const std::string& instrument) const {
-    if (source != engine_->scope().source || id <= 0) return false;
+    if (source != source_ || id <= 0) return false;
     oms::OrderView order;
     return engine_->order(static_cast<oms::OrderId>(id), &order) && order.owned &&
         order.command.intent.owner == owner_ && order.command.intent.instrument.code == instrument;
 }
 bool OmsStrategyExecution::read_position(short source, const std::string& code, const std::string& market,
                                         oms::Position* output) const {
-    return source == engine_->scope().source && engine_->position(oms::Instrument{market, code}, output);
+    return source == source_ && engine_->position(oms::Instrument{market, code}, output);
+}
+bool OmsStrategyExecution::read_day_fills(short source,const std::string& code,const std::string& market,oms::Quantity* q,oms::Money* amount)const {
+    return source==source_ && engine_->day_fills(oms::Instrument{market,code},q,amount);
 }
 bool OmsStrategyExecution::has_working_order(const std::string& instrument) const {
     return engine_->has_working_order(oms::Instrument{"SSE", instrument}) ||
            engine_->has_working_order(oms::Instrument{"SZE", instrument});
+}
+bool OmsStrategyExecution::read_order(short source, int id, oms::OrderView* out) const {
+    return out && source == source_ && id > 0 &&
+        engine_->order(static_cast<oms::OrderId>(id), out) && out->owned &&
+        out->command.intent.owner == owner_;
 }
 int OmsStrategyExecution::submit_limit(short source, const std::string& code, const std::string& market,
                                       double price, int quantity, char direction, char offset) {
@@ -37,14 +40,15 @@ int OmsStrategyExecution::submit_limit(short source, const std::string& code, co
 }
 int OmsStrategyExecution::submit_managed(short source, const std::string& code, const std::string& market,
         double price, int quantity, char direction, char offset, oms::OrderType type, long long delay,
-        const std::function<bool()>& gate) {
-    if (source != engine_->scope().source || quantity <= 0 ||
+        const std::function<bool()>& gate, const std::string& signal_id) {
+    if (signal_id.size() > 128) throw std::invalid_argument("strategy signal identity too long");
+    if (source != source_ || quantity <= 0 ||
         (direction != LF_CHAR_Buy && direction != LF_CHAR_Sell) ||
         (direction == LF_CHAR_Buy ? offset != LF_CHAR_Open : offset != LF_CHAR_Close)) return -1;
     oms::Intent intent;
     if (!oms::money_from_double(price, &intent.price)) return -1;
     intent.owner = owner_; intent.intent_id = std::to_string(engine_->scope().epoch) + ":" + std::to_string(++sequence_);
-    { std::lock_guard<std::mutex> guard(signal_mutex_); intent.signal_id = signal_id_; }
+    intent.signal_id = signal_id;
     intent.instrument = oms::Instrument{market, code};
     intent.side = direction == LF_CHAR_Buy ? oms::Side::Buy : oms::Side::Sell;
     intent.quantity = quantity; intent.type = type; intent.cancel_delay_ns = delay;
@@ -66,12 +70,12 @@ int OmsStrategyExecution::submit_managed(short source, const std::string& code, 
     return static_cast<int>(result.id);
 }
 int OmsStrategyExecution::cancel(short source, int id) {
-    if (source != engine_->scope().source || id <= 0) return -1;
+    if (source != source_ || id <= 0) return -1;
     const oms::Error result = engine_->cancel(owner_, static_cast<oms::OrderId>(id));
     return !result.failed() || result.category == oms::ErrorCategory::AlreadyFinal ? id : -1;
 }
 bool OmsStrategyExecution::schedule_cancel(short source, int id, int delay_ms) {
-    return source == engine_->scope().source && id > 0 && delay_ms >= 0 &&
+    return source == source_ && id > 0 && delay_ms >= 0 &&
         engine_->schedule_cancel(owner_, static_cast<oms::OrderId>(id), delay_ms * 1000000LL);
 }
 }  // namespace strategy_runtime

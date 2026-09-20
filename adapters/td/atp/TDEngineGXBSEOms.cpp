@@ -1,5 +1,8 @@
 #include "adapters/td/atp/TDEngineGXBSE.h"
 #include "common/config/StreamConfigJson.h"
+#include "common/oms/OrderReportLog.h"
+#include "common/oms/OrderLatencyLog.h"
+#include "common/execution/AtpSnapshotOrder.h"
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -239,6 +242,18 @@ bool TDEngineGXBSE::collect_oms_orders(const ATPRspCashOrderQueryResultMsg& msg,
                     row.price = money(msg.GetOrderPrice()); row.original = quantity(msg.GetOrderQty());
                     row.filled = quantity(msg.GetCumQty()); row.working = quantity(msg.GetLeavesQty());
                     row.state = order_state(to_lf_order_status(msg.GetOrdStatus()));
+                    const oms::Quantity raw_leaves = row.working;
+                    const oms::Quantity canceled = quantity(msg.GetCanceledQty());
+                    if (!strategy_runtime::normalize_atp_snapshot_order(&row, canceled))
+                        throw std::runtime_error("invalid ATP snapshot quantities for " + row.broker_id);
+                    order_report_log::write(order_report_log::Json{
+                        {"event", "atp_snapshot_order"}, {"broker_id", row.broker_id},
+                        {"instrument", row.instrument.code}, {"side", int(row.side)},
+                        {"price", row.price}, {"original", row.original},
+                        {"filled", row.filled}, {"working", row.working},
+                        {"raw_leaves", raw_leaves}, {"canceled", canceled},
+                        {"state", int(row.state)}, {"raw_status", int(msg.GetOrdStatus())},
+                        {"orig_cl_ord_no", msg.GetOrigClOrdNo()}, {"batch_cl_ord_no", msg.GetBatchClOrdNo()}});
                     const auto engine = stream_oms_.lock(); oms::OrderView owned;
                     if (engine && msg.GetBatchClOrdNo() && engine->order(msg.GetBatchClOrdNo(), &owned) && owned.owned &&
                         owned.command.intent.instrument == row.instrument && owned.command.intent.side == row.side &&
@@ -251,8 +266,10 @@ bool TDEngineGXBSE::collect_oms_orders(const ATPRspCashOrderQueryResultMsg& msg,
                         route.direction = msg.GetSide() == ATPSideConst::kBuy ? LF_CHAR_Buy : LF_CHAR_Sell;
                         route.offset_flag = row.side == oms::Side::Buy ? LF_CHAR_Open : LF_CHAR_Close;
                         std::lock_guard<std::mutex> routes(route_mutex_);
-                        route.oms_backend = oms_backends_[0]; oms_routes_[std::make_pair(0, route.order_ref)] = route;
-                        clord_to_route_[msg.GetClOrdNo()] = route; order_ref_to_clord_[route.order_ref] = msg.GetClOrdNo();
+                        route.oms_backend = oms_backends_[0];
+                        clord_to_route_[msg.GetClOrdNo()] = route;
+                        oms_routes_[std::make_pair(0, route.order_ref)] = &clord_to_route_.at(msg.GetClOrdNo());
+                        order_ref_to_clord_[route.order_ref] = msg.GetClOrdNo();
                     }
                     if (!oms_collector_.add_order(stream_scope_, found->second.token, row))
                         throw std::runtime_error(oms_collector_.error());
@@ -316,7 +333,9 @@ public:
                 if (!CPU_ISSET(cpu, &affinity)) continue;
                 if (cpu >= 255) throw std::runtime_error("stream TD CPU exceeds ATP's supported CPU range");
                 account["receive_thread_cpu"] = cpu;
-                account["send_thread_cpu"] = cpu;
+                // Sending is synchronous on the OMS owner. 0xFF means do not
+                // rebind the calling thread to the callback CPU on first send.
+                account["send_thread_cpu"] = 255;
             }
         }
         engine_.init_stream(account, scope, universe, allow_orders);
@@ -330,7 +349,13 @@ public:
         if (!engine_.is_logged_in()) { if (error) *error = "ATP login failed or timed out"; return false; }
         backend_->connected(); return true;
     }
-    void stop() override { if (backend_) backend_->close(); engine_.release_api(); }
+    void stop() override {
+        if (backend_) backend_->close();
+        engine_.release_api();
+        // No callback may retain a deferred diagnostic builder across dlclose.
+        order_report_log::sink().drain();
+        order_latency::sink().drain();
+    }
     std::string status() const override { return engine_.stream_status(); }
 private:
     TDEngineGXBSE engine_;

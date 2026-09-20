@@ -4,6 +4,10 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <sstream>
+#include <atomic>
+#include <cstdlib>
+#include <algorithm>
 
 namespace sse_stream {
 namespace {
@@ -74,7 +78,8 @@ SseStreamProcessor::SseStreamProcessor(
     const Auction59Provider& auction59_provider,
     const sse_auction59::StaticMetadataMap& auction_metadata,
     bool auction_enabled)
-    : states_(), channel_sequences_(), batch_sampler_(instrument_ids(metadata)),
+    : delegated_sequence_(false), route_tick_(), route_raw_tick_(), route_snapshot_(), route_close_(),
+      states_(), channel_sequences_(), batch_sampler_(instrument_ids(metadata)),
       closed_batches_(),
       hardware_batch_mode_(false), next_hardware_batch_id_(1ULL),
       hardware_batches_(), model_(model), factors_only_(factors_only),
@@ -173,20 +178,48 @@ Provenance SseStreamProcessor::provenance(
     return value;
 }
 
-bool SseStreamProcessor::valid_tick_sequence(const sse_live::TickEvent& tick) {
-    if (tick.channel_no == 0U || tick.tick_index == 0ULL) return false;
-    ChannelSequence& sequence = channel_sequences_[tick.channel_no];
+bool SseStreamProcessor::valid_tick_sequence(const sse_live::TickEvent& tick,
+    const deepwin_market_data::StreamEvent& event, std::size_t record_offset) {
+    return valid_tick_sequence(tick.channel_no,tick.tick_index,tick.provider_sequence,event,record_offset);
+}
+
+bool SseStreamProcessor::valid_tick_sequence(std::uint32_t channel,
+    std::uint64_t wire, std::uint64_t provider,
+    const deepwin_market_data::StreamEvent& event, std::size_t record_offset) {
+    if (channel == 0U || wire == 0ULL) return false;
+    ChannelSequence& sequence = channel_sequences_[channel];
+    const auto evidence = [&](std::uint64_t wire, std::uint64_t provider,
+        const deepwin_market_data::StreamEvent& source, std::size_t offset) {
+        std::ostringstream out;
+        out << "channel=" << channel << " wire_sequence=" << wire
+            << " provider_sequence=" << provider
+            << " stream_sequence=" << source.sequence << " record_offset=" << offset
+            << " hardware_ns=" << source.hardware_ns << " kernel_ns=" << source.realtime_ns
+            << " application_mono_ns=" << source.monotonic_ns;
+        return out.str();
+    };
     if (!sequence.have_tick) {
         sequence.have_tick = true;
-        sequence.last_tick = tick.tick_index;
+        sequence.last_tick = wire;
+        sequence.last_provider = provider;
+        sequence.last_event = event;
+        sequence.last_offset = record_offset;
         return true;
     }
-    if (tick.tick_index <= sequence.last_tick) return false;  // duplicate/replay
-    if (tick.tick_index - sequence.last_tick != 1ULL) {
+    if (wire <= sequence.last_tick) return false;  // duplicate/replay
+    if (wire - sequence.last_tick != 1ULL) {
         batch_sampler_.mark_sequence_gap();
-        fail("SSE tick sequence gap on wire channel");
+        fail("SSE tick sequence gap on wire channel before={" +
+             evidence(sequence.last_tick, sequence.last_provider, sequence.last_event, sequence.last_offset) +
+             "} after={" + evidence(wire, provider, event, record_offset) + "}");
     }
-    sequence.last_tick = tick.tick_index;
+    sequence.last_tick = wire;
+    sequence.last_provider = provider;
+    sequence.last_event.sequence=event.sequence;
+    sequence.last_event.hardware_ns=event.hardware_ns;
+    sequence.last_event.realtime_ns=event.realtime_ns;
+    sequence.last_event.monotonic_ns=event.monotonic_ns;
+    sequence.last_offset = record_offset;
     return true;
 }
 
@@ -241,18 +274,30 @@ void SseStreamProcessor::on_idle(const deepwin_market_data::StreamEvent& event) 
 
 void SseStreamProcessor::advance_hardware_batch(
     const deepwin_market_data::StreamEvent& event) {
+    const bool missing_phc = (event.timestamp_flags & deepwin_market_data::kHardwareTimestampRequested) && !event.hardware_ns;
     const std::uint64_t timestamp = event.hardware_ns != 0ULL
         ? event.hardware_ns : event.monotonic_ns;
     HardwareBatchState& state = hardware_batches_[event.channel_id];
-    if (state.have_hardware_timestamp && timestamp < state.last_hardware_ns)
-        fail("SSE hardware receive timestamp moved backwards");
+    const bool clock_valid = !missing_phc &&
+        (!state.have_hardware_timestamp || timestamp >= state.last_hardware_ns);
+    // Missing/backwards PHC values cannot be compared to a monotonic-clock
+    // fallback. Preserve this event and do not slice on that timestamp.
+    if (!clock_valid) {
+        static std::atomic<unsigned long> anomalies(0);
+        const unsigned long count = ++anomalies;
+        if (count <= 8 || count % 10000 == 0)
+            std::cerr << "SSE hardware timestamp ignored for slicing channel=" << event.channel_id
+                      << " event=" << event.sequence << " missing=" << missing_phc
+                      << " previous=" << state.last_hardware_ns << " current=" << event.hardware_ns
+                      << " count=" << count << '\n';
+    }
     if (!state.open) {
         state.open = true;
         state.batch_id = next_hardware_batch_id_++;
         state.packet_count = 0U;
         state.candidates.clear();
     } else {
-        if (timestamp - state.last_hardware_ns >= kHardwareBatchGapNanoseconds) {
+        if (clock_valid && state.have_hardware_timestamp && timestamp - state.last_hardware_ns >= kHardwareBatchGapNanoseconds) {
             close_hardware_batch(event.channel_id, event.monotonic_ns,
                                  sse_live_sampling::kBatchClosedByNextEvent);
             state.open = true;
@@ -261,8 +306,10 @@ void SseStreamProcessor::advance_hardware_batch(
             state.candidates.clear();
         }
     }
-    state.last_hardware_ns = timestamp;
-    state.have_hardware_timestamp = true;
+    if (clock_valid) {
+        state.last_hardware_ns = timestamp;
+        state.have_hardware_timestamp = true;
+    }
     state.last_hardware_monotonic_ns = event.monotonic_ns;
     ++state.packet_count;
 }
@@ -285,7 +332,8 @@ void SseStreamProcessor::close_hardware_batch(
     state.open = false;
     state.packet_count = 0U;
     state.candidates.clear();
-    process_closed_batch(batch);
+    if (route_close_) route_close_(channel_id, batch);
+    else process_closed_batch(batch);
 }
 
 void SseStreamProcessor::commit_hardware_candidate(
@@ -302,27 +350,44 @@ void SseStreamProcessor::on_datagram(
     if (event.data == 0 || event.size == 0U)
         fail("SSE datagram is empty or has no borrowed payload");
     if (sse_live::is_primary_heartbeat(event.data, event.size)) return;
+    const std::uint64_t routed_batch=route_raw_tick_?hardware_batches_.at(event.channel_id).batch_id:0;
+    // This fast path groups only records already present in one datagram.
+    // Mixed/snapshot datagrams retain the original record-by-record path.
+    if (route_packet_ && event.size%72U==0) {
+        bool ticks=true;
+        for(std::size_t off=0;off<event.size;off+=72U)
+            if(event.data[off+8]!=0x3eU){ticks=false;break;}
+        if(ticks){route_packet_(event,routed_batch);return;}
+    }
     std::size_t offset = 0U;
     while (offset < event.size) {
         const std::size_t remaining = event.size - offset;
+        if (route_raw_tick_ && remaining>=72U && event.data[offset+8]==0x3eU) {
+            sse_live::RawTickEvent raw;
+            if(!sse_live::decode_primary_raw_tick(event.data+offset,72U,&raw,0,false))fail("invalid SSE raw tick");
+            if(!raw.channel_no || !raw.tick_index)fail("SSE tick has invalid wire channel or sequence");
+            if(valid_tick_sequence(raw.channel_no,raw.tick_index,raw.provider_sequence,event,offset))
+                route_raw_tick_(raw,event,offset,routed_batch);
+            offset+=72U;continue;
+        }
+        if(route_raw_snapshot_ && remaining>=440U && event.data[offset+8]==0x27U){
+            route_raw_snapshot_(event.data+offset,event,offset);offset+=440U;continue;
+        }
         sse_live::TickEvent tick;
-        std::string tick_error;
         if (remaining >= 72U && sse_live::decode_primary_tick(
-                event.data + offset, 72U, &tick, &tick_error, false)) {
+                event.data + offset, 72U, &tick, 0, false)) {
             process_tick(tick, event, offset);
             offset += 72U;
             continue;
         }
         sse_live::Snapshot snapshot;
-        std::string snapshot_error;
         if (remaining >= 440U && sse_live::decode_primary_snapshot(
-                event.data + offset, 440U, &snapshot, &snapshot_error, false)) {
+                event.data + offset, 440U, &snapshot, 0, false)) {
             process_snapshot(snapshot, event, offset);
             offset += 440U;
             continue;
         }
-        fail(error_text("unknown or truncated SSE wire record",
-                        tick_error.empty() ? snapshot_error : tick_error));
+        fail("unknown or truncated SSE wire record");
     }
 }
 
@@ -332,7 +397,8 @@ void SseStreamProcessor::process_tick(
     std::size_t record_offset) {
     if (tick.channel_no == 0U || tick.tick_index == 0ULL)
         fail("SSE tick has invalid wire channel or sequence");
-    if (!valid_tick_sequence(tick)) return;
+    if (!delegated_sequence_ && !valid_tick_sequence(tick, event, record_offset)) return;
+    if (route_tick_) { route_tick_(tick, event, record_offset); return; }
     InstrumentState* state = state_for(tick.security_id);
     if (state == 0) return;
     // Every accepted event reaches the auction accumulator, independently of
@@ -351,6 +417,10 @@ void SseStreamProcessor::process_tick(
     const sse_tick::ApplyResult applied = state->book.apply(tick);
     if (!applied.accepted && tick.event_type != sse_tick::kStatus)
         fail(std::string("SSE order-book rejected ") + applied.reason);
+    if (model_ && model_->is_v06() && state->sample_gate.initialized() &&
+        state->sample_gate.window_start().exchange_time_of_day_micros < 41400000000ULL &&
+        tick.time_of_day_micros >= 46800000000ULL)
+        state->sample_gate.reset();  // New factor window; keep per-stock GRU hidden state.
     if (applied.accepted && applied.book_changed) initialize_window(*state, tick);
     sse_live_sampling::Candidate candidate;
     const sse_live_sampling::Candidate* candidate_ptr = 0;
@@ -377,6 +447,12 @@ sse_live_sampling::TickCut SseStreamProcessor::book_cut(
     const InstrumentState& state, const sse_live::TickEvent& tick) const {
     sse_tick::Level bids[1] = {}, asks[1] = {};
     state.book.snapshot(bids, asks, 1);
+    return book_cut(state,tick,bids,asks);
+}
+
+sse_live_sampling::TickCut SseStreamProcessor::book_cut(
+    const InstrumentState& state, const sse_live::TickEvent& tick,
+    const sse_tick::Level* bids, const sse_tick::Level* asks) const {
     sse_live_sampling::TickCut cut;
     cut.cut_index = tick.tick_index;
     cut.exchange_time_of_day_micros = tick.time_of_day_micros;
@@ -397,6 +473,11 @@ void SseStreamProcessor::initialize_window(InstrumentState& state, const sse_liv
     if (!state.sample_gate.observe_batch_end(cut, state.factors.turnover_threshold(), &decision, &error))
         fail(error_text("SSE opening window failed", error));
     if (!state.sample_gate.initialized()) return;
+    if (model_ && model_->is_v06()) {
+        state.factors.set_v06(true);
+        state.factors.build(state.book,cut.exchange_time_of_day_micros);
+        return;
+    }
     state.factors.seed_window(cut.mid_price, cut.exchange_time_of_day_micros,
                               static_cast<double>(state.book.total_trade_qty()), cut.cumulative_turnover);
     state.book.take_flow_window();
@@ -413,7 +494,8 @@ void SseStreamProcessor::process_closed_batch(
         if (!state->book.snapshot(bids, asks, 10U)) fail("SSE order-book snapshot failed");
         if (!state->have_pending_tick || state->pending_tick.tick_index != it->cut_index)
             fail("SSE candidate/book provenance mismatch");
-        const sse_live_sampling::TickCut cut = book_cut(*state, state->pending_tick);
+        const sse_live_sampling::TickCut cut = book_cut(*state, state->pending_tick,
+                                                        &bids[0], &asks[0]);
         sse_live_sampling::SampleDecision decision;
         std::string error;
         if (!state->sample_gate.observe_batch_end(
@@ -422,14 +504,17 @@ void SseStreamProcessor::process_closed_batch(
         if (!state->sample_gate.initialized()) continue;
         if (!decision.accepted) continue;
 
+        state->factors.set_v06(model_ && model_->is_v06());
         const sse_tick::FactorRow row = state->factors.build(
-            state->book, cut.exchange_time_of_day_micros);
+            state->book, cut.exchange_time_of_day_micros, bids, asks);
         Output output;
         output.kind = kTickOutput;
         if (!state->have_pending_tick)
             fail("SSE batch candidate provenance is missing");
         output.tick.event = state->pending_tick;
         output.tick.factors = row;
+        if (model_ && model_->is_v06())
+            output.tick.factors.values = sse_v06::from_legacy_factors(row.values);
         output.tick.sample_decision = decision;
         output.tick.bid_levels.assign(bids, bids + 10U);
         output.tick.ask_levels.assign(asks, asks + 10U);
@@ -443,8 +528,9 @@ void SseStreamProcessor::process_closed_batch(
         output.tick.provenance.batch_close_reason = batch.reason;
         if (!factors_only_) {
             std::string model_error;
-            output.tick.prediction_valid = model_->on_tick(
-                row.values, "sse", cut.exchange_time_of_day_micros,
+            if(defer_model_){output.tick.prediction_valid=true;output.tick.prediction.selected=row.validity.complete&&state->auction->shared_static_valid();}
+            else output.tick.prediction_valid = model_->on_tick(
+                output.tick.factors.values, "sse", cut.exchange_time_of_day_micros,
                 &state->model_state, &output.tick.prediction, &model_error);
             if (!output.tick.prediction_valid)
                 fail(error_text("SSE tick model rejected factors", model_error));
@@ -455,7 +541,7 @@ void SseStreamProcessor::process_closed_batch(
             }
             if (output.tick.prediction_valid) ++prediction_count;
         }
-        callback_(output);
+        callback_(std::move(output));
     }
     if (hardware_batch_mode_) {
         Output marker;
@@ -466,7 +552,7 @@ void SseStreamProcessor::process_closed_batch(
         marker.batch_end.packet_count = batch.packet_count;
         marker.batch_end.candidate_count = static_cast<std::uint32_t>(batch.candidates.size());
         marker.batch_end.prediction_count = prediction_count;
-        callback_(marker);
+        callback_(std::move(marker));
     }
 }
 
@@ -530,12 +616,21 @@ void SseStreamProcessor::process_snapshot(
     std::size_t record_offset) {
     if (snapshot.sequence == 0ULL)
         fail("SSE snapshot has invalid wire sequence");
+    if (route_snapshot_) { route_snapshot_(snapshot, event, record_offset); return; }
     InstrumentState* state = state_for(snapshot.security_id);
     if (state == 0) return;
     // Opening snapshots may be one-sided. Static/opening reconciliation does
     // not require Snapshot36's two-sided quote, and must precede its filters.
     state->auction->on_snapshot(snapshot);
     report_auction_state(snapshot.security_id, *state);
+    if (model_ && model_->is_v06()) {
+        Output reference;
+        reference.kind = kSnapshotOutput;
+        reference.snapshot.snapshot = snapshot;
+        reference.snapshot.provenance = provenance(event,event.channel_id,snapshot.sequence,record_offset);
+        callback_(std::move(reference));
+        return;
+    }
     if (!factors_only_ && snapshot.time_of_day_micros >= kSnapshotGenerateStartMicros)
         select_snapshot_mode(snapshot.security_id, *state);
     // A stock that has already fallen back does not run Snapshot36. Keep
@@ -588,7 +683,7 @@ void SseStreamProcessor::process_snapshot(
         if (!output.snapshot.prediction_valid)
             fail(error_text("SSE Snapshot model rejected factors", model_error));
     }
-    callback_(output);
+    callback_(std::move(output));
 }
 
 }  // namespace sse_stream

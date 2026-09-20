@@ -4,6 +4,8 @@
 #include <chrono>
 #include <limits>
 #include <stdexcept>
+#include <cstdlib>
+#include <sched.h>
 
 namespace oms {
 AsyncJournal::AsyncJournal(const std::string& path, std::size_t capacity, const Sink& sink)
@@ -87,6 +89,12 @@ void AsyncJournal::run() {
     typedef std::chrono::steady_clock Clock;
     Clock::time_point last_sync = Clock::now();
     try {
+        const char* cpu_text=std::getenv("SSE_OMS_JOURNAL_CPU");
+        if(cpu_text && *cpu_text) {
+            char* end=0;long cpu=std::strtol(cpu_text,&end,10);cpu_set_t set;CPU_ZERO(&set);
+            if(*end || cpu<0 || cpu>=CPU_SETSIZE)throw std::runtime_error("invalid OMS journal CPU");
+            CPU_SET(cpu,&set);if(sched_setaffinity(0,sizeof(set),&set))throw std::runtime_error("OMS journal affinity failed");
+        }
         while (healthy()) {
             const std::uint64_t tail = tail_.load(std::memory_order_relaxed);
             if (tail != head_.load(std::memory_order_acquire)) {

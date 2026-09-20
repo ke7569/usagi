@@ -16,6 +16,17 @@ static const std::uint32_t kPayloadMagic = 0x31534853U;
 static const std::uint16_t kPayloadVersion = 1;
 static const std::uint16_t kPayloadVersionV2 = 2;
 static const std::size_t kMaxDatagram = 8192;
+// The capture idle marker is separate from the 5us PHC batch boundary used
+// by the stream processor. Keep the historical 100us value readable so old
+// recordings can still be replayed while new captures use 5us by default.
+static const std::uint64_t kDefaultIdleGapNanoseconds = 5000ULL;
+static const std::uint64_t kHistoricalIdleGapNanoseconds = 100000ULL;
+
+inline bool is_supported_idle_gap_ns(std::uint64_t value) {
+    return value == kDefaultIdleGapNanoseconds ||
+           value == kHistoricalIdleGapNanoseconds;
+}
+
 struct PayloadHeader {
     std::uint32_t magic;
     std::uint16_t version, kind;
@@ -71,12 +82,12 @@ inline std::size_t stored_header_bytes(const Config& config) {
     return config.extended_timestamps ? sizeof(PayloadHeaderV2) : sizeof(PayloadHeader);
 }
 
-inline Config load(const std::string& path) {
+inline Config load(const std::string& path, bool allow_historical_boot = false) {
     const nlohmann::json value = load_stream_json(path);
     stream_input::fields(value, {"schema_version", "payload_format", "trading_day", "source_id",
         "generation", "boot_id", "journal_directory", "journal_prefix", "shm_path",
         "segment_bytes", "min_free_bytes_after_allocate", "ring_capacity", "journal_queue_capacity",
-        "queue_capacity", "max_datagram_bytes", "receive_batch_size", "receive_buffer_bytes",
+        "queue_capacity", "max_datagram_bytes", "receive_batch_size", "receive_busy_poll", "dispatch_busy_poll", "receive_buffer_bytes",
         "idle_gap_ns", "receive_cpu", "dispatch_cpu", "journal_cpu", "prediction_cpu",
         "flush_interval_ms", "duration_ms", "hardware_timestamp_interface", "channels"});
     if (value.at("schema_version") != 1)
@@ -99,7 +110,7 @@ inline Config load(const std::string& path) {
     config.journal.generation = stream_input::uint_value(value.at("generation"));
     if (!config.journal.generation) throw std::runtime_error("explicit journal generation required");
     config.boot = value.at("boot_id").get<std::string>();
-    if (config.boot != boot_id()) throw std::runtime_error("journal belongs to another host boot");
+    if (!allow_historical_boot && config.boot != boot_id()) throw std::runtime_error("journal belongs to another host boot");
     config.journal.directory = value.at("journal_directory").get<std::string>();
     config.journal.prefix = value.value("journal_prefix", std::string("sse"));
     if (config.journal.directory.empty() || config.journal.directory[0] != '/' ||
@@ -127,9 +138,17 @@ inline Config load(const std::string& path) {
     stream_input::optional_uint(value, "duration_ms", &config.duration_ms);
     stream_input::cpu(value, "journal_cpu", &config.journal_cpu);
     stream_input::cpu(value, "prediction_cpu", &config.prediction_cpu);
+    if(value.count("receive_busy_poll")) {
+        if(!value.at("receive_busy_poll").is_boolean())throw std::runtime_error("receive_busy_poll must be boolean");
+        config.stream.receive_busy_poll=value.at("receive_busy_poll").get<bool>();
+    }
+    if(value.count("dispatch_busy_poll")) {
+        if(!value.at("dispatch_busy_poll").is_boolean())throw std::runtime_error("dispatch_busy_poll must be boolean");
+        config.stream.dispatch_busy_poll=value.at("dispatch_busy_poll").get<bool>();
+    }
     config.stream.recording_directory.clear();
     config.stream.recording_required = false;
-    config.stream.idle_gap_ns = 100000;
+    config.stream.idle_gap_ns = kDefaultIdleGapNanoseconds;
     config.stream.queue_capacity = 32768;
     config.stream.max_datagram_bytes = kMaxDatagram;
     config.stream.receive_buffer_bytes = 67108864;
@@ -140,7 +159,8 @@ inline Config load(const std::string& path) {
     stream_input::optional_uint(value, "idle_gap_ns", &config.stream.idle_gap_ns);
     stream_input::cpu(value, "receive_cpu", &config.stream.receive_cpu);
     stream_input::cpu(value, "dispatch_cpu", &config.stream.dispatch_cpu);
-    if (config.stream.idle_gap_ns != 100000 || config.stream.max_datagram_bytes > kMaxDatagram ||
+    if (!is_supported_idle_gap_ns(config.stream.idle_gap_ns) ||
+        config.stream.max_datagram_bytes > kMaxDatagram ||
         !config.stream.max_datagram_bytes || !config.ring.capacity || !config.journal_queue_capacity ||
         !config.flush_interval_ms)
         throw std::runtime_error("invalid SSE journal capacities/timing");

@@ -1,4 +1,7 @@
 #include "common/oms/Oms.h"
+#include "common/oms/OrderLatencyLog.h"
+#include "common/oms/OrderReportLog.h"
+#include "common/oms/SseStockRules.h"
 #include "common/oms/Journal.h"
 #include "common/oms/AsyncJournal.h"
 #include "common/oms/Records.h"
@@ -140,6 +143,7 @@ struct Engine::Impl {
     };
     struct Order {
         OrderView view;
+        order_latency::SendStages send_stages;
         Quantity order_cumulative = 0, trade_quantity = 0, settled_filled = 0;
         Quantity new_priced_quantity = 0;
         Money new_amount = 0, new_fees = 0, fee_cap = 0, cash_effect = 0;
@@ -171,7 +175,7 @@ struct Engine::Impl {
     std::deque<Time> send_rate, cancel_rate, total_rate;
     std::deque<AuditEvent> audit;
     Time now = 0, new_not_before = 0;
-    OrderId next_id = 1, next_external = (1ULL << 63);
+    OrderId next_id = 1, next_external = (1ULL << 63), reserved_id_end = 0;
     Money cash = 0, reserved = 0;
     std::size_t pending = 0, trade_ids = 0;
     std::uint64_t activity = 0, snapshot_activity = 0, token = 0, last_token = 0;
@@ -374,6 +378,7 @@ struct Engine::Impl {
 };
 
 Engine::Engine(const Config& config, const std::shared_ptr<Backend>& backend) {
+    order_latency::sink(); // Open the configured log before any order can be sent.
     if (!backend || !text_ok(config.scope.account.broker) || !text_ok(config.scope.account.account) ||
         !text_ok(config.scope.gateway) || !text_ok(config.instance) || config.scope.source <= 0 ||
         config.scope.epoch != 0 || config.instruments.empty())
@@ -414,6 +419,15 @@ Engine::Engine(const Config& config, const std::shared_ptr<Backend>& backend) {
     if (!replay_ok) s.freeze("OMS journal replay failed: " + s.journal.error());
     if (!s.journal.sequence()) s.save("header", Json{{"scope", encode(config.scope)}, {"instance", config.instance},
         {"fills", static_cast<int>(s.caps.fills)}, {"fee_reserve", config.limits.fee_reserve_per_order}}, true);
+    if (!config.durable_order_intents && s.journal.persistent()) {
+        const OrderId limit=static_cast<OrderId>(std::numeric_limits<int>::max());
+        const OrderId count=static_cast<OrderId>(config.limits.max_orders);
+        if(!count || s.next_id>=limit || count>limit-s.next_id)
+            throw std::runtime_error("OMS startup order ID reservation exhausted");
+        s.reserved_id_end=s.next_id+count;
+        if(!s.save("id-reservation",Json{{"end",s.reserved_id_end}},true))
+            throw std::runtime_error("OMS startup order ID reservation failed");
+    }
     s.recovered = !s.orders.empty();
     s.connected = s.reconciled = s.reconciling = false;
     s.actions.clear(); s.timers.clear(); s.orphans.clear(); s.broker_ids.clear();
@@ -429,6 +443,8 @@ Engine::Engine(const Config& config, const std::shared_ptr<Backend>& backend) {
 
 std::shared_ptr<Engine> Engine::create(const Config& config, const std::shared_ptr<Backend>& backend) {
     std::shared_ptr<Engine> result(new Engine(config, backend));
+    // Prime optional diagnostic sinks before callbacks or the first live order.
+    order_report_log::sink();order_latency::sink();
     std::weak_ptr<Engine> weak(result);
     backend->bind([weak](const Report& report) { if (auto engine = weak.lock()) engine->report(report); },
                   [weak](const Snapshot& snapshot) { if (auto engine = weak.lock()) engine->complete_snapshot(snapshot); },
@@ -495,15 +511,18 @@ bool Engine::begin_reconcile(std::uint64_t token, bool request_backend) {
 }
 
 SubmitResult Engine::submit(const Intent& intent, const std::function<bool()>& gate) {
+    order_latency::SendStages send_stages;send_stages.enter=order_latency::now_ns();
     OMS_PROFILE_SCOPE(profile_submit, Submit);
     SubmitResult result;
     // The external gate is never invoked with the account mutex held.
     OMS_PROFILE_SCOPE(profile_gate, Gate);
     const bool permitted = gate_allows(gate);
+    send_stages.gate_done=order_latency::now_ns();
     OMS_PROFILE_STOP(profile_gate);
     {
         OMS_PROFILE_SCOPE(profile_lock, AccountLock);
         std::lock_guard<std::mutex> guard(impl_->mutex);
+        send_stages.lock_acquired=order_latency::now_ns();
         OMS_PROFILE_STOP(profile_lock);
         OMS_PROFILE_SCOPE(profile_risk, Risk);
         Impl& s = *impl_;
@@ -535,7 +554,10 @@ SubmitResult Engine::submit(const Intent& intent, const std::function<bool()>& g
             const bool odd_sale = intent.side == Side::Sell && r.allow_odd_lot_liquidation &&
                 intent.quantity == position.sellable - position.working_sell;
             if (intent.price < r.lower_price || intent.price > r.upper_price || intent.price % r.tick ||
-                (intent.quantity % r.lot && !odd_sale) || intent.quantity > r.max_order_quantity || notional > r.max_order_notional) {
+                (is_sse_star(intent.instrument)
+                    ? !star_quantity_valid(intent.side, intent.quantity, position, intent.type)
+                    : (intent.quantity % r.lot && !odd_sale)) ||
+                intent.quantity > r.max_order_quantity || notional > r.max_order_notional) {
                 reject(ErrorCategory::Limit, "price, lot, quantity or notional rule violated"); return result;
             }
             if (intent.side == Side::Buy && sum(sum(position.total, position.working_buy), intent.quantity) > r.max_position) {
@@ -551,7 +573,8 @@ SubmitResult Engine::submit(const Intent& intent, const std::function<bool()>& g
                 reject(ErrorCategory::SelfTrade, "price crosses own or external account order"); return result;
             }
             if (s.orders.size() >= s.config.limits.max_orders || s.pending >= s.config.limits.max_pending ||
-                s.actions.size() >= s.config.limits.max_actions || s.next_id >= static_cast<OrderId>(std::numeric_limits<int>::max())) {
+                s.actions.size() >= s.config.limits.max_actions || s.next_id >= static_cast<OrderId>(std::numeric_limits<int>::max()) ||
+                (s.reserved_id_end && s.next_id>=s.reserved_id_end)) {
                 reject(ErrorCategory::Capacity, "OMS order or action capacity reached"); return result;
             }
             if (!s.rate_available(false)) { reject(ErrorCategory::RateLimited, "account order rate reached"); return result; }
@@ -564,16 +587,21 @@ SubmitResult Engine::submit(const Intent& intent, const std::function<bool()>& g
             order.view.working = intent.quantity; order.fee_cap = s.config.limits.fee_reserve_per_order; order.gate = gate;
             OMS_PROFILE_STOP(profile_construct);
             OMS_PROFILE_SCOPE(profile_intent, IntentAudit);
-            if (!s.save_bytes(s.journal.recording() ? records::intent(s.now, order.view.command) : std::string(), true)) {
-                reject(ErrorCategory::Persistence, "pre-send durable registration failed"); return result;
+            send_stages.intent_begin=order_latency::now_ns();
+            send_stages.intent_durable_wait=s.config.durable_order_intents;
+            if (!s.save_bytes(s.journal.recording() ? records::intent(s.now, order.view.command) : std::string(), s.config.durable_order_intents)) {
+                reject(ErrorCategory::Persistence, "pre-send journal registration failed"); return result;
             }
             OMS_PROFILE_STOP(profile_intent);
+            send_stages.intent_durable=order_latency::now_ns();
             OrderView empty; s.apply_delta(order, empty, 0);
             OMS_PROFILE_SCOPE(profile_registration, Registration);
             result.id = s.next_id++; result.accepted = true;
-            s.orders.emplace(result.id, order); s.intents[std::make_pair(intent.owner, intent.intent_id)] = result.id;
+            s.orders.emplace(result.id, std::move(order)); s.intents[std::make_pair(intent.owner, intent.intent_id)] = result.id;
             s.actions.push_back(Impl::Action{Impl::Action::Submit, result.id, 0});
             s.take_rate(false); ++s.admissions; ++s.activity; s.note("registered", result.id, intent.signal_id);
+            send_stages.registered=order_latency::now_ns();
+            s.orders.at(result.id).send_stages=send_stages;
         } catch (const std::exception& e) { s.freeze(e.what()); reject(ErrorCategory::Invalid, e.what()); return result; }
     }
     drain();
@@ -691,13 +719,21 @@ bool Engine::order(OrderId id, OrderView* output) const {
 // the SSE session to suppress a new signal while one order is in flight.
 bool Engine::has_working_order(const Instrument& instrument) const {
     std::lock_guard<std::mutex> guard(impl_->mutex);
-    for (auto it = impl_->orders.begin(); it != impl_->orders.end(); ++it) {
-        const Impl::Order& order = it->second;
-        if (order.view.command.intent.instrument == instrument && order.view.working > 0 &&
-            !terminal(order.view.state))
-            return true;
-    }
-    return false;
+    // apply_delta and snapshot reconciliation already maintain exact working
+    // quantities, including external orders. Terminal orders contribute zero.
+    const auto found = impl_->positions.find(instrument);
+    return found != impl_->positions.end() &&
+        (found->second.working_buy > 0 || found->second.working_sell > 0);
+}
+
+bool Engine::ready() const {
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+    return impl_->ready();
+}
+
+Time Engine::now_ns() const {
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+    return impl_->now;
 }
 
 AccountView Engine::account() const {
@@ -867,21 +903,40 @@ void Engine::Impl::resolve_orphans() {
 
 bool Engine::report(const Report& report) {
     bool result = false;
+    const std::uint64_t entry_ns = order_report_log::monotonic_ns();
+    order_report_log::oms_received(report, 0, entry_ns);
+    const char* outcome = "unknown"; std::string detail;
+    Time report_time=0;std::uint64_t done_ns=0;
     {
         std::lock_guard<std::mutex> guard(impl_->mutex);
         Impl& s = *impl_;
-        if (!(report.scope == s.config.scope)) { ++s.stale; s.note("stale-report", report.id); return false; }
-        ++s.activity;
-        try {
-            if (report.broker_id.size() > 128 || report.trade_id.size() > 128 ||
-                !instrument_ok(report.instrument)) {
-                s.freeze("report metadata outside normalized contract", report.id); return false;
+        const bool scope_ok = report.scope == s.config.scope;
+        if (!scope_ok) {
+            ++s.stale; s.note("stale-report", report.id);
+            outcome = "stale-scope"; detail = "scope mismatch";
+        } else {
+            ++s.activity;
+            try {
+                if (report.broker_id.size() > 128 || report.trade_id.size() > 128 ||
+                    !instrument_ok(report.instrument)) {
+                    s.freeze("report metadata outside normalized contract", report.id);
+                    outcome = "invalid-metadata"; detail = s.fault;
+                } else {
+                    s.save_bytes(s.journal.recording() ? records::report(s.now, report) : std::string());
+                    result = s.apply_report(report, true);
+                    outcome = result ? "applied" : "unmatched-or-quarantined";
+                    if (!result) detail = s.orphans.empty() ? s.fault : "orphan report queued";
+                }
+            } catch (const std::exception& e) {
+                detail = e.what(); outcome = "exception"; s.freeze(detail, report.id);
             }
-            s.save_bytes(s.journal.recording() ? records::report(s.now, report) : std::string());
-            result = s.apply_report(report, true);
         }
-        catch (const std::exception& e) { s.freeze(e.what(), report.id); }
+        report_time=s.now;
+        done_ns=order_report_log::monotonic_ns();
     }
+    // Snapshot the result under the account lock; diagnostic construction,
+    // serialization and output must not keep other account users waiting.
+    order_report_log::oms_result(report, report_time, entry_ns, result, outcome, detail, done_ns);
     drain(); return result;
 }
 
@@ -894,6 +949,7 @@ void Engine::drain() {
     if (!dispatch.owns_lock()) return;
     for (;;) {
         Impl::Action action; Command command; Scope query_scope; std::function<bool()> gate;
+        order_latency::SendStages send_stages;
         {
             OMS_PROFILE_SCOPE(profile_lock, AccountLock);
             std::lock_guard<std::mutex> guard(s.mutex);
@@ -909,6 +965,7 @@ void Engine::drain() {
                 if (o.view.terminal) continue;
                 command = o.view.command; command.scope = s.config.scope; command.time_ns = s.now;
                 command.cancel = action.kind == Impl::Action::Cancel; gate = o.gate;
+                send_stages=o.send_stages;
             }
         }
         if (action.kind == Impl::Action::Query) {
@@ -938,7 +995,8 @@ void Engine::drain() {
                 if (send && !s.retime_new_rate(o)) {
                     send = false; preflight = error(ErrorCategory::RateLimited, "queued order exceeds current dispatch rate");
                 }
-                // The durable intent already means "possibly sent" after a crash.
+                // Recovered intents mean "possibly sent"; async mode reserves IDs at
+                // startup and reconciles the complete account before new orders.
                 OMS_PROFILE_SCOPE(profile_dispatch_audit, DispatchAudit);
                 if (send && !s.save_id(records::Kind::Dispatch, command.id)) send = false;
                 OMS_PROFILE_STOP(profile_dispatch_audit);
@@ -960,12 +1018,15 @@ void Engine::drain() {
             }
         }
         SendResult result;
+        const std::uint64_t td_begin_ns=order_latency::now_ns();
         if (!send) result.error = preflight;
         else {
             OMS_PROFILE_SCOPE(profile_backend, BackendCall);
             try { result = command.cancel ? s.backend->cancel(command) : s.backend->submit(command); }
             catch (...) { result.disposition = SendDisposition::Unknown; result.error = error(ErrorCategory::Unknown, "TD send threw; outcome unknown"); }
         }
+        const std::uint64_t td_return_ns=order_latency::now_ns();
+        order_latency::record(command,result,send,td_begin_ns,td_return_ns,send_stages);
         {
             OMS_PROFILE_SCOPE(profile_lock, AccountLock);
             std::lock_guard<std::mutex> guard(s.mutex);
@@ -1069,6 +1130,8 @@ bool Engine::Impl::install_snapshot(const Snapshot& snapshot, bool persisted) {
                 (!own->second.view.command.broker_id.empty() && own->second.view.command.broker_id != row.broker_id) ||
                 !seen_owned.insert(id).second) return reject("snapshot cannot prove historical order ownership");
         } else {
+            if(!config.durable_order_intents && row.working>0)
+                return reject("snapshot contains unowned working order; reconcile before trading");
             id = external_id++; Order external;
             external.view.owned = false; external.view.command.id = id;
             external.view.command.intent.owner = "external"; external.view.command.intent.intent_id = row.broker_id;
@@ -1145,6 +1208,10 @@ bool Engine::Impl::install_snapshot(const Snapshot& snapshot, bool persisted) {
         derive_money(o); new_reserved = sum(new_reserved, o.view.cash_reserved);
         new_trade_ids += o.trades.size();
         Position& p = new_positions[o.view.command.intent.instrument];
+        // Broker positions already contain fills; restore only the daily
+        // counters here, not total/sellable a second time.
+        if(o.view.command.intent.side==Side::Buy)p.bought=sum(p.bought,o.view.filled);
+        else p.sold=sum(p.sold,o.view.filled);
         if (o.view.command.intent.side == Side::Buy) p.working_buy = sum(p.working_buy, o.view.working);
         else p.working_sell = sum(p.working_sell, o.view.working);
         if (o.view.working) {
@@ -1214,7 +1281,11 @@ bool Engine::Impl::replay_record(const std::string& payload) {
         return have_header;
     }
     if (!have_header) return false;
-    if (type == "epoch") {
+    if (type == "id-reservation") {
+        const OrderId end=data.at("end").get<OrderId>();
+        if(!end || end>static_cast<OrderId>(std::numeric_limits<int>::max()) || end<=next_id)return false;
+        next_id=end;
+    } else if (type == "epoch") {
         config.scope.epoch = data.at("epoch").get<std::uint64_t>();
         token = last_token = 0;
         connected = data.at("connected").get<bool>(); broker_ids.clear();
@@ -1285,6 +1356,24 @@ bool Engine::Impl::replay_record(const std::string& payload) {
 std::vector<AuditEvent> Engine::audit_events() const {
     std::lock_guard<std::mutex> guard(impl_->mutex);
     return std::vector<AuditEvent>(impl_->audit.begin(), impl_->audit.end());
+}
+
+bool Engine::day_fills(const Instrument& instrument, Quantity* quantity, Money* net_amount) const {
+    if(!quantity || !net_amount)return false;
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+    const auto p=impl_->positions.find(instrument);if(p==impl_->positions.end())return false;
+    try {
+        Quantity bought=0,sold=0;Money amount=0;
+        for(const auto& item:impl_->orders) {
+            const OrderView& v=item.second.view;
+            if(!(v.command.intent.instrument==instrument) || !v.filled)continue;
+            if(v.priced_quantity!=v.filled || v.known_amount<0)return false;
+            if(v.command.intent.side==Side::Buy){bought=sum(bought,v.filled);amount=sum(amount,v.known_amount);}
+            else {sold=sum(sold,v.filled);amount=sum(amount,-v.known_amount);}
+        }
+        if(bought!=p->second.bought || sold!=p->second.sold)return false;
+        *quantity=sum(bought,sold);*net_amount=amount;return true;
+    }catch(...){return false;}
 }
 
 }  // namespace oms
