@@ -402,6 +402,8 @@ const char* BoolText(bool value) {
 }
 
 void StrategyBase::request_startup_risk_state() {
+    std::unique_lock<std::recursive_mutex> v06_lock;
+    if (mV06Account) v06_lock = std::unique_lock<std::recursive_mutex>(mV06Account->mutex);
     if (mRiskQueriesSubmitted) {
         return;
     }
@@ -429,10 +431,12 @@ void StrategyBase::request_startup_risk_state() {
 
     for (short src : mTdSources) {
         const int account_rid = req_account(src);
+        if (mV06Enabled) { mV06PositionSubmitting = true; mV06PositionSubmittingSource = src; }
         const int position_rid = req_position(src);
+        mV06PositionSubmitting = false;
         mPendingAccountRid[src] = account_rid;
         mPendingPositionRid[src] = position_rid;
-        mAccountReady[src] = account_rid < 0;
+        mAccountReady[src] = !mV06Enabled && account_rid < 0;
         mPositionReady[src] = !mSzeLiveRoutingEnabled && position_rid < 0;
         const auto early_account_it = mEarlyAccountRid.find(src);
         if (early_account_it != mEarlyAccountRid.end() && early_account_it->second == account_rid) {
@@ -463,6 +467,16 @@ void StrategyBase::request_startup_risk_state() {
 }
 
 void StrategyBase::schedule_startup_position_retry() {
+    std::unique_lock<std::recursive_mutex> v06_lock;
+    if (mV06Account) v06_lock = std::unique_lock<std::recursive_mutex>(mV06Account->mutex);
+    if (mV06Enabled) {
+        if (mSzePositionRetryScheduled || is_risk_data_ready() || !util) return;
+        mSzePositionRetryScheduled = true;
+        BLCallback callback = std::bind(&StrategyBase::retry_or_finalize_startup_positions, this);
+        util->insert_callback(util->get_nano() + static_cast<long long>(mSzePositionRetryIntervalMs) * 1000000LL,
+                              callback);
+        return;
+    }
     if (!mSzeLiveRoutingEnabled || mSzePositionRetryScheduled ||
         mSzePositionCutoffApplied ||
         mSzeLivePositionReady.size() == mInstrumentVec.size() ||
@@ -479,6 +493,9 @@ void StrategyBase::schedule_startup_position_retry() {
 }
 
 void StrategyBase::finalize_unresolved_startup_positions(const char* reason) {
+    std::unique_lock<std::recursive_mutex> v06_lock;
+    if (mV06Account) v06_lock = std::unique_lock<std::recursive_mutex>(mV06Account->mutex);
+    if (mV06Enabled && (!reason || std::string(reason) != "position_query_complete")) return;
     std::size_t defaulted = 0;
     std::ostringstream examples;
     for (std::unordered_map<std::string, ZStrategy*>::iterator it =
@@ -511,7 +528,33 @@ void StrategyBase::finalize_unresolved_startup_positions(const char* reason) {
 }
 
 void StrategyBase::retry_or_finalize_startup_positions() {
+    std::unique_lock<std::recursive_mutex> v06_lock;
+    if (mV06Account) v06_lock = std::unique_lock<std::recursive_mutex>(mV06Account->mutex);
     mSzePositionRetryScheduled = false;
+    if (mV06Enabled) {
+        if (is_risk_data_ready()) return;
+        for (short src : mTdSources) {
+            if (!mAccountReady[src]) {
+                const int rid = req_account(src);
+                mPendingAccountRid[src] = rid;
+                const auto early = mEarlyAccountRid.find(src);
+                mAccountReady[src] = rid >= 0 && early != mEarlyAccountRid.end() && early->second == rid;
+            }
+            if (!mPositionReady[src]) {
+                mSzeLivePositionReady.clear();
+                mV06PositionSubmitting = true;
+                mV06PositionSubmittingSource = src;
+                const int rid = req_position(src);
+                mV06PositionSubmitting = false;
+                mPendingPositionRid[src] = rid;
+                const auto early = mEarlyPositionRid.find(src);
+                mPositionReady[src] = rid >= 0 && early != mEarlyPositionRid.end() && early->second == rid &&
+                    mSzeLivePositionReady.size() == mInstrumentVec.size();
+            }
+        }
+        schedule_startup_position_retry();
+        return;
+    }
     if (!mSzeLiveRoutingEnabled || mSzePositionCutoffApplied ||
         mSzeLivePositionReady.size() == mInstrumentVec.size()) {
         return;
@@ -556,6 +599,8 @@ void StrategyBase::retry_or_finalize_startup_positions() {
 }
 
 bool StrategyBase::is_risk_data_ready() const {
+    std::unique_lock<std::recursive_mutex> v06_lock;
+    if (mV06Account) v06_lock = std::unique_lock<std::recursive_mutex>(mV06Account->mutex);
     if (!mRiskQueriesSubmitted) {
         return true;
     }
@@ -579,6 +624,8 @@ bool StrategyBase::is_risk_data_ready() const {
 }
 
 StrategyBase::StrategyBase(const std::string &name, json& src_config): IWCStrategy(name),j_config(src_config) {
+    mV06Enabled = src_config.value("strategy_version", std::string()) == "v06-b15-mh4";
+    if (mV06Enabled) mV06Account.reset(new V06AccountState());
     auto& ins_params = src_config["ins_params"];
     mInstrumentVec.reserve(ins_params.size());
     for (auto it = ins_params.begin(); it != ins_params.end(); ++it) {
@@ -849,6 +896,7 @@ StrategyBase::StrategyBase(const std::string &name, json& src_config): IWCStrate
             mSzHpEventIndexMap[code] = 0;
             if (mix_model_loaded) {
                 mix153060::StaticInputs mix_inputs;
+                mix_inputs.v06_baseline = mV06Enabled;
                 mix_inputs.instrument = code;
                 mix_inputs.trading_date = params.Date;
                 mix_inputs.average_amount = params.HistoryAmount;
@@ -1215,6 +1263,10 @@ bool StrategyBase::process_sze_recovery_event(
     const sze_recovery::CanonicalEvent& event,
     const void* payload,
     std::size_t payload_size) {
+    if (mV06Enabled && event.trading_day != mSzeRecoveryConsumerConfig.trading_day) {
+        mSzeRecoveryDecodeErrors.fetch_add(1U, std::memory_order_relaxed);
+        return false;
+    }
     if (payload == 0 || payload_size == 0U) {
         mSzeRecoveryDecodeErrors.fetch_add(1U, std::memory_order_relaxed);
         return false;
@@ -1250,6 +1302,16 @@ bool StrategyBase::process_sze_recovery_event(
         if (mInsParamsMap.find(NormalizeInstrumentId(trade.InstrumentID)) ==
             mInsParamsMap.end()) {
             return true;
+        }
+        if (mV06Account && trade.BidApplSeqNum > 0 && trade.OfferApplSeqNum > 0 && trade.Volume > 0) {
+            const std::string code = NormalizeInstrumentId(trade.InstrumentID);
+            const std::uint32_t tod_ms = ShSzFullOrderBookEngine::parse_event_time_ms(trade.TradeTime);
+            if (mV06Account->observe_execution_open(code, trade.Price, tod_ms,
+                    event.trading_day, mSzeRecoveryConsumerConfig.trading_day)) {
+                KF_LOG_INFO(logger, "[V06Open] instrument=" << code << " trading_day=" << event.trading_day
+                    << " price=" << trade.Price << " exchange_ms=" << tod_ms << " event_id=" << event.event_id
+                    << " source=" << (tod_ms < (9U * 3600U + 30U * 60U) * 1000U ? "first_auction" : "first_continuous"));
+            }
         }
         process_l2_trade_event(&trade,
                                static_cast<short>(event.source_id),
@@ -1578,7 +1640,8 @@ bool StrategyBase::enqueue_sze_trading_signal(
     long receive_time,
     sze_prediction::Source prediction_source,
     std::uint32_t trading_day,
-    std::uint64_t exchange_time_us) {
+    std::uint64_t exchange_time_us,
+    const std::array<float, 4>* v06_heads) {
     if (market_data == 0 || code.empty() || code.size() >= 16U) {
         return false;
     }
@@ -1600,6 +1663,8 @@ bool StrategyBase::enqueue_sze_trading_signal(
     std::memset(slot.instrument, 0, sizeof(slot.instrument));
     std::memcpy(slot.instrument, code.data(), code.size());
     slot.prediction = prediction;
+    slot.has_v06_heads = v06_heads != 0;
+    if (v06_heads) slot.v06_heads = *v06_heads;
     slot.source = source;
     slot.receive_time = receive_time;
     slot.prediction_source = prediction_source;
@@ -1700,9 +1765,12 @@ void StrategyBase::dispatch_sze_prediction_candidate(const std::string& code) {
     MSMarketDataField market_data = {MSMarketData()};
     market_data.ms_market_data.ms_market_data = chosen->market_data;
     strategy_it->second->set_latency_trace(chosen->latency_trace);
-    strategy_it->second->on_signal(
-        &market_data, chosen->prediction, chosen->source,
-        chosen->receive_time);
+    if (mV06Enabled) {
+        if (!chosen->has_v06_heads) return;
+        strategy_it->second->on_v06_signal(&market_data, chosen->v06_heads,
+            chosen->exchange_time_us, chosen->source, chosen->receive_time);
+    } else strategy_it->second->on_signal(
+        &market_data, chosen->prediction, chosen->source, chosen->receive_time);
     state.arbiter.mark_dispatched(selected);
     ++state.dispatch_count;
     if (!state.has_selected_source ||
@@ -1733,7 +1801,9 @@ void StrategyBase::dispatch_or_queue_trading_signal(
     sze_prediction::Source prediction_source,
     std::uint32_t trading_day,
     std::uint64_t exchange_time_us,
-    const StrategyLatencyTrace& latency_trace) {
+    const StrategyLatencyTrace& latency_trace,
+    const std::array<float, 4>* v06_heads) {
+    if (mV06Enabled && !v06_heads) return;
     const bool snapshot = prediction_source == sze_prediction::kSnapshot;
     if (!is_risk_data_ready() || mSzeRecoveryAnalysisMode ||
         !mSzeTradingQueueHealthy.load(std::memory_order_acquire) ||
@@ -1743,7 +1813,7 @@ void StrategyBase::dispatch_or_queue_trading_signal(
     if (mSzeRecoveryConsumerConfig.enabled) {
         if (!enqueue_sze_trading_signal(
                 code, market_data, prediction, source, receive_time,
-                prediction_source, trading_day, exchange_time_us)) {
+                prediction_source, trading_day, exchange_time_us, v06_heads)) {
             mSzeTradingQueueHealthy.store(false, std::memory_order_release);
             mSzeRecoveryLiveReady.store(false, std::memory_order_release);
             KF_LOG_ERROR(logger, "[SZPredictionArbiter] "
@@ -1756,8 +1826,9 @@ void StrategyBase::dispatch_or_queue_trading_signal(
         mZStrategyMap.find(code);
     if (strategy_it != mZStrategyMap.end() && strategy_it->second != 0) {
         strategy_it->second->set_latency_trace(latency_trace);
-        strategy_it->second->on_signal(
-            market_data, prediction, source, receive_time);
+        if (mV06Enabled) strategy_it->second->on_v06_signal(
+            market_data, *v06_heads, exchange_time_us, source, receive_time);
+        else strategy_it->second->on_signal(market_data, prediction, source, receive_time);
     }
 }
 
@@ -2172,12 +2243,26 @@ void StrategyBase::consume_mix153060_samples(const std::string& code,
     for (std::size_t index = 0; index < samples.count; ++index) {
         const mix153060::Sample& sample = samples.values[index];
         float prediction = 0.0f;
+        std::array<float, 4> v06_heads = {{0, 0, 0, 0}};
         StrategyLatencyTrace trace = mCurrentLatencyTrace;
         trace.market_receive_realtime_ns = rcv_time > 0
             ? static_cast<std::uint64_t>(rcv_time) * 1000ULL : 0ULL;
         trace.factor_done_mono_ns = StrategyMonotonicTimeNs();
         const std::uint64_t model_begin = capture_detail ? sz_hp::latency_now_ns() : 0;
-        if (!mMix153060Model.predict(sample.factors, &state_it->second, &prediction)) {
+        const bool model_ok = mV06Enabled
+            ? (mMix153060Model.output_count() == 4 &&
+               mMix153060Model.predict_heads(sample.factors, &state_it->second, &v06_heads))
+            : mMix153060Model.predict(sample.factors, &state_it->second, &prediction);
+        if (mV06Enabled) prediction = v06_heads[0];
+        if (mV06Enabled && model_ok) {
+            unsigned invalid_heads = 0;
+            for (unsigned head = 0; head < 4; ++head)
+                if (!std::isfinite(v06_heads[head])) invalid_heads |= 1U << head;
+            if (invalid_heads) KF_LOG_INFO(logger, "[V06InvalidHeads] instrument=" << code
+                << " row=" << sample.row_in_stock_day << " invalid_mask=" << invalid_heads
+                << " action=dispatch_for_revoke_and_reduction");
+        }
+        if (!model_ok) {
             ++mMix153060PredictionRejectCount;
             mix153060::Runtime* runtime = mix153060_runtime_for(code);
             if (runtime != 0) {
@@ -2237,7 +2322,7 @@ void StrategyBase::consume_mix153060_samples(const std::string& code,
             code, view, prediction, source, rcv_time,
             sze_prediction::kFullOrderBook,
             mSzeRecoveryConsumerConfig.trading_day,
-            ExchangeTimeOfDayUs(sample.exchange_time_us), trace);
+            ExchangeTimeOfDayUs(sample.exchange_time_us), trace, mV06Enabled ? &v06_heads : 0);
 #else
         std::unordered_map<std::string, ZStrategy*>::iterator strategy_it =
             mZStrategyMap.find(code);
@@ -2603,6 +2688,7 @@ void StrategyBase::init() {
         for (const auto& code : mInstrumentVec) {
             const auto& params = mInsParamsMap.at(code);
             mZStrategyMap[code] = new ZStrategy(code, params, j_config, util, logger);
+            if (mV06Enabled) mZStrategyMap[code]->bind_v06_account(mV06Account);
         }
     }
 #ifdef T0_USE_DEEPWIN
@@ -2867,6 +2953,8 @@ void StrategyBase::on_signal(const MSMarketDataField * market_data,
 
 void StrategyBase::on_rsp_account(const LFRspAccountField* data, int request_id, short source, long rcv_time,
     int errorId, const char* errorMsg) {
+    std::unique_lock<std::recursive_mutex> v06_lock;
+    if (mV06Account) v06_lock = std::unique_lock<std::recursive_mutex>(mV06Account->mutex);
     IWCStrategy::on_rsp_account(data, request_id, source, rcv_time, errorId, errorMsg);
     KF_LOG_INFO(logger, "[RiskInit][Account] source=" << source
         << " rid=" << request_id
@@ -2877,7 +2965,8 @@ void StrategyBase::on_rsp_account(const LFRspAccountField* data, int request_id,
         << " balance=" << (data == nullptr ? 0.0 : data->Balance)
         << " equity=" << (data == nullptr ? 0.0 : data->Equity)
         << " market_value=" << (data == nullptr ? 0.0 : data->MarketValue));
-    if (errorId != 0) {
+    if (errorId != 0 || (mV06Enabled && (data == 0 || !std::isfinite(data->Available) || data->Available < 0))) {
+        if (mV06Enabled) schedule_startup_position_retry();
         return;
     }
     auto it = mPendingAccountRid.find(source);
@@ -2894,6 +2983,14 @@ void StrategyBase::on_rsp_account(const LFRspAccountField* data, int request_id,
 }
 
 void StrategyBase::on_rtn_pos_option(const LFRspPositionField* data, bool isLast, int request_id, short source, long rcv_time) {
+    std::unique_lock<std::recursive_mutex> v06_lock;
+    if (mV06Account) v06_lock = std::unique_lock<std::recursive_mutex>(mV06Account->mutex);
+    if (mV06Enabled && mPositionReady[source]) return; // Never overwrite fills with a periodic/startup snapshot.
+    if (mV06Enabled) {
+        auto pending = mPendingPositionRid.find(source);
+        const bool submitting = mV06PositionSubmitting && mV06PositionSubmittingSource == source;
+        if (!submitting && (pending == mPendingPositionRid.end() || pending->second != request_id)) return;
+    }
     IWCStrategy::on_rtn_pos_option(data, isLast, request_id, source, rcv_time);
     if (data != nullptr) {
         KF_LOG_INFO(logger, "[RiskInit][Position] source=" << source
@@ -2924,6 +3021,11 @@ void StrategyBase::on_rtn_pos_option(const LFRspPositionField* data, bool isLast
         }
     }
     if (!isLast) {
+        return;
+    }
+    if (mV06Enabled && mV06PositionSubmitting && mV06PositionSubmittingSource == source) {
+        finalize_unresolved_startup_positions("position_query_complete");
+        mEarlyPositionRid[source] = request_id;
         return;
     }
     auto it = mPendingPositionRid.find(source);

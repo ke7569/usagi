@@ -12,6 +12,10 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <mutex>
+#include "V06AccountState.h"
+#include <memory>
+#include <array>
+#include <vector>
 
 struct InsParams;
 
@@ -113,6 +117,9 @@ public:
     void delay_cancel_order(int request_id,int delay_ms);
     void sync_startup_position(int32_t total_position, int32_t available_position);
     void set_latency_trace(const StrategyLatencyTrace& trace);
+    void bind_v06_account(const std::shared_ptr<V06AccountState>& account);
+    void on_v06_signal(const MSMarketDataField*, const std::array<float, 4>&,
+                       std::uint64_t exchange_time_us, short, long);
 
 
 
@@ -180,6 +187,26 @@ private:
     // authoritative guard against cancel-after-fill requests.
     std::unordered_set<int> cancel_pending_request_ids_;
     mutable std::mutex state_mutex_;
+    bool v06_enabled_ = false;
+    bool v06_submitting_ = false;
+    double v06_upper_price_ = 0, v06_lower_price_ = 0;
+    std::shared_ptr<V06AccountState> v06_account_;
+    v06_strategy::Config v06_config_;
+    v06_strategy::ReservationBook v06_reservations_;
+    struct V06Order {
+        int original = 0, cumulative = 0;
+        bool buy = true, terminal = false, cancel_pending = false;
+        double price = 0;
+        long long cancel_retry_ns = 0;
+        v06_strategy::OrderKind kind = v06_strategy::OrderKind::Hit;
+    };
+    std::map<int, V06Order> v06_orders_;
+    std::vector<std::pair<LFRtnOrderField, int> > v06_early_orders_;
+    std::vector<std::pair<LFRtnTradeField, int> > v06_early_trades_;
+    void v06_order_return(const LFRtnOrderField*, int);
+    void v06_trade_return(const LFRtnTradeField*, int);
+    void v06_cancel(int);
+    int v06_submit(const v06_strategy::PricingOutput&, int);
 
 
 };

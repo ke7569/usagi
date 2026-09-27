@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.10)
 project(sze_dev_debug CXX)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -54,6 +55,8 @@ set(SZE_COMMON_SOURCES
   ${T0}/bse_latency.cpp
   ${T0}/strategy/StrategyBase.cpp
   ${T0}/strategy/ZStrategy.cpp
+  ${T0}/strategy/ZStrategyV06.cpp
+  ${T0}/strategy/V06StrategyRules.cpp
   ${T0}/deepwin_strategy/sze_config_guard.cpp
   ${T0}/deepwin_strategy/sze_get_obj.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/reference/snapshot_legacy15/snapshot_legacy15_factors.cpp

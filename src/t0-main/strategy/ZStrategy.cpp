@@ -58,6 +58,20 @@ ZStrategy::ZStrategy(const std::string &InstrumentID,
     KfLogPtr other_logger):j_config(config),mTradeInstrument(InstrumentID), last_ob_ptr(nullptr) {
     util=other_util;
     logger=other_logger;
+    v06_enabled_ = config.value("strategy_version", std::string()) == "v06-b15-mh4";
+    if (v06_enabled_) {
+        const json values = config.value("v06_strategy", json::object());
+        v06_config_.offset_permille = values.value("offset_permille", 1.0);
+        v06_config_.quote_ratio = values.value("quote_ratio", 10.0);
+        v06_config_.bias_factor = values.value("bias_factor", 0.3);
+        v06_config_.position_base_line = values.value("position_base_line", 500000.0);
+        v06_config_.position_limit_factor = values.value("position_limit_factor", 1.0);
+        v06_config_.skewness_bps = values.value("skewness_bps", 1.0);
+        v06_config_.max_exposure = values.value("max_exposure", 0.05);
+        v06_config_.max_global_skewness_bps = values.value("max_global_skewness_bps", 10.0);
+        v06_upper_price_ = ins_params.HpUpperPrice;
+        v06_lower_price_ = ins_params.HpLowerPrice;
+    }
     context.last_ob = nullptr;
     context.curr_ob = nullptr;
     context.name = nullptr;
@@ -196,6 +210,8 @@ ZStrategy::ZStrategy(const std::string &InstrumentID,
 }
 
 void ZStrategy::sync_startup_position(int32_t total_position, int32_t available_position) {
+    std::unique_lock<std::recursive_mutex> account_lock;
+    if (v06_account_) account_lock = std::unique_lock<std::recursive_mutex>(v06_account_->mutex);
     std::lock_guard<std::mutex> lock(state_mutex_);
     const sze_position_risk::StartupPosition startup =
         sze_position_risk::NormalizeStartupPosition(
@@ -203,6 +219,7 @@ void ZStrategy::sync_startup_position(int32_t total_position, int32_t available_
     context.pi = startup.delta_from_static;
     i_params.last_position = startup.delta_from_static;
     i_params.shortable = startup.available;
+    if (v06_account_) v06_account_->sync_position(mTradeInstrument, startup.total);
     KF_LOG_INFO(logger, "[SZEPosSync] InstrumentID=" << mTradeInstrument
         << ", total_position=" << startup.total
         << ", available_position=" << startup.available
@@ -647,6 +664,7 @@ void ZStrategy::cancelSell() {
 }
 
 void ZStrategy::on_signal(const MSMarketDataField * market_data, double signal, short source, long rcv_time) {
+    if (v06_enabled_) return; // V06 requires the matching four-head sample.
     if (market_data == nullptr) {
         return;
     }
@@ -689,6 +707,7 @@ void ZStrategy::on_signal(const MSMarketDataField * market_data, double signal, 
 }
 
 void ZStrategy::on_rtn_order(const LFRtnOrderField *data, int request_id, short source, long rcv_time) {
+    if (v06_enabled_) { v06_order_return(data, request_id); return; }
     if (data == nullptr) {
         return;
     }
@@ -784,6 +803,7 @@ void ZStrategy::on_rtn_order(const LFRtnOrderField *data, int request_id, short 
 }
 
 void ZStrategy::on_rtn_trade(const LFRtnTradeField *data, int request_id, short source, long rcv_time) {
+    if (v06_enabled_) { v06_trade_return(data, request_id); return; }
     if (data == nullptr) {
         return;
     }

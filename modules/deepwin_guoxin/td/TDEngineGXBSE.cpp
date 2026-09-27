@@ -1144,8 +1144,8 @@ void TDEngineGXBSE::req_investor_position(const LFQryPositionField* data, int ac
         return;
     }
     if (!unit->logged_in.load()) {
-        LFRspPositionField pos = {};
-        on_rsp_position(&pos, true, requestId, ATPErrorCode::kNotLogin, "gxbse_not_login");
+        // V06 release: the legacy helper drops the position error field.
+        // Never turn a failed request into an apparently successful zero row.
         KF_LOG_ERROR(logger, "[req_investor_position] not logged in account_index="
             << account_index << " rid=" << requestId);
         return;
@@ -1179,8 +1179,7 @@ void TDEngineGXBSE::req_investor_position(const LFQryPositionField* data, int ac
     if (ec != ATPErrorCode::kSuccess) {
         erase_request_send_latency(requestId);
         erase_position_query(requestId);
-        LFRspPositionField pos = {};
-        on_rsp_position(&pos, true, requestId, ec, "gxbse_share_query_failed");
+        KF_LOG_ERROR(logger, "[V06PositionQueryBlocked] request rejected rid=" << requestId << " ec=" << ec);
     }
 }
 
@@ -1320,8 +1319,6 @@ void TDEngineGXBSE::send_periodic_position_query(int account_index)
     if (ec != ATPErrorCode::kSuccess) {
         erase_request_send_latency(request_id);
         finish_position_query(request_id);
-        LFRspPositionField pos = {};
-        on_rsp_position(&pos, true, static_cast<int>(request_id), ec, "gxbse_periodic_share_query_failed");
         KF_LOG_ERROR(logger, "[PositionSync] request failed account_index=" << account_index
             << " rid=" << request_id
             << " ec=" << ec);
@@ -1809,6 +1806,11 @@ void TDEngineGXBSE::on_rsp_cash_share_query(int account_index,
     }
 
     const int error_id = error_info.error_id;
+    if (!has_context) {
+        // Includes late responses after a failed query was retired.
+        KF_LOG_ERROR(logger, "[V06PositionQueryBlocked] unknown/retired rid=" << request_id);
+        return;
+    }
     const bool forward_to_helper = !(has_context && context.periodic_sync);
     if (error_id == ATPErrorCode::kQNotFoundShare
         || error_id == ATPErrorCode::kQSharePositionNotExist) {
@@ -1835,6 +1837,14 @@ void TDEngineGXBSE::on_rsp_cash_share_query(int account_index,
                 << " errorMsg=" << error_info.GetErrorMsg());
         }
         finish_position_query(request_id);
+        return;
+    }
+
+    if (error_id != 0) {
+        erase_request_send_latency(request_id);
+        finish_position_query(request_id);
+        KF_LOG_ERROR(logger, "[V06PositionQueryBlocked] failed result rid=" << request_id
+            << " ec=" << error_id << "; strategy remains gated and retries");
         return;
     }
 

@@ -82,6 +82,10 @@ public:
 
 private:
     std::string mMarket;
+    bool mV06Enabled = false;
+    std::shared_ptr<V06AccountState> mV06Account;
+    bool mV06PositionSubmitting = false;
+    short mV06PositionSubmittingSource = -1;
     OrderBookRuntimeMode mOrderBookMode = LEGACY_SNAPSHOT_MODE;
     std::unordered_set<std::string> mPendingPredictSet;
     ShSzFullOrderBookManager mFullOrderBookManager;
@@ -250,6 +254,8 @@ private:
         std::array<double, BASIC_FIELD_NUM> market_data;
         char instrument[16];
         double prediction;
+        std::array<float, 4> v06_heads;
+        bool has_v06_heads;
         short source;
         long receive_time;
         sze_prediction::Source prediction_source;
@@ -289,7 +295,8 @@ private:
                                     long receive_time,
                                     sze_prediction::Source prediction_source,
                                     std::uint32_t trading_day,
-                                    std::uint64_t exchange_time_us);
+                                    std::uint64_t exchange_time_us,
+                                    const std::array<float, 4>* v06_heads = 0);
     bool dequeue_sze_trading_signal(sze_prediction::Source prediction_source,
                                     SzeTradingSignal* signal);
     bool update_sze_prediction_candidate(const SzeTradingSignal& signal);
@@ -302,7 +309,8 @@ private:
                                           sze_prediction::Source prediction_source,
                                           std::uint32_t trading_day,
                                           std::uint64_t exchange_time_us,
-                                          const StrategyLatencyTrace& latency_trace);
+                                          const StrategyLatencyTrace& latency_trace,
+                                          const std::array<float, 4>* v06_heads = 0);
 
     SzeRecoveryConsumerConfig mSzeRecoveryConsumerConfig;
     static const std::uint64_t kSzeTradingSignalCapacity = 1024U;

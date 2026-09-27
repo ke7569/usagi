@@ -1,4 +1,4 @@
-#include "mix153060_model.h"
+#include "common/model/mix153060/mix153060_model.h"
 
 #include <algorithm>
 #include <cmath>
@@ -10,58 +10,26 @@
 #include <utility>
 #include <vector>
 
-#include <immintrin.h>
-
-#include "../cpp_model/eigen3/Eigen/Dense"
+#include "third_party/eigen3/Eigen/Dense"
 
 namespace mix153060 {
 
 namespace {
 
 static const char kMagic[8] = {'M', 'I', 'X', '1', '5', '3', '0', '6'};
-static const std::uint32_t kFormatVersion = 1;
+static const std::uint32_t kLegacyFormatVersion = 1;
+static const std::uint32_t kV06FormatVersion = 2;
 static const std::uint32_t kEndianMarker = 0x01020304U;
 static const std::size_t kGateCount = 3 * kHiddenSize;
 static const float kExpectedLayerNormEpsilon = 1.0e-5f;
 static const char kExpectedCheckpointHash[] =
     "09ed1cf8b824d75708faf725cf14797c3b0f32635dbad59374c04f4ff7fb3bb5";
+static const char kExpectedV06CheckpointHash[] =
+    "a56a98638e9c2357022dfd7bc4c98ce320ee8ac746540cab86783948f85bfa11";
 static const char kExpectedFactorHash[] =
     "e20ed70098a025f597f8b9cda41fb79b3188d875ad227f243c872ddbfbbed97e";
 
 typedef Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> RowMatrix;
-
-static inline float dot_product(const float* left, const float* right,
-                                std::size_t count) {
-#if defined(__AVX2__)
-    __m256 sum0 = _mm256_setzero_ps();
-    __m256 sum1 = _mm256_setzero_ps();
-    std::size_t i = 0;
-    for (; i + 16 <= count; i += 16) {
-        sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(
-            _mm256_loadu_ps(left + i), _mm256_loadu_ps(right + i)));
-        sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(
-            _mm256_loadu_ps(left + i + 8), _mm256_loadu_ps(right + i + 8)));
-    }
-    sum0 = _mm256_add_ps(sum0, sum1);
-    __m128 lo = _mm256_castps256_ps128(sum0);
-    __m128 hi = _mm256_extractf128_ps(sum0, 1);
-    __m128 sum = _mm_add_ps(lo, hi);
-    sum = _mm_hadd_ps(sum, sum);
-    sum = _mm_hadd_ps(sum, sum);
-    float result = _mm_cvtss_f32(sum);
-    for (; i < count; ++i) result += left[i] * right[i];
-    return result;
-#else
-    float result = 0.0f;
-    for (std::size_t i = 0; i < count; ++i) result += left[i] * right[i];
-    return result;
-#endif
-}
-
-static inline float row_dot(const RowMatrix& matrix, std::size_t row,
-                            const float* input, std::size_t count) {
-    return dot_product(matrix.data() + row * count, input, count);
-}
 
 struct Tensor {
     std::vector<std::uint32_t> shape;
@@ -273,6 +241,7 @@ Trace::Trace() : layernorm_output(), projected_input(), gru_output() {
 
 struct Model::Impl {
     float epsilon;
+    std::size_t output_count;
     Eigen::VectorXf norm_weight;
     Eigen::VectorXf norm_bias;
     RowMatrix projection_weight;
@@ -286,7 +255,7 @@ struct Model::Impl {
     std::string checkpoint_hash;
     std::string factor_hash;
 
-    Impl() : epsilon(1.0e-5f) {}
+    Impl() : epsilon(1.0e-5f), output_count(0) {}
 };
 
 Model::Model() : impl_() {}
@@ -318,6 +287,7 @@ bool Model::load(const std::string& path, std::string* error) {
     std::uint32_t tensor_count = 0;
     float epsilon = 0.0f;
     std::uint32_t factor_count = 0;
+    std::uint32_t output_count = 1;
     unsigned char checkpoint_hash[32];
     unsigned char factor_hash[32];
     if (!read_exact(&input, magic, sizeof(magic)) ||
@@ -325,6 +295,7 @@ bool Model::load(const std::string& path, std::string* error) {
         !read_u32(&input, &features) || !read_u32(&input, &hidden) ||
         !read_u32(&input, &layers) || !read_u32(&input, &tensor_count) ||
         !read_f32(&input, &epsilon) || !read_u32(&input, &factor_count) ||
+        (version == kV06FormatVersion && !read_u32(&input, &output_count)) ||
         !read_exact(&input, checkpoint_hash, sizeof(checkpoint_hash)) ||
         !read_exact(&input, factor_hash, sizeof(factor_hash))) {
         if (error != 0) {
@@ -332,12 +303,19 @@ bool Model::load(const std::string& path, std::string* error) {
         }
         return false;
     }
-    if (std::memcmp(magic, kMagic, sizeof(magic)) != 0 || version != kFormatVersion ||
-        endian != kEndianMarker || features != kFeatureCount || hidden != kHiddenSize ||
-        layers != kLayerCount || tensor_count != 14 || factor_count != kFeatureCount ||
-        !std::isfinite(epsilon) || epsilon != kExpectedLayerNormEpsilon) {
+    const bool is_legacy = version == kLegacyFormatVersion;
+    const bool is_v06 = version == kV06FormatVersion;
+    const bool valid_header =
+        std::memcmp(magic, kMagic, sizeof(magic)) == 0 &&
+        (is_legacy || is_v06) && endian == kEndianMarker &&
+        features == kFeatureCount && hidden == kHiddenSize &&
+        layers == kLayerCount && tensor_count == 14 &&
+        factor_count == kFeatureCount &&
+        (!is_legacy ? output_count == kOutputCount : output_count == 1) &&
+        std::isfinite(epsilon) && epsilon == kExpectedLayerNormEpsilon;
+    if (!valid_header) {
         if (error != 0) {
-            *error = "model header does not match mix153060 v1";
+            *error = "model header does not match mix153060 v1 or V06 v2";
         }
         return false;
     }
@@ -420,9 +398,13 @@ bool Model::load(const std::string& path, std::string* error) {
     const std::string embedded_checkpoint_hash =
         hex_string(checkpoint_hash, sizeof(checkpoint_hash));
     const std::string embedded_factor_hash = hex_string(factor_hash, sizeof(factor_hash));
-    if (embedded_checkpoint_hash != kExpectedCheckpointHash) {
+    const char* expected_checkpoint_hash =
+        is_v06 ? kExpectedV06CheckpointHash : kExpectedCheckpointHash;
+    if (embedded_checkpoint_hash != expected_checkpoint_hash) {
         if (error != 0) {
-            *error = "model checkpoint hash does not match the accepted mix153060 artifact";
+            *error = is_v06
+                         ? "model checkpoint hash does not match the accepted V06 artifact"
+                         : "model checkpoint hash does not match the accepted mix153060 artifact";
         }
         return false;
     }
@@ -434,6 +416,7 @@ bool Model::load(const std::string& path, std::string* error) {
     }
     std::unique_ptr<Impl> next(new Impl());
     next->epsilon = epsilon;
+    next->output_count = output_count;
     next->checkpoint_hash = embedded_checkpoint_hash;
     next->factor_hash = embedded_factor_hash;
     if (!copy_vector(tensors, "input_norm.weight", kFeatureCount, &next->norm_weight, error) ||
@@ -456,8 +439,9 @@ bool Model::load(const std::string& path, std::string* error) {
             return false;
         }
     }
-    if (!copy_matrix(tensors, "head.weight", 1, kHiddenSize, &next->head_weight, error) ||
-        !copy_vector(tensors, "head.bias", 1, &next->head_bias, error)) {
+    if (!copy_matrix(tensors, "head.weight", output_count, kHiddenSize,
+                     &next->head_weight, error) ||
+        !copy_vector(tensors, "head.bias", output_count, &next->head_bias, error)) {
         return false;
     }
     impl_.swap(next);
@@ -472,19 +456,49 @@ bool Model::predict(const std::array<float, kFeatureCount>& factors,
                     State* state,
                     float* prediction,
                     Trace* trace) const {
-    if (impl_.get() == 0 || state == 0 || prediction == 0) {
+    if (impl_.get() == 0 || state == 0 || prediction == 0 ||
+        (impl_->output_count != 1 && impl_->output_count != kOutputCount)) {
         return false;
     }
-    float normalized[kFeatureCount];
-    float layer_input[kHiddenSize];
-    float input_gates[kGateCount];
-    float hidden_gates[kGateCount];
-    float next[kHiddenSize];
+    std::array<float, kOutputCount> values;
+    if (!predict_impl(factors, state, values.data(), impl_->output_count, trace)) {
+        return false;
+    }
+    *prediction = values[0];
+    return true;
+}
+
+bool Model::predict_heads(const std::array<float, kFeatureCount>& factors,
+                          State* state,
+                          std::array<float, kOutputCount>* predictions,
+                          Trace* trace) const {
+    if (impl_.get() == 0 || state == 0 || predictions == 0 ||
+        impl_->output_count != kOutputCount) {
+        return false;
+    }
+    return predict_impl(factors, state, predictions->data(), kOutputCount, trace);
+}
+
+std::size_t Model::output_count() const {
+    return impl_.get() == 0 ? 0 : impl_->output_count;
+}
+
+bool Model::predict_impl(const std::array<float, kFeatureCount>& factors,
+                         State* state,
+                         float* predictions,
+                         std::size_t prediction_count,
+                         Trace* trace) const {
+    if (impl_.get() == 0 || state == 0 || predictions == 0 ||
+        prediction_count != impl_->output_count || prediction_count == 0) {
+        return false;
+    }
+    Eigen::Matrix<float, kFeatureCount, 1> input;
     float mean = 0.0f;
     for (std::size_t i = 0; i < kFeatureCount; ++i) {
         if (!std::isfinite(factors[i])) {
             return false;
         }
+        input(static_cast<Eigen::Index>(i)) = factors[i];
         mean += factors[i];
     }
     mean /= static_cast<float>(kFeatureCount);
@@ -495,59 +509,60 @@ bool Model::predict(const std::array<float, kFeatureCount>& factors,
     }
     variance /= static_cast<float>(kFeatureCount);
     const float inverse_std = 1.0f / std::sqrt(variance + impl_->epsilon);
+    Eigen::Matrix<float, kFeatureCount, 1> normalized;
     for (std::size_t i = 0; i < kFeatureCount; ++i) {
-        normalized[i] = (factors[i] - mean) * inverse_std * impl_->norm_weight(i) +
-                        impl_->norm_bias(i);
+        normalized(static_cast<Eigen::Index>(i)) =
+            (factors[i] - mean) * inverse_std * impl_->norm_weight(i) + impl_->norm_bias(i);
         if (trace != 0) {
-            trace->layernorm_output[i] = normalized[i];
+            trace->layernorm_output[i] = normalized(static_cast<Eigen::Index>(i));
         }
     }
 
-    for (std::size_t i = 0; i < kHiddenSize; ++i) {
-        layer_input[i] = row_dot(impl_->projection_weight, i, normalized, kFeatureCount) +
-                         impl_->projection_bias(i);
-    }
+    Eigen::VectorXf layer_input = affine(
+        impl_->projection_weight, normalized, impl_->projection_bias);
     if (trace != 0) {
-        std::copy(layer_input, layer_input + kHiddenSize, trace->projected_input.begin());
+        std::copy(layer_input.data(), layer_input.data() + kHiddenSize,
+                  trace->projected_input.begin());
     }
     for (std::size_t layer = 0; layer < kLayerCount; ++layer) {
-        float* previous = state->hidden.data() + layer * kHiddenSize;
-        // Each GRU gate projection has three contiguous 128-wide gate
-        // blocks (reset, update, candidate). Compute all 384 outputs before
-        // consuming the three blocks below.
-        for (std::size_t index = 0; index < kGateCount; ++index) {
-            input_gates[index] = row_dot(impl_->weight_ih[layer], index,
-                                         layer_input, kHiddenSize) +
-                                 impl_->bias_ih[layer](index);
-            hidden_gates[index] = row_dot(impl_->weight_hh[layer], index,
-                                          previous, kHiddenSize) +
-                                  impl_->bias_hh[layer](index);
-        }
+        Eigen::Map<Eigen::VectorXf> previous(
+            state->hidden.data() + layer * kHiddenSize, kHiddenSize);
+        const Eigen::VectorXf input_gates = affine(
+            impl_->weight_ih[layer], layer_input, impl_->bias_ih[layer]);
+        const Eigen::VectorXf hidden_gates = affine(
+            impl_->weight_hh[layer], previous, impl_->bias_hh[layer]);
+        Eigen::VectorXf next(kHiddenSize);
         for (std::size_t index = 0; index < kHiddenSize; ++index) {
-            const float reset = sigmoid(input_gates[index] + hidden_gates[index]);
+            const Eigen::Index i = static_cast<Eigen::Index>(index);
+            const float reset = sigmoid(input_gates(i) + hidden_gates(i));
             const float update = sigmoid(
-                input_gates[index + kHiddenSize] + hidden_gates[index + kHiddenSize]);
+                input_gates(i + kHiddenSize) + hidden_gates(i + kHiddenSize));
             const float candidate = std::tanh(
-                input_gates[index + 2 * kHiddenSize] +
-                reset * hidden_gates[index + 2 * kHiddenSize]);
+                input_gates(i + 2 * kHiddenSize) + reset * hidden_gates(i + 2 * kHiddenSize));
             // This is PyTorch's native GRU update order: n + z * (h - n).
             // The algebraically equivalent (1-z)*n + z*h accumulates several
             // ULPs of drift over a full trading day.
-            next[index] = candidate + update * (previous[index] - candidate);
+            next(i) = candidate + update * (previous(i) - candidate);
         }
-        std::copy(next, next + kHiddenSize, previous);
-        std::copy(next, next + kHiddenSize, layer_input);
+        previous = next;
+        layer_input.swap(next);
     }
 
-    const float value = row_dot(impl_->head_weight, 0, layer_input, kHiddenSize) +
-                        impl_->head_bias(0);
-    if (!std::isfinite(value)) {
-        return false;
+    const Eigen::VectorXf values = affine(impl_->head_weight, layer_input, impl_->head_bias);
+    for (std::size_t output = 0; output < prediction_count; ++output) {
+        const float value = values(static_cast<Eigen::Index>(output));
+        // V06 decisions distinguish an unusable primary head from auxiliary
+        // disagreement. Preserve head values for that policy; the old scalar
+        // model retains its fail-on-nonfinite contract.
+        if (prediction_count == 1 && !std::isfinite(value)) {
+            return false;
+        }
+        predictions[output] = value;
     }
+    if (prediction_count == kOutputCount && !layer_input.allFinite()) return false;
     ++state->accepted_rows;
-    *prediction = value;
     if (trace != 0) {
-        std::copy(layer_input, layer_input + kHiddenSize, trace->gru_output.begin());
+        std::copy(layer_input.data(), layer_input.data() + kHiddenSize, trace->gru_output.begin());
     }
     return true;
 }
