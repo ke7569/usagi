@@ -35,6 +35,8 @@ struct StaticInputs {
     double upper_limit;
     double lower_limit;
     double history_volatility_20d;
+    // V06 baseline sampling contract. False preserves the deployed A3 stream.
+    bool v06_baseline;
 
     StaticInputs();
     bool valid() const;

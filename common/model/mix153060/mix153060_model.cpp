@@ -17,12 +17,15 @@ namespace mix153060 {
 namespace {
 
 static const char kMagic[8] = {'M', 'I', 'X', '1', '5', '3', '0', '6'};
-static const std::uint32_t kFormatVersion = 1;
+static const std::uint32_t kLegacyFormatVersion = 1;
+static const std::uint32_t kV06FormatVersion = 2;
 static const std::uint32_t kEndianMarker = 0x01020304U;
 static const std::size_t kGateCount = 3 * kHiddenSize;
 static const float kExpectedLayerNormEpsilon = 1.0e-5f;
 static const char kExpectedCheckpointHash[] =
     "09ed1cf8b824d75708faf725cf14797c3b0f32635dbad59374c04f4ff7fb3bb5";
+static const char kExpectedV06CheckpointHash[] =
+    "a56a98638e9c2357022dfd7bc4c98ce320ee8ac746540cab86783948f85bfa11";
 static const char kExpectedFactorHash[] =
     "e20ed70098a025f597f8b9cda41fb79b3188d875ad227f243c872ddbfbbed97e";
 
@@ -238,6 +241,7 @@ Trace::Trace() : layernorm_output(), projected_input(), gru_output() {
 
 struct Model::Impl {
     float epsilon;
+    std::size_t output_count;
     Eigen::VectorXf norm_weight;
     Eigen::VectorXf norm_bias;
     RowMatrix projection_weight;
@@ -251,7 +255,7 @@ struct Model::Impl {
     std::string checkpoint_hash;
     std::string factor_hash;
 
-    Impl() : epsilon(1.0e-5f) {}
+    Impl() : epsilon(1.0e-5f), output_count(0) {}
 };
 
 Model::Model() : impl_() {}
@@ -283,6 +287,7 @@ bool Model::load(const std::string& path, std::string* error) {
     std::uint32_t tensor_count = 0;
     float epsilon = 0.0f;
     std::uint32_t factor_count = 0;
+    std::uint32_t output_count = 1;
     unsigned char checkpoint_hash[32];
     unsigned char factor_hash[32];
     if (!read_exact(&input, magic, sizeof(magic)) ||
@@ -290,6 +295,7 @@ bool Model::load(const std::string& path, std::string* error) {
         !read_u32(&input, &features) || !read_u32(&input, &hidden) ||
         !read_u32(&input, &layers) || !read_u32(&input, &tensor_count) ||
         !read_f32(&input, &epsilon) || !read_u32(&input, &factor_count) ||
+        (version == kV06FormatVersion && !read_u32(&input, &output_count)) ||
         !read_exact(&input, checkpoint_hash, sizeof(checkpoint_hash)) ||
         !read_exact(&input, factor_hash, sizeof(factor_hash))) {
         if (error != 0) {
@@ -297,12 +303,19 @@ bool Model::load(const std::string& path, std::string* error) {
         }
         return false;
     }
-    if (std::memcmp(magic, kMagic, sizeof(magic)) != 0 || version != kFormatVersion ||
-        endian != kEndianMarker || features != kFeatureCount || hidden != kHiddenSize ||
-        layers != kLayerCount || tensor_count != 14 || factor_count != kFeatureCount ||
-        !std::isfinite(epsilon) || epsilon != kExpectedLayerNormEpsilon) {
+    const bool is_legacy = version == kLegacyFormatVersion;
+    const bool is_v06 = version == kV06FormatVersion;
+    const bool valid_header =
+        std::memcmp(magic, kMagic, sizeof(magic)) == 0 &&
+        (is_legacy || is_v06) && endian == kEndianMarker &&
+        features == kFeatureCount && hidden == kHiddenSize &&
+        layers == kLayerCount && tensor_count == 14 &&
+        factor_count == kFeatureCount &&
+        (!is_legacy ? output_count == kOutputCount : output_count == 1) &&
+        std::isfinite(epsilon) && epsilon == kExpectedLayerNormEpsilon;
+    if (!valid_header) {
         if (error != 0) {
-            *error = "model header does not match mix153060 v1";
+            *error = "model header does not match mix153060 v1 or V06 v2";
         }
         return false;
     }
@@ -385,9 +398,13 @@ bool Model::load(const std::string& path, std::string* error) {
     const std::string embedded_checkpoint_hash =
         hex_string(checkpoint_hash, sizeof(checkpoint_hash));
     const std::string embedded_factor_hash = hex_string(factor_hash, sizeof(factor_hash));
-    if (embedded_checkpoint_hash != kExpectedCheckpointHash) {
+    const char* expected_checkpoint_hash =
+        is_v06 ? kExpectedV06CheckpointHash : kExpectedCheckpointHash;
+    if (embedded_checkpoint_hash != expected_checkpoint_hash) {
         if (error != 0) {
-            *error = "model checkpoint hash does not match the accepted mix153060 artifact";
+            *error = is_v06
+                         ? "model checkpoint hash does not match the accepted V06 artifact"
+                         : "model checkpoint hash does not match the accepted mix153060 artifact";
         }
         return false;
     }
@@ -399,6 +416,7 @@ bool Model::load(const std::string& path, std::string* error) {
     }
     std::unique_ptr<Impl> next(new Impl());
     next->epsilon = epsilon;
+    next->output_count = output_count;
     next->checkpoint_hash = embedded_checkpoint_hash;
     next->factor_hash = embedded_factor_hash;
     if (!copy_vector(tensors, "input_norm.weight", kFeatureCount, &next->norm_weight, error) ||
@@ -421,8 +439,9 @@ bool Model::load(const std::string& path, std::string* error) {
             return false;
         }
     }
-    if (!copy_matrix(tensors, "head.weight", 1, kHiddenSize, &next->head_weight, error) ||
-        !copy_vector(tensors, "head.bias", 1, &next->head_bias, error)) {
+    if (!copy_matrix(tensors, "head.weight", output_count, kHiddenSize,
+                     &next->head_weight, error) ||
+        !copy_vector(tensors, "head.bias", output_count, &next->head_bias, error)) {
         return false;
     }
     impl_.swap(next);
@@ -437,7 +456,40 @@ bool Model::predict(const std::array<float, kFeatureCount>& factors,
                     State* state,
                     float* prediction,
                     Trace* trace) const {
-    if (impl_.get() == 0 || state == 0 || prediction == 0) {
+    if (impl_.get() == 0 || state == 0 || prediction == 0 ||
+        (impl_->output_count != 1 && impl_->output_count != kOutputCount)) {
+        return false;
+    }
+    std::array<float, kOutputCount> values;
+    if (!predict_impl(factors, state, values.data(), impl_->output_count, trace)) {
+        return false;
+    }
+    *prediction = values[0];
+    return true;
+}
+
+bool Model::predict_heads(const std::array<float, kFeatureCount>& factors,
+                          State* state,
+                          std::array<float, kOutputCount>* predictions,
+                          Trace* trace) const {
+    if (impl_.get() == 0 || state == 0 || predictions == 0 ||
+        impl_->output_count != kOutputCount) {
+        return false;
+    }
+    return predict_impl(factors, state, predictions->data(), kOutputCount, trace);
+}
+
+std::size_t Model::output_count() const {
+    return impl_.get() == 0 ? 0 : impl_->output_count;
+}
+
+bool Model::predict_impl(const std::array<float, kFeatureCount>& factors,
+                         State* state,
+                         float* predictions,
+                         std::size_t prediction_count,
+                         Trace* trace) const {
+    if (impl_.get() == 0 || state == 0 || predictions == 0 ||
+        prediction_count != impl_->output_count || prediction_count == 0) {
         return false;
     }
     Eigen::Matrix<float, kFeatureCount, 1> input;
@@ -496,12 +548,19 @@ bool Model::predict(const std::array<float, kFeatureCount>& factors,
         layer_input.swap(next);
     }
 
-    const float value = affine(impl_->head_weight, layer_input, impl_->head_bias)(0);
-    if (!std::isfinite(value)) {
-        return false;
+    const Eigen::VectorXf values = affine(impl_->head_weight, layer_input, impl_->head_bias);
+    for (std::size_t output = 0; output < prediction_count; ++output) {
+        const float value = values(static_cast<Eigen::Index>(output));
+        // V06 decisions distinguish an unusable primary head from auxiliary
+        // disagreement. Preserve head values for that policy; the old scalar
+        // model retains its fail-on-nonfinite contract.
+        if (prediction_count == 1 && !std::isfinite(value)) {
+            return false;
+        }
+        predictions[output] = value;
     }
+    if (prediction_count == kOutputCount && !layer_input.allFinite()) return false;
     ++state->accepted_rows;
-    *prediction = value;
     if (trace != 0) {
         std::copy(layer_input.data(), layer_input.data() + kHiddenSize, trace->gru_output.begin());
     }

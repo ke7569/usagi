@@ -40,20 +40,22 @@ int64_t time_of_day(int64_t value) {
     return positive_mod(value, kDayUs);
 }
 
-int session_id(int64_t value) {
+int session_id(int64_t value, bool v06_baseline = false) {
     const int64_t tod = time_of_day(value);
-    if (tod >= kMorningOpenUs && tod <= kMorningCloseUs) {
+    if ((v06_baseline ? tod > kMorningOpenUs : tod >= kMorningOpenUs) &&
+        tod <= kMorningCloseUs) {
         return 1;
     }
-    if (tod >= kAfternoonOpenUs && tod < kFeatureEndUs) {
+    const int64_t end_us = v06_baseline ? 53760000000LL : kFeatureEndUs;
+    if (tod >= kAfternoonOpenUs && tod < end_us) {
         return 2;
     }
     return 0;
 }
 
-bool same_session(int64_t left, int64_t right) {
-    const int left_session = session_id(left);
-    return left_session != 0 && left_session == session_id(right);
+bool same_session(int64_t left, int64_t right, bool v06_baseline = false) {
+    const int left_session = session_id(left, v06_baseline);
+    return left_session != 0 && left_session == session_id(right, v06_baseline);
 }
 
 bool valid_trading_date(int32_t date) {
@@ -491,17 +493,19 @@ struct Flow {
                    : 0.0;
     }
 
-    void on_order(const Cut& start, const OrderEvent& event) {
+    void on_order(const Cut& start, const OrderEvent& event, bool v06_baseline = false) {
         const double volume = static_cast<double>(std::max<int64_t>(event.volume, 0));
         const double raw_price = event.price;
         if (event.buy) {
             buy_order_volume += volume;
             if (event.kind != OrderKind::kLimit ||
-                raw_price > start.best_ask_price() + 1.0e-6) {
+                ((!v06_baseline || start.best_ask_price() > 0.0) &&
+                 raw_price > start.best_ask_price() + 1.0e-6)) {
                 market_buy_amount += volume;
             }
-            if (start.best_bid_volume() != 0) {
-                const double bench = start.best_bid_price();
+            if (v06_baseline || start.best_bid_volume() != 0) {
+                const double bench = v06_baseline && start.best_bid_price() <= 0.0
+                                         ? raw_price : start.best_bid_price();
                 const double limit = start.best_ask_volume() != 0
                                          ? start.best_ask_price()
                                          : bench + 0.01;
@@ -513,11 +517,13 @@ struct Flow {
         } else {
             sell_order_volume += volume;
             if (event.kind != OrderKind::kLimit ||
-                raw_price < start.best_bid_price() - 1.0e-6) {
+                ((!v06_baseline || start.best_bid_price() > 0.0) &&
+                 raw_price < start.best_bid_price() - 1.0e-6)) {
                 market_sell_amount += volume;
             }
-            if (start.best_ask_volume() != 0) {
-                const double bench = start.best_ask_price();
+            if (v06_baseline || start.best_ask_volume() != 0) {
+                const double bench = v06_baseline && start.best_ask_price() <= 0.0
+                                         ? raw_price : start.best_ask_price();
                 const double limit = start.best_bid_volume() != 0
                                          ? start.best_bid_price()
                                          : bench - 0.01;
@@ -685,7 +691,8 @@ StaticInputs::StaticInputs()
       pre_close(0.0),
       upper_limit(0.0),
       lower_limit(0.0),
-      history_volatility_20d(0.0) {}
+      history_volatility_20d(0.0),
+      v06_baseline(false) {}
 
 bool StaticInputs::valid() const {
     const double max_price =
@@ -696,6 +703,7 @@ bool StaticInputs::valid() const {
            std::isfinite(pre_close) && pre_close > 0.0 && pre_close <= max_price &&
            std::isfinite(upper_limit) && upper_limit > 0.0 && upper_limit <= max_price &&
            std::isfinite(lower_limit) && lower_limit > 0.0 && lower_limit <= max_price &&
+           (!v06_baseline || (std::isfinite(free_share) && free_share > 0.0)) &&
            lower_limit <= upper_limit;
 }
 
@@ -1114,7 +1122,8 @@ struct Runtime::Impl {
         const int64_t cancel_id = std::max(event.buy_order_id, event.sell_order_id);
         std::unordered_map<int64_t, double>::const_iterator price_it = order_prices.find(cancel_id);
         const double cancel_price = price_it == order_prices.end() ? event.price : price_it->second;
-        if (has_window && same_session(window_start.exchange_time_us, event.exchange_time_us)) {
+        if (has_window && same_session(window_start.exchange_time_us, event.exchange_time_us,
+                                       inputs.v06_baseline)) {
             flow.on_trade(event, cancel_price);
         }
         if (event.buy_order_id != 0 && !book.contains(event.buy_order_id)) {
@@ -1127,8 +1136,9 @@ struct Runtime::Impl {
 
     void dispatch_order(const OrderEvent& event) {
         order_prices[event.app_sequence] = event.price;
-        if (has_window && same_session(window_start.exchange_time_us, event.exchange_time_us)) {
-            flow.on_order(window_start, event);
+        if (has_window && same_session(window_start.exchange_time_us, event.exchange_time_us,
+                                       inputs.v06_baseline)) {
+            flow.on_order(window_start, event, inputs.v06_baseline);
         }
     }
 
@@ -1339,6 +1349,10 @@ void Runtime::Impl::fill_timeline_factors(const Cut& start,
     const double mid = current.mid;
     const double hermes = classic_hermes(current);
     (*output)[0] = static_cast<float>(safe_div(current.best_ask_price() - current.best_bid_price(), mid) * 1000.0);
+    if (inputs.v06_baseline &&
+        (!current.has_two_sided_l1() || std::abs(current.limit_state) == 1)) {
+        (*output)[0] = 0.0f;
+    }
     (*output)[1] = static_cast<float>(per_mille(mid - start.mid, mid));
     for (std::size_t i = 0; i < kModelDepth; ++i) {
         (*output)[2 + i] = static_cast<float>(weighted[i]);
@@ -1437,13 +1451,14 @@ void Runtime::Impl::fill_book_factors(const Cut& current,
         asks.push_back(value);
     });
     const double span_10 = mid_tick * 0.1;
-    const double bound_ask_10 = mid_tick + span_10;
-    const double bound_bid_10 = mid_tick - span_10;
+    const double bound_ask_10 = inputs.v06_baseline ? mid_tick * 1.1 : mid_tick + span_10;
+    const double bound_bid_10 = inputs.v06_baseline ? mid_tick * 0.9 : mid_tick - span_10;
     const double span_1 = mid_tick * 0.01;
-    const double bound_ask_1 = mid_tick + span_1;
-    const double bound_bid_1 = mid_tick - span_1;
+    const double bound_ask_1 = inputs.v06_baseline ? mid_tick * 1.01 : mid_tick + span_1;
+    const double bound_bid_1 = inputs.v06_baseline ? mid_tick * 0.99 : mid_tick - span_1;
     const double span_5 = mid_tick * 0.05;
-    const double bound_ask_5 = mid_tick + span_5;
+    const double bound_ask_5 = inputs.v06_baseline ? mid_tick * 1.05 : mid_tick + span_5;
+    const double bound_bid_5 = inputs.v06_baseline ? mid_tick * 0.95 : mid_tick - span_5;
 
     SideStats ask10;
     SideStats bid10;
@@ -1465,7 +1480,7 @@ void Runtime::Impl::fill_book_factors(const Cut& current,
     bool bid_w5_found = false;
     for (std::size_t i = 0; i < asks.size(); ++i) {
         const LevelSnapshot& level = asks[i];
-        if (level.tick < mid_tick) {
+        if (!inputs.v06_baseline && level.tick < mid_tick) {
             break;
         }
         if (level.tick < bound_ask_10) {
@@ -1500,7 +1515,7 @@ void Runtime::Impl::fill_book_factors(const Cut& current,
     }
     for (std::size_t i = 0; i < bids.size(); ++i) {
         const LevelSnapshot& level = bids[i];
-        if (level.tick > mid_tick) {
+        if (!inputs.v06_baseline && level.tick > mid_tick) {
             break;
         }
         if (level.tick > bound_bid_10) {
@@ -1515,7 +1530,7 @@ void Runtime::Impl::fill_book_factors(const Cut& current,
             bid_w1_found = true;
             bid_w1 += level.volume * (1.0 - (mid_tick - level.tick) / span_1);
         }
-        if (level.tick > mid_tick - span_5) {
+        if (level.tick > bound_bid_5) {
             bid_band5.volume += level.volume;
             bid_band5.count += level.count;
             bid_band5.age_sum_us += level.age_sum_us;
@@ -1556,6 +1571,9 @@ void Runtime::Impl::fill_book_factors(const Cut& current,
     (*output)[34] = ask_w5_found && bid_w5_found
                         ? static_cast<float>(imbalance(ask_w5, bid_w5)) : 0.0f;
     (*output)[35] = static_cast<float>(imbalance(avg_size(ask10), avg_size(bid10)));
+    if (inputs.v06_baseline && (ask10.count == 0.0 || bid10.count == 0.0)) {
+        (*output)[35] = 0.0f;
+    }
     (*output)[36] = static_cast<float>(imbalance(ask10.count, bid10.count));
     (*output)[37] = static_cast<float>(imbalance(life(ask10), life(bid10)));
 
@@ -1664,13 +1682,18 @@ bool Runtime::Impl::maybe_emit(const Cut& cut,
     *amount_trigger = false;
     *time_trigger = false;
     *change_trigger = false;
+    if (inputs.v06_baseline && session_id(cut.exchange_time_us, true) == 0) {
+        has_window = false;
+        flow.clear();
+        return false;
+    }
     if (!has_window) {
         window_start = cut;
         has_window = true;
         flow.clear();
         return false;
     }
-    if (!same_session(window_start.exchange_time_us, cut.exchange_time_us)) {
+    if (!same_session(window_start.exchange_time_us, cut.exchange_time_us, inputs.v06_baseline)) {
         window_start = cut;
         flow.clear();
         return false;
@@ -1681,7 +1704,7 @@ bool Runtime::Impl::maybe_emit(const Cut& cut,
     // The first post-open event establishes the active-session window. It is
     // a boundary marker, not a model sample; otherwise live replay advances
     // the GRU once before the formal v0.4 stream begins.
-    if (time_of_day(window_start.exchange_time_us) == kMorningOpenUs &&
+    if (!inputs.v06_baseline && time_of_day(window_start.exchange_time_us) == kMorningOpenUs &&
         cut.exchange_time_us > window_start.exchange_time_us) {
         window_start = cut;
         flow.clear();
@@ -1701,7 +1724,7 @@ bool Runtime::Impl::maybe_emit(const Cut& cut,
     if (!(*amount_trigger || *time_trigger || *change_trigger)) {
         return false;
     }
-    if (has_last_accepted && time_of_day(cut.exchange_time_us) / 1000 <=
+    if (!inputs.v06_baseline && has_last_accepted && time_of_day(cut.exchange_time_us) / 1000 <=
                                 time_of_day(last_accepted_time_us) / 1000) {
         return false;
     }
