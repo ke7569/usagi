@@ -1160,7 +1160,8 @@ struct Runtime::Impl {
                     bool* time_trigger,
                     bool* change_trigger,
                     Sample* output);
-    bool begin_order_frame(const OrderEvent& order, EventTiming* timing) {
+    bool begin_order_frame(const OrderEvent& order, EventTiming* timing,
+                           int64_t match_volume = -1) {
         if (order.app_sequence <= 0 || order.exchange_time_us <= 0 ||
             order.local_time_us <= 0 || order.volume <= 0 ||
             !std::isfinite(order.price) ||
@@ -1169,7 +1170,11 @@ struct Runtime::Impl {
             return false;
         }
         const std::uint64_t book_begin = timing == 0 ? 0 : runtime_clock_ns();
-        const bool added = book.add(order);
+        // mdserver publishes the original order but matches only the
+        // executed quantity when the remainder is cancelled.
+        OrderEvent book_order = order;
+        if (match_volume >= 0) book_order.volume = match_volume;
+        const bool added = book.add(book_order);
         if (timing != 0) {
             const std::uint64_t book_end = runtime_clock_ns();
             timing->book_mutation_ns += book_end >= book_begin ? book_end - book_begin : 0;
@@ -1246,7 +1251,7 @@ struct Runtime::Impl {
     }
 
     bool resolve_deferred_market_order(double price, EventTiming* timing,
-                                       bool from_linked_fill) {
+                                       bool from_linked_fill, int64_t match_volume = -1) {
         if (!deferred_market_order) {
             return true;
         }
@@ -1266,7 +1271,7 @@ struct Runtime::Impl {
 
         OrderEvent resolved = original;
         resolved.price = price;
-        if (!begin_order_frame(resolved, timing)) {
+        if (!begin_order_frame(resolved, timing, match_volume)) {
             return false;
         }
         for (std::size_t i = 0; i < fills.size(); ++i) {
@@ -1733,7 +1738,8 @@ bool Runtime::Impl::maybe_emit(const Cut& cut,
         flow.clear();
         return false;
     }
-    // A completed sampling frame must not retain crossed best prices.
+    // Validate the completed sampling frame, after linked fills have been
+    // applied. Crossing while an incoming order is still matching is normal.
     if (cut.has_two_sided_l1() && cut.best_bid_price() > cut.best_ask_price() + 1e-8) {
         fail(cut.app_sequence, "crossed best bid/ask at completed sample");
         return false;
@@ -1953,20 +1959,61 @@ void Runtime::on_trade(const TradeEvent& event,
         if (event.kind == TradeKind::kCancel &&
             std::max(event.buy_order_id, event.sell_order_id) ==
                 impl_->deferred_market.app_sequence) {
-            if (impl_->deferred_market_fills.empty()) {
-                if (!impl_->consume_deferred_market_cancel(event))
-                    impl_->fail(event.app_sequence, "deferred market cancel rejected");
+            const int64_t matched_volume =
+                event.volume > 0 && event.volume <= impl_->deferred_market.volume
+                    ? impl_->deferred_market.volume - event.volume : -1;
+            if (event.volume <= 0 || matched_volume < 0 ||
+                matched_volume != impl_->deferred_market_fill_volume ||
+                event.app_sequence <= impl_->last_ingress_sequence ||
+                event.app_sequence <= impl_->deferred_market.app_sequence ||
+                !std::isfinite(event.price) || event.local_time_us <= 0 ||
+                (!impl_->deferred_market_fills.empty() &&
+                 (event.app_sequence <= impl_->deferred_market_fills.back().app_sequence ||
+                  event.exchange_time_us < impl_->deferred_market_fills.back().exchange_time_us))) {
+                impl_->fail(event.app_sequence, "market fill/cancel quantities or sequence inconsistent");
                 finish_event_timing(timing, total_begin);
                 return;
             }
-            // Apply executed quantities before removing the cancelled remainder.
+            if (impl_->deferred_market_fills.empty()) {
+                if (!impl_->consume_deferred_market_cancel(event)) {
+                    impl_->fail(event.app_sequence, "deferred market cancel rejected");
+                }
+                finish_event_timing(timing, total_begin);
+                return;
+            }
+            // Match mdserver: original quantity minus cancelled quantity
+            // enters the book; the original order volume remains in flow.
+            const double resolved_price = impl_->deferred_market_last_fill_price;
             if (!impl_->resolve_deferred_market_order(
-                    impl_->deferred_market_last_fill_price, timing, true)) {
+                    resolved_price, timing, true, matched_volume)) {
                 impl_->fail(event.app_sequence, "partial market fill replay before cancel rejected");
                 output->clear();
                 finish_event_timing(timing, total_begin);
                 return;
             }
+            bool emitted = false;
+            impl_->finalize_pending(&output->values[0], &emitted);
+            if (!impl_->available) {
+                output->clear();
+                finish_event_timing(timing, total_begin);
+                return;
+            }
+            if (emitted) output->count = 1;
+            // There is no residual market order in the book to cancel.
+            // Still publish the cancellation to the factor timeline.
+            TradeEvent resolved_cancel = event;
+            resolved_cancel.price = resolved_price;
+            impl_->dispatch_trade(resolved_cancel);
+            impl_->last_ingress_sequence = event.app_sequence;
+            impl_->last_ingress_time_us = event.exchange_time_us;
+            const Cut cut = impl_->make_cut(impl_->frame_count++, event.app_sequence,
+                                            event.exchange_time_us, event.local_time_us);
+            Sample& sample = output->values[output->count];
+            if (impl_->maybe_emit(cut, &sample.amount_trigger, &sample.time_trigger,
+                                  &sample.change_trigger, &sample)) ++output->count;
+            if (!impl_->available) output->clear();
+            finish_event_timing(timing, total_begin);
+            return;
         }
 
         const int64_t related_order = std::max(event.buy_order_id, event.sell_order_id);
