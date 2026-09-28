@@ -1,4 +1,7 @@
 if(T0_BUILD_SZE_STREAM_PROCESSOR)
+  add_executable(sze_book_runtime_test ${USAGI_ROOT}/tests/sze/book_runtime_test.cpp ${USAGI_ROOT}/sze/sampling/mix153060_runtime.cpp)
+  target_compile_options(sze_book_runtime_test PRIVATE -UNDEBUG -ffp-contract=off)
+  add_test(NAME sze_book_runtime_test COMMAND sze_book_runtime_test)
   add_executable(v06_model_test ${USAGI_ROOT}/tests/sze/v06_model_test.cpp)
   target_link_libraries(v06_model_test PRIVATE common_mix153060_model)
   add_executable(v06_factor_golden_test ${USAGI_ROOT}/tests/sze/v06_factor_golden_test.cpp ${USAGI_ROOT}/sze/sampling/mix153060_runtime.cpp)

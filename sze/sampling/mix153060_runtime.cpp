@@ -1733,6 +1733,11 @@ bool Runtime::Impl::maybe_emit(const Cut& cut,
         flow.clear();
         return false;
     }
+    // A completed sampling frame must not retain crossed best prices.
+    if (cut.has_two_sided_l1() && cut.best_bid_price() > cut.best_ask_price() + 1e-8) {
+        fail(cut.app_sequence, "crossed best bid/ask at completed sample");
+        return false;
+    }
     output->factors.fill(0.0f);
     output->bid_price.fill(0.0);
     output->ask_price.fill(0.0);
@@ -1948,12 +1953,20 @@ void Runtime::on_trade(const TradeEvent& event,
         if (event.kind == TradeKind::kCancel &&
             std::max(event.buy_order_id, event.sell_order_id) ==
                 impl_->deferred_market.app_sequence) {
-            if (!impl_->consume_deferred_market_cancel(event)) {
-                impl_->fail(event.app_sequence,
-                            "deferred market cancel rejected");
+            if (impl_->deferred_market_fills.empty()) {
+                if (!impl_->consume_deferred_market_cancel(event))
+                    impl_->fail(event.app_sequence, "deferred market cancel rejected");
+                finish_event_timing(timing, total_begin);
+                return;
             }
-            finish_event_timing(timing, total_begin);
-            return;
+            // Apply executed quantities before removing the cancelled remainder.
+            if (!impl_->resolve_deferred_market_order(
+                    impl_->deferred_market_last_fill_price, timing, true)) {
+                impl_->fail(event.app_sequence, "partial market fill replay before cancel rejected");
+                output->clear();
+                finish_event_timing(timing, total_begin);
+                return;
+            }
         }
 
         const int64_t related_order = std::max(event.buy_order_id, event.sell_order_id);

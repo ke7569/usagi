@@ -46,6 +46,9 @@ def prepare(day, original, release, output):
             if not isinstance(fields.get(key), (int, float)) or fields[key] <= 0:
                 raise ValueError('invalid static field ' + symbol + ':' + key)
     config['strategy_version'] = 'v06-b15-mh4'
+    quarantine = Path('/home/zane/run_main/risk/sze') / str(day)
+    quarantine.mkdir(parents=True, exist_ok=True)
+    config['sze_daily_book_guard_directory'] = str(quarantine)
     config['strategy_name'] = 'sze_v06_b15_mh4_{}'.format(day)
     config['model_path'] = str(model)
     config['mix153060_model_sha256'] = MODEL_SHA256
