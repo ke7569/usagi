@@ -319,7 +319,13 @@ def strategy_configs(system, daily, day, output_dir):
     shard_count, strategy_cpus, state_cpus = validate_system(system, False)
     base = strategy_base(system, daily, day, True)
     groups = [[] for _ in range(shard_count)]
+    quarantine = os.path.join(system["paths"]["run_main"], "risk", "sze", str(day))
+    blocked_symbols = [
+        symbol for symbol in sorted(base["ins_params"])
+        if os.path.exists(os.path.join(quarantine, symbol.split(".")[0] + ".blocked"))]
     for symbol in sorted(base["ins_params"]):
+        if symbol in blocked_symbols:
+            continue
         groups[fnv1a(symbol) % shard_count].append(symbol)
     workers_dir = os.path.join(output_dir, "workers")
     manifest = []
@@ -394,6 +400,7 @@ def strategy_configs(system, daily, day, output_dir):
         "model_sha256": system["model"]["sha256"],
         "shards": manifest,
         "trade_symbols": trade_symbols,
+        "daily_blocked_symbols": blocked_symbols,
         "credentials_path": system["trade"].get("credentials_path", ""),
     })
 

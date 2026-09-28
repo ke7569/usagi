@@ -6,12 +6,43 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <stdexcept>
 
 // One account-wide state shared by the strategy instances. Its recursive
 // mutex also serializes synchronous gateway callbacks with order submission.
 class V06AccountState {
 public:
     mutable std::recursive_mutex mutex;
+    void configure_book_guard(const std::string& directory) {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        struct stat info;
+        if (directory.empty() || stat(directory.c_str(), &info) || !S_ISDIR(info.st_mode))
+            throw std::runtime_error("missing daily instrument quarantine directory");
+        quarantine_directory_ = directory;
+    }
+    bool blocked(const std::string& code) const {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        return blocked_.count(code) != 0;
+    }
+    void block(const std::string& code, const std::string& reason) {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        if (!blocked_.insert(code).second) return;
+        if (quarantine_directory_.empty()) return; // Standalone tests only.
+        const std::string path = quarantine_directory_ + "/" + code + ".blocked";
+        const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (fd < 0) {
+            if (errno != EEXIST) healthy_ = false;
+            return;
+        }
+        const std::string text = reason + "\n";
+        if (write(fd, text.data(), text.size()) != static_cast<ssize_t>(text.size()) ||
+            fsync(fd) != 0) healthy_ = false;
+        close(fd);
+    }
     struct Instrument {
         long long base = 0, initial_total = 0;
         double open = 0;
@@ -20,6 +51,11 @@ public:
     void register_instrument(const std::string& code, long long base) {
         std::lock_guard<std::recursive_mutex> lock(mutex);
         instruments_[code].base = base;
+        if (!quarantine_directory_.empty()) {
+            const std::string path = quarantine_directory_ + "/" + code + ".blocked";
+            if (access(path.c_str(), F_OK) == 0) blocked_.insert(code);
+            else if (errno != ENOENT) healthy_ = false;
+        }
     }
     void sync_position(const std::string& code, long long total) {
         std::lock_guard<std::recursive_mutex> lock(mutex);
@@ -73,6 +109,7 @@ public:
         for (const auto& item : quantities_)
             if (item.second.first != item.second.second) return false;
         for (const auto& item : instruments_) {
+            if (blocked_.count(item.first)) continue;
             const Instrument& p = item.second;
             if (!p.synced || p.base < 0) return false;
             if ((p.base != 0 || p.initial_total != 0) && p.open <= 0) return false;
@@ -83,6 +120,7 @@ public:
         std::lock_guard<std::recursive_mutex> lock(mutex);
         const auto it = instruments_.find(code);
         return it != instruments_.end() &&
+            !blocked_.count(code) &&
             (!it->second.synced || it->second.base > 0 || it->second.initial_total > 0);
     }
     v06_strategy::DirectionalSkew skew(long long exchange_us,
@@ -91,7 +129,8 @@ public:
         if (!ready()) return v06_strategy::DirectionalSkew();
         initial_locked_ = true;
         bool has_base = false;
-        for (const auto& item : instruments_) has_base = has_base || item.second.base > 0;
+        for (const auto& item : instruments_)
+            if (!blocked_.count(item.first)) has_base = has_base || item.second.base > 0;
         if (!has_base) {
             // All instruments are sell-only. No target-capital denominator
             // exists; volume clamps still enforce actual sellable inventory.
@@ -103,6 +142,7 @@ public:
         if (boundary != boundary_) {
             v06_strategy::GlobalExposureInput input;
             for (const auto& item : instruments_) {
+                if (blocked_.count(item.first)) continue;
                 const Instrument& p = item.second;
                 if (p.base == 0 && p.initial_total == 0) continue;
                 v06_strategy::GlobalExposureInstrument i;
@@ -119,6 +159,8 @@ public:
     }
     void invalidate() { std::lock_guard<std::recursive_mutex> lock(mutex); healthy_ = false; }
 private:
+    std::string quarantine_directory_;
+    std::set<std::string> blocked_;
     std::map<std::string, Instrument> instruments_;
     std::map<std::string, double> fills_;
     std::map<std::string, std::pair<long long, long long> > quantities_;

@@ -51,6 +51,7 @@ public:
     std::vector<std::pair<LFRtnOrderField,int> > v06_early_orders_;
     std::vector<std::pair<LFRtnTradeField,int> > v06_early_trades_;
     void bind_v06_account(const std::shared_ptr<V06AccountState>&);
+    void halt_v06_for_day(const std::string&);
     void on_v06_signal(const MSMarketDataField*,const std::array<float,4>&,std::uint64_t,short,long);
     void v06_order_return(const LFRtnOrderField*,int);
     void v06_trade_return(const LFRtnTradeField*,int);
@@ -88,6 +89,30 @@ static void assert_skew(const v06_strategy::DirectionalSkew& skew, double buy, d
     assert(std::abs(skew.sell_bps-sell)<1e-10);
 }
 int main() {
+    {
+        char temp[]="/tmp/v06-daily-block-XXXXXX";
+        char* directory=mkdtemp(temp);assert(directory);
+        ZStrategy s;s.bind_v06_account(std::make_shared<V06AccountState>());
+        s.v06_account_->configure_book_guard(directory);
+        s.v06_account_->sync_position("000001",1000);
+        s.v06_account_->observe_open("000001",10);
+        s.v06_submit(decision(),100);
+        MSMarketDataField md;md.BidPrice1=10.64;md.AskPrice1=10.22;
+        std::array<float,4> h={{-10,-10,-10,-10}};
+        const auto now=(10*3600LL)*1000000LL;
+        s.on_v06_signal(&md,h,now,180,0);
+        assert(s.v06_account_->blocked("000001") && s.fake.cancels==1 && s.fake.submits==1);
+        md.BidPrice1=10;md.AskPrice1=10.01;
+        s.on_v06_signal(&md,h,now,180,0);
+        assert(s.fake.submits==1 && s.v06_submit(decision(),100)==-1);
+        V06AccountState restarted;restarted.configure_book_guard(directory);
+        restarted.register_instrument("000001",1000);
+        assert(restarted.blocked("000001") && !restarted.needs_market_data("000001"));
+        restarted.register_instrument("000002",0);restarted.sync_position("000002",100);
+        restarted.observe_open("000002",10);assert(restarted.ready());
+        assert(!restarted.blocked("000002"));
+        unlink((std::string(directory)+"/000001.blocked").c_str());rmdir(directory);
+    }
     {
         V06AccountState a;
         a.register_instrument("000001",0);

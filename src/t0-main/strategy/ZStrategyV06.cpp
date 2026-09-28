@@ -6,7 +6,23 @@
 
 void ZStrategy::bind_v06_account(const std::shared_ptr<V06AccountState>& account) {
     v06_account_ = account;
-    if (account) account->register_instrument(mTradeInstrument, i_params.static_position);
+    if (account) {
+        account->register_instrument(mTradeInstrument, i_params.static_position);
+        if (account->blocked(mTradeInstrument))
+            KF_LOG_INFO(logger, "[V06DailyBlockLoaded] instrument=" << mTradeInstrument
+                << " prediction_disabled=1 trading_disabled_for_day=1");
+    }
+}
+
+void ZStrategy::halt_v06_for_day(const std::string& reason) {
+    if (!v06_account_) return;
+    std::lock_guard<std::recursive_mutex> lock(v06_account_->mutex);
+    const bool first = !v06_account_->blocked(mTradeInstrument);
+    v06_account_->block(mTradeInstrument, reason);
+    for (const auto& item : v06_orders_)
+        if (!item.second.terminal) v06_cancel(item.first);
+    if (first) KF_LOG_INFO(logger, "[V06DailyBlock] instrument=" << mTradeInstrument
+        << " reason=" << reason << " trading_disabled_for_day=1");
 }
 
 void ZStrategy::on_v06_signal(const MSMarketDataField* md,
@@ -14,6 +30,15 @@ void ZStrategy::on_v06_signal(const MSMarketDataField* md,
                             std::uint64_t exchange_us, short, long) {
     if (!v06_enabled_ || !v06_account_ || !md) return;
     std::lock_guard<std::recursive_mutex> lock(v06_account_->mutex);
+    if (v06_account_->blocked(mTradeInstrument)) {
+        halt_v06_for_day("daily quarantine");
+        return;
+    }
+    if (md->BidPrice1 > 0 && md->AskPrice1 > 0 &&
+        md->BidPrice1 > md->AskPrice1 + 1e-8) {
+        halt_v06_for_day("crossed best bid/ask");
+        return;
+    }
     const auto global = v06_account_->skew(exchange_us, v06_config_);
     if (!routing_enabled_ || virtual_routing_) return;
     ++startup_signal_count_; // V06 uses exchange-time gates, no extra sample warmup.
@@ -103,6 +128,7 @@ void ZStrategy::on_v06_signal(const MSMarketDataField* md,
 }
 
 int ZStrategy::v06_submit(const v06_strategy::PricingOutput& d, int quantity) {
+    if (!v06_account_ || v06_account_->blocked(mTradeInstrument)) return -1;
     const bool buy = d.side == v06_strategy::Side::Buy;
     if (i_params.static_position == 0) {
         const long long reserved = v06_reservations_.reservedVolume(v06_strategy::Side::Sell);

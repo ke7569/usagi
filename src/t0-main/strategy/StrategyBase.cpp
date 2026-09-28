@@ -625,7 +625,11 @@ bool StrategyBase::is_risk_data_ready() const {
 
 StrategyBase::StrategyBase(const std::string &name, json& src_config): IWCStrategy(name),j_config(src_config) {
     mV06Enabled = src_config.value("strategy_version", std::string()) == "v06-b15-mh4";
-    if (mV06Enabled) mV06Account.reset(new V06AccountState());
+    if (mV06Enabled) {
+        mV06Account.reset(new V06AccountState());
+        mV06Account->configure_book_guard(
+            src_config.value("sze_daily_book_guard_directory", std::string()));
+    }
     auto& ins_params = src_config["ins_params"];
     mInstrumentVec.reserve(ins_params.size());
     for (auto it = ins_params.begin(); it != ins_params.end(); ++it) {
@@ -2022,6 +2026,12 @@ mix153060::Runtime* StrategyBase::mix153060_runtime_for(const std::string& code)
 #ifdef T0_SZE_STRATEGY_ONLY
 void StrategyBase::update_sze_book_health(const std::string& code,
                                           mix153060::Runtime* runtime) {
+    if (runtime && !runtime->available() && mV06Account) {
+        const auto strategy = mZStrategyMap.find(code);
+        if (strategy != mZStrategyMap.end())
+            strategy->second->halt_v06_for_day(runtime->failure_reason());
+        else mV06Account->block(code, runtime->failure_reason());
+    }
     if (!mSzeRecoveryHealthWriter || !runtime) return;
     const std::uint32_t symbol_id = sze_health::parse_symbol_id(code.c_str());
     if (symbol_id >= 1000000U) return;

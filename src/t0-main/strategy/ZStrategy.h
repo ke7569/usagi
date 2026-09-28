@@ -118,6 +118,7 @@ public:
     void sync_startup_position(int32_t total_position, int32_t available_position);
     void set_latency_trace(const StrategyLatencyTrace& trace);
     void bind_v06_account(const std::shared_ptr<V06AccountState>& account);
+    void halt_v06_for_day(const std::string& reason);
     void on_v06_signal(const MSMarketDataField*, const std::array<float, 4>&,
                        std::uint64_t exchange_time_us, short, long);
 

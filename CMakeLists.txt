@@ -204,6 +204,14 @@ set_target_properties(sze_l1_md PROPERTIES OUTPUT_NAME sze_l1_md
   BUILD_RPATH "${WC_LIB};${YJJ_LIB};${TPWC_LIB};${BOOST_LIB}")
 
 enable_testing()
+add_executable(v06_live_execution_test
+  ${T0}/strategy/v06_live_execution_test.cpp ${T0}/strategy/V06StrategyRules.cpp)
+target_compile_options(v06_live_execution_test PRIVATE -UNDEBUG)
+add_test(NAME v06_live_execution_test COMMAND v06_live_execution_test)
+add_executable(sze_book_runtime_test
+  ${T0}/strategy/book_runtime_test.cpp ${T0}/predictor/mix153060_runtime.cpp)
+target_compile_options(sze_book_runtime_test PRIVATE -UNDEBUG -ffp-contract=off)
+add_test(NAME sze_book_runtime_test COMMAND sze_book_runtime_test)
 add_executable(sze_recoverable_test
   ${SZE_MD}/tests/sze_recoverable_test.cpp ${SZE_MD}/SZERecoverable.cpp)
 target_include_directories(sze_recoverable_test PRIVATE ${SZE_MD})
