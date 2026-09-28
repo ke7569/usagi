@@ -337,8 +337,8 @@ def strategy_configs(system, daily, day, output_dir):
         manifest.append({"shard": shard, "symbol_count": len(symbols),
                          "strategy_cpu": strategy_cpus[shard],
                          "state_cpu": state_cpus[shard]})
-    trade_symbols = sorted(symbol for symbol, item in base["ins_params"].items()
-                           if int(item.get("static_position", 0)) != 0)
+    # Startup broker positions decide which zero targets need liquidation.
+    trade_symbols = sorted(base["ins_params"])
     if system["trade"].get("enabled", False) and trade_symbols:
         trade = strategy_base(system, daily, day, False)
         trade["strategy_name"] = "sze_realtime_trade_{}".format(day)
@@ -462,10 +462,9 @@ def main():
         validate_credentials(system)
         trade_count = sum(int(item.get("static_position", 0)) != 0
                           for item in daily["ins_params"].values())
-        if system["trade"].get("enabled", False) and trade_count == 0:
-            raise ConfigError("trade enabled but daily config has no nonzero static_position")
         print(json.dumps({"ok": True, "trading_day": args.day,
-                          "trade_instruments": trade_count},
+                          "trade_instruments": len(daily["ins_params"]),
+                          "nonzero_targets": trade_count},
                          sort_keys=True, separators=(",", ":")))
         return
     if args.component in ("capture", "all"):

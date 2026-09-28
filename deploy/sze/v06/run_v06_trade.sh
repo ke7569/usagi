@@ -2,7 +2,7 @@
 set -euo pipefail
 DAY="${TRADING_DAY:-$(date +%Y%m%d)}"
 SOURCE=/home/zane/usagi-sze-v06-20260910
-RELEASE=/home/zane/releases/sze-v06-live-20260910-exposure-fix
+RELEASE=/home/zane/releases/sze-v06-live-20260928-zero-target
 RUNTIME=/run/sze-v06/$DAY/trade
 ORIGINAL=/run/sze/$DAY/strategy/trade
 SYSTEM=/home/zane/configs/general_config/sze_system.json
