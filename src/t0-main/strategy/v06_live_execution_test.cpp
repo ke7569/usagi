@@ -89,6 +89,82 @@ static void assert_skew(const v06_strategy::DirectionalSkew& skew, double buy, d
 }
 int main() {
     {
+        V06AccountState a;
+        a.register_instrument("000001",0);
+        assert(a.needs_market_data("000001"));
+        assert(!a.ready());
+        a.sync_position("000001",0);
+        assert(a.ready() && !a.needs_market_data("000001"));
+        v06_strategy::Config c;
+        assert_skew(a.skew(100000000LL,c),0,0);
+    }
+    {
+        v06_strategy::PositionClampInput p;
+        v06_strategy::Config c;
+        p.static_position=0;p.opening_position=1000;p.current_position=1000;
+        p.side=v06_strategy::Side::Sell;p.requested=1000;
+        p.exchange_time_micros=(9*3600LL+31*60LL)*1000000LL;
+        assert(v06_strategy::ordinaryAllowedVolume(p,c)==1000);
+        p.dirty_sell_hit=200;p.dirty_sell_quote=300;
+        assert(v06_strategy::ordinaryAllowedVolume(p,c)==500);
+        p.short_position=400;p.current_position=600;
+        assert(v06_strategy::ordinaryAllowedVolume(p,c)==100);
+        p.side=v06_strategy::Side::Buy;
+        assert(v06_strategy::ordinaryAllowedVolume(p,c)==0);
+        p.side=v06_strategy::Side::Sell;p.current_position=0;
+        assert(v06_strategy::ordinaryAllowedVolume(p,c)==0);
+    }
+    {
+        // Real signal/submit/reply path: sell-only, available inventory,
+        // partial fill, duplicate replies, pending cancellation and no rebuy.
+        ZStrategy s;s.i_params.static_position=0;s.i_params.last_position=1000;
+        s.i_params.shortable=300;s.context.pi=1000;
+        s.bind_v06_account(std::make_shared<V06AccountState>());
+        MSMarketDataField md;
+        std::array<float,4> sell={{-10,-10,-10,-10}},buy={{10,10,10,10}};
+        const auto now=(10*3600LL)*1000000LL;
+        s.on_v06_signal(&md,sell,now,180,0);assert(s.fake.submits==0);
+        s.v06_account_->sync_position("000001",1000);
+        s.v06_account_->observe_open("000001",10);
+        assert(s.v06_account_->ready());
+        assert_skew(s.v06_account_->skew(now,s.v06_config_),0,0);
+        s.on_v06_signal(&md,buy,now,180,0);assert(s.fake.submits==0);
+        assert(s.v06_submit(decision(),100)==-1 && s.fake.submits==0);
+        s.on_v06_signal(&md,sell,now,180,0);
+        assert(s.fake.submits==1 && s.fake.last_qty==200 && !s.v06_orders_[1].buy);
+        s.on_v06_signal(&md,sell,now,180,0);
+        assert(s.fake.submits==2 && s.fake.last_qty==100 && s.context.vs_pos==300);
+        s.on_v06_signal(&md,sell,now,180,0);assert(s.fake.submits==2);
+        s.v06_cancel(1);
+        s.on_v06_signal(&md,sell,now,180,0);assert(s.fake.submits==2);
+        LFRtnOrderField o;o.VolumeTraded=100;o.VolumeTotal=100;o.VolumeTotalOriginal=200;
+        s.v06_order_return(&o,1);
+        assert(s.context.pi==900 && s.i_params.shortable==200 && s.context.vs_pos==200);
+        s.on_v06_signal(&md,sell,now,180,0);assert(s.fake.submits==2);
+        auto t=trade();s.v06_trade_return(&t,1);s.v06_trade_return(&t,1);
+        s.v06_order_return(&o,1);
+        assert(s.context.pi==900 && s.i_params.shortable==200 && s.context.cum_sell==100);
+        o.OrderStatus=LF_CHAR_Canceled;o.VolumeTotal=0;s.v06_order_return(&o,1);
+        s.on_v06_signal(&md,sell,now,180,0);
+        assert(s.fake.submits==3 && s.fake.last_qty==100 && s.context.vs_pos==200);
+    }
+    {
+        ZStrategy s;s.i_params.static_position=0;s.i_params.last_position=100;
+        s.i_params.shortable=100;s.context.pi=100;
+        s.bind_v06_account(std::make_shared<V06AccountState>());
+        s.v06_account_->sync_position("000001",100);
+        s.v06_account_->observe_open("000001",10);
+        MSMarketDataField md;std::array<float,4> h={{-10,10,10,10}};
+        const auto now=(10*3600LL)*1000000LL;
+        s.on_v06_signal(&md,h,now,180,0);
+        assert(s.fake.submits==1 && s.fake.last_qty==100); // MH4 cannot block reduction.
+        auto t=trade();s.v06_trade_return(&t,1);
+        assert(s.context.pi==0 && s.i_params.shortable==0);
+        s.on_v06_signal(&md,h,now,180,0);
+        h={{10,10,10,10}};s.on_v06_signal(&md,h,now,180,0);
+        assert(s.fake.submits==1);
+    }
+    {
         // Exercise the real account-to-rules boundary with the live basket
         // size. Twenty positions and zero fills must produce a valid skew.
         V06AccountState account;initialize_twenty_stock_account(account);

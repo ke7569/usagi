@@ -81,6 +81,18 @@ class RuntimeConfigTest(unittest.TestCase):
         with self.assertRaises(RUNTIME.ConfigError):
             RUNTIME.validate_daily(copy.deepcopy(self.daily), 20260818, False)
 
+    def test_zero_target_still_generates_broker_position_candidates(self):
+        daily = copy.deepcopy(self.daily)
+        for fields in daily["ins_params"].values():
+            fields["static_position"] = 0
+        daily["static_data_hash"] = RUNTIME.canonical_hash(daily["ins_params"])
+        daily = RUNTIME.validate_daily(daily, 20260817, False)
+        output = os.path.join(self.temp, "zero-target")
+        RUNTIME.strategy_configs(self.system, daily, 20260817, output)
+        trade = RUNTIME.load_json(os.path.join(output, "trade", "config.json"))
+        self.assertEqual(set(daily["ins_params"]), set(trade["ins_params"]))
+        self.assertTrue(all(v["static_position"] == 0 for v in trade["ins_params"].values()))
+
     def test_static_hash_mismatch_is_rejected(self):
         daily = copy.deepcopy(self.daily)
         daily["ins_params"]["000001.SZ"]["static_position"] = 0

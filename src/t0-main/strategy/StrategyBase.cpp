@@ -1291,6 +1291,8 @@ bool StrategyBase::process_sze_recovery_event(
     }
     mSzeCurrentRecoveryEventId = event.event_id;
     if (decoded == sze_md::DecodeStatus::kOrder) {
+        if (mV06Account && !mV06Account->needs_market_data(
+                NormalizeInstrumentId(order.InstrumentID))) return true;
         if (mInsParamsMap.find(NormalizeInstrumentId(order.InstrumentID)) ==
             mInsParamsMap.end()) {
             return true;
@@ -1299,6 +1301,8 @@ bool StrategyBase::process_sze_recovery_event(
                                static_cast<short>(event.source_id),
                                receive_time);
     } else if (decoded == sze_md::DecodeStatus::kExecution) {
+        if (mV06Account && !mV06Account->needs_market_data(
+                NormalizeInstrumentId(trade.InstrumentID))) return true;
         if (mInsParamsMap.find(NormalizeInstrumentId(trade.InstrumentID)) ==
             mInsParamsMap.end()) {
             return true;

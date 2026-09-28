@@ -72,20 +72,33 @@ public:
         if (!healthy_ || instruments_.empty()) return false;
         for (const auto& item : quantities_)
             if (item.second.first != item.second.second) return false;
-        bool has_base = false;
         for (const auto& item : instruments_) {
             const Instrument& p = item.second;
             if (!p.synced || p.base < 0) return false;
             if ((p.base != 0 || p.initial_total != 0) && p.open <= 0) return false;
-            has_base = has_base || p.base > 0;
         }
-        return has_base;
+        return true;
+    }
+    bool needs_market_data(const std::string& code) const {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        const auto it = instruments_.find(code);
+        return it != instruments_.end() &&
+            (!it->second.synced || it->second.base > 0 || it->second.initial_total > 0);
     }
     v06_strategy::DirectionalSkew skew(long long exchange_us,
                                       const v06_strategy::Config& config) {
         std::lock_guard<std::recursive_mutex> lock(mutex);
         if (!ready()) return v06_strategy::DirectionalSkew();
         initial_locked_ = true;
+        bool has_base = false;
+        for (const auto& item : instruments_) has_base = has_base || item.second.base > 0;
+        if (!has_base) {
+            // All instruments are sell-only. No target-capital denominator
+            // exists; volume clamps still enforce actual sellable inventory.
+            v06_strategy::DirectionalSkew neutral;
+            neutral.valid = true;
+            return neutral;
+        }
         const long long boundary = exchange_us / 10000000LL;
         if (boundary != boundary_) {
             v06_strategy::GlobalExposureInput input;

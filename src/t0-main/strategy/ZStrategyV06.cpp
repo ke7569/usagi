@@ -104,6 +104,11 @@ void ZStrategy::on_v06_signal(const MSMarketDataField* md,
 
 int ZStrategy::v06_submit(const v06_strategy::PricingOutput& d, int quantity) {
     const bool buy = d.side == v06_strategy::Side::Buy;
+    if (i_params.static_position == 0) {
+        const long long reserved = v06_reservations_.reservedVolume(v06_strategy::Side::Sell);
+        if (buy || quantity <= 0 || quantity > context.pi - reserved ||
+            quantity > i_params.shortable - reserved) return -1;
+    }
     v06_submitting_ = true;
     const int id = util->insert_limit_order(td_source_, mTradeInstrument, ExchangeID,
         d.order_price, quantity, buy ? LF_CHAR_Buy : LF_CHAR_Sell,

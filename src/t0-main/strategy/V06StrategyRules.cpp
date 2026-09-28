@@ -466,7 +466,7 @@ PricingOutput V06StrategyRules::price(const PricingInput& input) const {
     output.quote_buy_price = quote_buy_price;
     output.quote_sell_price = quote_sell_price;
 
-    if (output.buy_margin > 0.0) {
+    if (input.static_position > 0 && output.buy_margin > 0.0) {
         output.signal = Signal::HitBuy;
         output.side = Side::Buy;
         output.kind = OrderKind::Hit;
@@ -488,7 +488,7 @@ PricingOutput V06StrategyRules::price(const PricingInput& input) const {
                                                input.bid_volume,
                                                config_.lot_size);
         output.timeout_micros = config_.hit_timeout_micros;
-    } else if (quote_buy_price <= quote_buy_theo) {
+    } else if (input.static_position > 0 && quote_buy_price <= quote_buy_theo) {
         output.signal = Signal::QuoteBuy;
         output.side = Side::Buy;
         output.kind = OrderKind::Quote;
@@ -548,6 +548,19 @@ std::int64_t ordinaryAllowedVolume(const PositionClampInput& input,
         !std::isfinite(config.position_limit_factor) ||
         config.position_limit_factor < 0.0) {
         return 0;
+    }
+
+    // Zero target means liquidation only, not zero sell capacity.
+    // Outstanding sells continue to consume capacity until terminal replies.
+    if (input.static_position == 0) {
+        if (input.side != Side::Sell) return 0;
+        const long double reserved = sumNonnegative(input.dirty_sell_hit, input.dirty_sell_quote);
+        const long double remaining = std::min(
+            static_cast<long double>(positiveRequested(input.current_position)),
+            std::max(0.0L, static_cast<long double>(positiveRequested(input.opening_position)) -
+                              positiveRequested(input.short_position)));
+        return floorToLot(clampLongDoubleToInt64(
+            std::min(static_cast<long double>(request), std::max(0.0L, remaining - reserved))), lot);
     }
 
     std::int64_t limit = floorNonnegative(
