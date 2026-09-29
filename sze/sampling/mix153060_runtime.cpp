@@ -214,6 +214,15 @@ public:
                 tick = bids_.begin()->first;
             }
         } else if (event.kind == OrderKind::kSelfBest) {
+            // With no same-side quote there is no executable self-best price.
+            // mdserver retains the order identity for cancellation only.
+            if ((event.buy && bids_.empty()) || (!event.buy && asks_.empty())) {
+                if (event.app_sequence <= 0 || event.volume <= 0 ||
+                    locators_.count(event.app_sequence)) return false;
+                Locator locator; locator.buy = event.buy; locator.tick = 0;
+                locators_[event.app_sequence] = locator;
+                return true;
+            }
             if (event.buy && !bids_.empty()) {
                 tick = bids_.begin()->first;
             } else if (!event.buy && !asks_.empty()) {
@@ -258,7 +267,9 @@ public:
         }
         if (event.buy_order_id <= 0 || event.sell_order_id <= 0 ||
             event.buy_order_id == event.sell_order_id ||
-            !contains(event.buy_order_id) || !contains(event.sell_order_id)) {
+            !contains(event.buy_order_id) || !contains(event.sell_order_id) ||
+            locators_.at(event.buy_order_id).tick == 0 ||
+            locators_.at(event.sell_order_id).tick == 0) {
             return false;
         }
         return remove(event.buy_order_id, event.volume) &&
@@ -383,6 +394,11 @@ private:
             return false;
         }
         const Locator locator = locator_it->second;
+        if (locator.tick == 0) {
+            if (quantity >= 0) return false;
+            locators_.erase(locator_it);
+            return true;
+        }
         if (locator.buy) {
             BuyMap::iterator level_it = bids_.find(locator.tick);
             if (level_it == bids_.end()) {

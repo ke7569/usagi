@@ -18,6 +18,34 @@ void trade(Runtime& r,long long id,long long bid,long long ask,double price,long
     SampleBuffer b;r.on_trade(t,&b);
 }
 int main() {
+    for (bool baseline : {false,true}) for (bool buy : {false,true})
+      for (double raw_price : {0.0,30.84}) {
+        auto config=inputs();config.v06_baseline=baseline;
+        Runtime r(config);
+        order(r,1,!buy,buy?10.02:10,1000);
+        order(r,2,buy,raw_price,500,OrderKind::kSelfBest);
+        assert(r.available());
+        trade(r,3,buy?2:0,buy?0:2,0,500,TradeKind::kCancel);
+        assert(r.available());
+        // The ignored order must not appear as a priced level, even if a
+        // same-side quote subsequently becomes available.
+        order(r,4,buy,buy?9.99:10.03,1000);
+        SampleBuffer out;r.flush(&out);
+        assert(r.available() && out.count==1);
+        assert(out.values[0].bid_price[0]==(buy?9.99:10));
+        assert(out.values[0].ask_price[0]==(buy?10.02:10.03));
+        assert(out.values[0].volume==0);
+        r.reset();
+        order(r,1,!buy,buy?10.02:10,1000);
+        order(r,2,buy,raw_price,500,OrderKind::kSelfBest);
+        assert(r.available()); // reset clears retained cancellation identities
+      }
+    {
+        Runtime r(inputs());order(r,1,false,10.02,1000);
+        order(r,2,true,0,500,OrderKind::kSelfBest);
+        trade(r,3,2,1,10.02,100,TradeKind::kFill);
+        assert(!r.available()); // Cannot silently fill a non-book order.
+    }
     for (bool sell : {true,false}) {
       for (bool baseline : {false,true}) {
         auto config=inputs();config.v06_baseline=baseline;Runtime r(config);
