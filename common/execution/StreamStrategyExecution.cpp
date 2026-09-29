@@ -41,19 +41,37 @@ int ProtectedExecution::submit_limit(short source, const std::string& instrument
 
 int ProtectedExecution::submit_managed(short source, const std::string& instrument,
         const std::string& exchange, double price, int volume, char direction, char offset,
-        oms::OrderType type, long long delay, const std::function<bool()>& caller_gate) {
+        oms::OrderType type, long long delay, const std::function<bool()>& caller_gate,
+        const std::string& signal_id) {
     if (!allowed() || source != source_ || exchange != exchange_ ||
         !instruments_.count(instrument) || !std::isfinite(price) || price <= 0 || volume <= 0)
         return -1;
     const std::shared_ptr<GateState> state = gate_;
     return backend_->submit_managed(source, instrument, exchange, price, volume, direction, offset,
-        type, delay, [state, caller_gate]() { return state->allowed() && (!caller_gate || caller_gate()); });
+        type, delay, [state, caller_gate]() { return state->allowed() && (!caller_gate || caller_gate()); },
+        signal_id);
 }
 
 bool ProtectedExecution::read_position(short source, const std::string& instrument,
         const std::string& exchange, oms::Position* output) const {
     return source == source_ && exchange == exchange_ && instruments_.count(instrument) &&
         backend_->read_position(source, instrument, exchange, output);
+}
+
+bool ProtectedExecution::read_day_fills(short source,const std::string& code,const std::string& market,oms::Quantity* q,oms::Money* amount)const {
+    return source==source_ && market==exchange_ && instruments_.count(code) && backend_->read_day_fills(source,code,market,q,amount);
+}
+bool ProtectedExecution::read_t0_position(short source, const std::string& code,
+                                         const std::string& market, oms::Position* out) const {
+    return source == source_ && market == exchange_ && instruments_.count(code) &&
+        backend_->read_t0_position(source, code, market, out);
+}
+bool ProtectedExecution::has_working_order(const std::string& instrument) const {
+    return instruments_.count(instrument) && backend_->has_working_order(instrument);
+}
+bool ProtectedExecution::read_order(short source, int id, oms::OrderView* out) const {
+    return source == source_ && backend_->read_order(source,id,out) &&
+        instruments_.count(out->command.intent.instrument.code);
 }
 
 int ProtectedExecution::cancel(short source, int request_id) {

@@ -25,9 +25,9 @@ class ConfigError(ValueError):
 STATIC_FIELDS = {
     "Date", "Close", "Amount", "Range", "HistoryAmount", "FreeShare",
     "free_share", "HpUpperPrice", "HpLowerPrice", "HpFeeShare",
-    "HistoryVolatility20d",
+    "HistoryVolatility20d", "listing_date", "is_ipo_first_day",
 }
-POSITION_FIELDS = {"static_position", "last_position"}
+POSITION_FIELDS = {"static_position", "last_position", "external_delta"}
 INSTRUMENT_FIELDS = {"vol_unit", "min_order_size", "max_order_size"}
 SECRET_FIELDS = {
     "password", "trade_password", "agw_password", "login_password",
@@ -407,8 +407,18 @@ def validate(config):
                 date_value(value, symbol + ".Date")
                 if value != daily["trading_day"]:
                     raise ConfigError(symbol + ".Date differs from trading_day")
+            elif key == "listing_date":
+                date_value(value, symbol + ".listing_date")
+                if value > daily["trading_day"]:
+                    raise ConfigError(symbol + ".listing_date is after trading_day")
+            elif key == "is_ipo_first_day":
+                if type(value) is not bool:
+                    raise ConfigError(symbol + ".is_ipo_first_day must be boolean")
             else:
                 number(value, symbol + "." + key, minimum=0)
+        if "listing_date" in values and "is_ipo_first_day" in values and \
+                values["is_ipo_first_day"] != (values["listing_date"] == daily["trading_day"]):
+            raise ConfigError(symbol + " has inconsistent listing date and first-day flag")
         for key in ("Close", "HistoryAmount", "FreeShare", "free_share", "HpUpperPrice", "HpLowerPrice"):
             if key in values and values[key] <= 0:
                 raise ConfigError(symbol + "." + key + " must be positive")
@@ -422,10 +432,17 @@ def validate(config):
                 raise ConfigError(symbol + " has misplaced instrument fields")
             for key, value in obj.items():
                 number(value, symbol + "." + key,
-                       minimum=None if key == "last_position" else 0,
+                       minimum=None if key in ("last_position", "external_delta") else 0,
                        integer=key in POSITION_FIELDS or key == "vol_unit")
                 if key == "vol_unit" and value <= 0:
                     raise ConfigError("vol_unit must be positive")
+        if "external_delta" in positions:
+            delta = positions["external_delta"]
+            bottom = positions.get("static_position", 0)
+            previous = bottom - delta
+            actual = previous + positions.get("last_position", 0)
+            if abs(delta) > 2147483647 or previous < 0 or not 0 <= actual <= 2147483647:
+                raise ConfigError(symbol + " has invalid pre-execution holdings")
         if symbol in config["deployment"]["instrument_cpu"]:
             number(config["deployment"]["instrument_cpu"][symbol], "cpu", minimum=0, integer=True)
     parameters = config["strategy"].get("parameters", {})

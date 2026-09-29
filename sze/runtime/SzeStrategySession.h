@@ -18,6 +18,7 @@ public:
 
     void set_ready(bool account, bool risk, bool execution);
     void begin_stop();
+    void on_timer(std::uint64_t exchange_time_us) { core_.on_timer(exchange_time_us); }
     void on_output(const sze_stream::ProcessedSample& output);
     bool on_order(const LFRtnOrderField& order, int request_id,
                   short source, long received_ns);

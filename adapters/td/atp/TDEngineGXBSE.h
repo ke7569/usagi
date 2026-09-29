@@ -10,6 +10,9 @@
 #include "atp_quant_api.h"
 #include "adapters/td/atp/GxbseDirectApi.h"
 #include "adapters/td/atp/OmsAtpBackend.h"
+#include "adapters/td/atp/AtpOmsRequests.h"
+#include "common/execution/AtpSnapshotCollector.h"
+#include "common/execution/LiveTd.h"
 #include <map>
 
 #include <atomic>
@@ -108,6 +111,13 @@ public:
     int direct_cash_order(const GxbseDirectOrderRequest* request, GxbseDirectOrderResult* result);
     int direct_cancel_order(const GxbseDirectCancelRequest* request, GxbseDirectCancelResult* result);
     std::shared_ptr<oms::Backend> make_oms_backend(int account_index, const oms::Scope& scope);
+    void init_stream(const json& account, const oms::Scope& scope,
+                     const std::set<oms::Instrument>& universe, bool allow_orders);
+    void attach_stream_oms(const std::shared_ptr<oms::Engine>& engine) { stream_oms_ = engine; }
+    std::string stream_status() const;
+    void on_rsp_cash_trade_query(int account_index,
+        const atp::quant_api::ATPRspCashTradeOrderQueryResultMsg& msg,
+        int64_t request_id, const atp::quant_api::ATPRspErrorInfo& error_info, bool is_last);
 
     void on_login(int account_index, const atp::quant_api::ATPCustomerInfo& msg);
     void on_logout(int account_index, const char* desc);
@@ -136,12 +146,11 @@ public:
                                  int64_t request_id,
                                  const atp::quant_api::ATPRspErrorInfo& error_info,
                                  bool is_last);
-    void on_rsp_cash_trade_order_query(
-        int account_index,
-        const atp::quant_api::ATPRspCashTradeOrderQueryResultMsg& msg,
-        int64_t request_id,
-        const atp::quant_api::ATPRspErrorInfo& error_info,
-        bool is_last);
+    void on_rsp_cash_trade_order_query(int account_index,
+                                       const atp::quant_api::ATPRspCashTradeOrderQueryResultMsg& msg,
+                                       int64_t request_id,
+                                       const atp::quant_api::ATPRspErrorInfo& error_info,
+                                       bool is_last);
     void on_rsp_cash_security_info_query(int account_index,
                                          const atp::quant_api::ATPRspCashExtQueryResultSecurityInfoMsg& msg,
                                          int64_t request_id,
@@ -149,6 +158,34 @@ public:
                                          bool is_last);
 
 private:
+    enum StreamOmsQueryKind { OmsFunds, OmsPositions, OmsOrders, OmsTrades };
+    struct StreamOmsQueryRequest {
+        StreamOmsQueryKind kind;
+        std::uint64_t token, index;
+        std::size_t rows;
+        StreamOmsQueryRequest() : kind(OmsFunds), token(0), index(0), rows(0) {}
+    };
+    bool stream_mode_ = false;
+    bool stream_allow_orders_ = false;
+    bool stream_disconnected_ = false;
+    oms::Scope stream_scope_;
+    std::set<oms::Instrument> stream_universe_;
+    std::weak_ptr<oms::Engine> stream_oms_;
+    mutable std::mutex stream_query_mutex_;
+    strategy_runtime::AtpSnapshotCollector oms_collector_;
+    std::map<int64_t, StreamOmsQueryRequest> stream_queries_;
+    bool oms_snapshot_published_ = false;
+    std::string oms_query_error_;
+    oms::Error query_oms_snapshot(int account_index, const oms::Scope&, std::uint64_t token);
+    oms::Error send_oms_query(StreamOmsQueryKind, std::uint64_t token, std::uint64_t index);
+    void finish_oms_query(int64_t request_id, std::uint64_t last_index, bool is_last);
+    void fail_oms_query(const std::string& reason);
+    bool collect_oms_funds(const atp::quant_api::ATPRspCashFundQueryResultMsg&, int64_t,
+                          const atp::quant_api::ATPRspErrorInfo&, bool);
+    bool collect_oms_positions(const atp::quant_api::ATPRspCashShareQueryResultMsg&, int64_t,
+                              const atp::quant_api::ATPRspErrorInfo&, bool);
+    bool collect_oms_orders(const atp::quant_api::ATPRspCashOrderQueryResultMsg&, int64_t,
+                           const atp::quant_api::ATPRspErrorInfo&, bool);
     struct OrderRoute
     {
         oms::Scope oms_scope;
@@ -235,11 +272,21 @@ private:
     std::condition_variable login_cv_;
 
     std::mutex route_mutex_;
+    friend struct AtpSendTest;
     std::map<int, std::weak_ptr<oms::AtpBackend> > oms_backends_;
-    std::map<std::pair<int, long>, OrderRoute> oms_routes_;
-    oms::SendResult send_oms_command(int account_index, const oms::Command& command);
+    // Pointers are protected by route_mutex_; unordered_map rehash preserves
+    // element addresses. Sent routes live in request_to_route_, recovered
+    // routes in clord_to_route_; neither store is pruned while referenced.
+    std::map<std::pair<int, long>, const OrderRoute*> oms_routes_;
+    oms::SendResult send_oms_command(int account_index, const oms::Command& command,
+                                    atp_oms::Requests& requests);
     void publish_oms_order(const OrderRoute& route, const atp::quant_api::ATPRtnCashAuctionOrderMsg& msg);
+    // A sent order owns one full route record keyed by ATP request id.  The
+    // callback indexes below carry only ids; snapshot/reconciliation code
+    // still uses the legacy maps above for routes that have no sent request.
     std::unordered_map<int64_t, OrderRoute> request_to_route_;
+    std::unordered_map<int64_t, int64_t> clord_to_request_;
+    std::map<std::pair<int, long>, int64_t> order_ref_to_request_;
     std::unordered_map<int64_t, OrderRoute> clord_to_route_;
     std::unordered_map<long, int64_t> order_ref_to_clord_;
     std::unordered_map<int64_t, int> limit_price_request_account_;
@@ -314,6 +361,7 @@ private:
     void bind_clord_route(int64_t cl_ord_no, const OrderRoute& route);
     bool lookup_route_by_request_id(int64_t request_id, OrderRoute* route);
     bool lookup_route_by_clord(int64_t cl_ord_no, OrderRoute* route);
+    bool lookup_route_by_order_ref(int account_index, long order_ref, OrderRoute* route);
     bool lookup_clord_by_order_ref(long order_ref, int64_t* cl_ord_no);
 
     void respond_bypass_account(const AccountUnitGXBSE& unit, int request_id);

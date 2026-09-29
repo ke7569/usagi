@@ -2,7 +2,6 @@
 """Loopback ZStrategy intent checks using temporary synthetic model assets."""
 
 import copy
-import csv
 import json
 import os
 import select
@@ -65,15 +64,6 @@ class StrategyStreamCliTests(unittest.TestCase):
         generated = subprocess.run([self.fixture_binary, self.assets], stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, timeout=5)
         self.assertEqual(0, generated.returncode, generated.stderr.decode("utf-8", "replace"))
-        contract = unified_config.load_json(os.path.join(
-            market_cli.ROOT, "sse/model/sse_snapshot_gru_contract.json"))
-        names = contract["auction_factor_names"]
-        self.assertEqual(59, len(names))
-        self.auction_csv = os.path.join(self.assets, "auction59.csv")
-        with open(self.auction_csv, "w", newline="") as stream:
-            writer = csv.writer(stream, lineterminator="\n")
-            writer.writerow(["security_id"] + names)
-            writer.writerow(["600000"] + [0.0] * 59)
 
     def runtime(self):
         return {
@@ -89,7 +79,6 @@ class StrategyStreamCliTests(unittest.TestCase):
             "snapshot_baseline_scaler_path": os.path.join(self.assets, "baseline.json"),
             "snapshot_auction59_model_path": os.path.join(self.assets, "auction59.ssegru"),
             "snapshot_auction59_scaler_path": os.path.join(self.assets, "auction59.json"),
-            "snapshot_auction59_factors_path": self.auction_csv,
             "global_params": {"offset": 0.25, "global_bias_factor": 1.0,
                               "position_limit": 1000.0, "position_base_line": 100000.0},
             "ins_params": {"600000.SH": {
@@ -103,7 +92,13 @@ class StrategyStreamCliTests(unittest.TestCase):
     def live_profile(self):
         config = unified_config.migrate_runtime(self.runtime(), "PAPER-TEST")
         bound = unified_config.bind_environment(config, "live")
-        return prepare.make_profile(bound, strategy_intents=True), bound
+        return self.strategy_profile(bound), bound
+
+    def strategy_profile(self, bound):
+        profile = prepare.make_profile(bound, strategy_intents=True)
+        # This parity fixture exercises repeated decisions and due cancels.
+        profile["strategy_runtime"]["legacy_config"]["sse_single_flight"] = False
+        return profile
 
     def stream_config(self, recording, receive_port):
         return {
@@ -187,7 +182,7 @@ class StrategyStreamCliTests(unittest.TestCase):
 
         replay_bound = unified_config.bind_environment(
             bound, "replay", recording, "t0md-v1", "recorded-receive")
-        replay_profile = prepare.make_profile(replay_bound, strategy_intents=True)
+        replay_profile = self.strategy_profile(replay_bound)
         replay_path = os.path.join(self.directory, "replay-profile.json")
         market_cli.write_json(replay_path, replay_profile)
         replay = self.invoke("replay", recording, replay_path)

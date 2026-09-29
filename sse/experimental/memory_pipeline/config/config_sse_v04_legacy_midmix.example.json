@@ -1,0 +1,50 @@
+{
+  "strategy_name": "sse_hybrid_prediction",
+  "name": "HStrategy",
+  "market": "SH",
+  "instrument_id": ["600000"],
+  "his_amt": [0],
+  "static_position": [0],
+  "last_position": [0],
+  "model_type": "sse_hybrid_native",
+  "model_path": "/opt/sse/experimental/memory_pipeline/models/sse-hybrid-model/models/tick/ssemodl1.bin",
+  "snapshot_baseline_model_path": "/opt/sse/experimental/memory_pipeline/models/sse-hybrid-model/models/snapshot/baseline.ssegru",
+  "snapshot_baseline_scaler_path": "/opt/sse/experimental/memory_pipeline/models/sse-hybrid-model/models/snapshot/baseline.json",
+  "snapshot_auction59_model_path": "/opt/sse/experimental/memory_pipeline/models/sse-hybrid-model/models/snapshot/auction59.ssegru",
+  "snapshot_auction59_scaler_path": "/opt/sse/experimental/memory_pipeline/models/sse-hybrid-model/models/snapshot/auction59.json",
+  "sse_hybrid_routing_path": "/opt/sse/experimental/memory_pipeline/models/sse-hybrid-model/config/sse_hybrid_routing.json",
+  "sse_factor_contract": "v0.4-sse-cob-batch-end-100us",
+  "sse_inference_backend": "native-cpp",
+  "runtime_mode": "prediction-only",
+  "md_source_index": [89],
+  "td_source_index": [],
+  "sh_orderbook_mode": "full-orderbook",
+  "prediction_only": true,
+  "trading_enabled": false,
+  "production_approval": false,
+  "sse_live_sampling": {
+    "mode": "trailing-edge-one-shot",
+    "threshold_ns": 100000,
+    "comparison": "strict-greater-than",
+    "clock": "CLOCK_MONOTONIC",
+    "candidate_event": "CompleteOrderBookSH Level2",
+    "activity_scope": "normalized-sse-book-update",
+    "sequence_gap_policy": "fail-closed",
+    "periodic_md": false,
+    "shutdown_flush": false
+  },
+  "model_routing": {
+    "clock": "exchange-time-of-day-micros",
+    "snapshot_selected_window": "[09:30:00,09:35:00)",
+    "tick_selected_window": "[09:35:00,24:00:00)",
+    "tick_warm_before_switch": true,
+    "silent_fallback": false
+  },
+  "feed_health": {
+    "require_sequence_healthy": true,
+    "sample_on_gap": false,
+    "resume_after_explicit_resync": true
+  },
+  "global_params": {"offset": 1.2, "quote_offset": 5, "bias_factor": 1, "position_limit": 0.3, "position_base_line": 100000},
+  "runtime_note": "Prediction only. Connect the target-host SSE decoder and frozen factor adapter before use. Do not reuse SZE factors or enable TD."
+}

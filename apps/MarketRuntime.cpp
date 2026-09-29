@@ -1,6 +1,9 @@
 #include "common/contracts/MarketRuntimeApi.h"
 #include "common/config/StreamInputConfig.h"
 #include "apps/StreamProcessingCli.h"
+#ifdef T0_STREAM_SSE
+#include "sse/runtime/sse_cpu_affinity.h"
+#endif
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -127,8 +130,28 @@ private:
     }
 
     void run() {
+#ifdef T0_STREAM_SSE
+        // Keep the lease until receive, dispatch and recording workers have
+        // joined. Replay has no concurrent capture workers and needs no lease.
+        sse_cpu::Lease cpu_lease;
+        Json cpu_affinity = Json::array();
+#endif
         try {
             if (stopped_.load()) throw std::runtime_error("runtime stopped during startup");
+#ifdef T0_STREAM_SSE
+            if (action_ == "capture") {
+                if (!cpu_lease.acquire({options_.receive_cpu, options_.dispatch_cpu,
+                                       options_.writer_cpu}, &error_))
+                    throw std::runtime_error(error_);
+                const std::vector<sse_cpu::Cpu>& cpus = cpu_lease.cpus();
+                options_.receive_cpu = cpus[0].id;
+                options_.dispatch_cpu = cpus[1].id;
+                options_.writer_cpu = cpus[2].id;
+                const char* roles[] = {"receive", "dispatch", "writer"};
+                for (std::size_t i = 0; i < cpus.size(); ++i)
+                    cpu_affinity.push_back({{"role", roles[i]}, {"cpu", cpus[i].id}, {"l3", cpus[i].l3}});
+            }
+#endif
             if (action_ == "recovery-journal" || action_ == "recovery-handoff") {
                 succeeded_ = application_->run_recovery();
                 if (!succeeded_) error_ = application_->recovery_error();
@@ -158,6 +181,9 @@ private:
             out["state"] = !succeeded_ ? "failed" : stopped_.load() ? "stopped" : "completed";
             out["ready"] = false;
             out["stop_requested"] = stopped_.load();
+#ifdef T0_STREAM_SSE
+            out["cpu_affinity"] = cpu_affinity;
+#endif
             out["processing"] = application_->summary();
             out["datagrams"] = datagrams_; out["idle_events"] = idles_; out["payload_bytes"] = payload_bytes_;
             const deepwin_market_data::StreamStats& stats = stream_.stats();

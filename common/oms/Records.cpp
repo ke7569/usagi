@@ -86,7 +86,12 @@ std::string intent(Time time, const Command& c) {
     w.instrument(c.intent.instrument); w.u(static_cast<unsigned char>(c.intent.side), 1);
     w.u(static_cast<unsigned char>(c.intent.type), 1); w.signed_value(c.intent.price); w.signed_value(c.intent.quantity);
     w.signed_value(c.intent.cancel_delay_ns); w.u(static_cast<unsigned char>(c.intent.cancel_clock), 1);
-    w.text(c.broker_id); w.signed_value(c.time_ns); w.u(c.cancel, 1); return std::move(w.bytes);
+    w.text(c.broker_id); w.signed_value(c.time_ns); w.u(c.cancel, 1);
+    // Optional tail preserves readability of existing version-2 journals.
+    if (c.intent.external_quantity) {
+        w.signed_value(c.intent.external_quantity); w.signed_value(c.intent.external_delta);
+    }
+    return std::move(w.bytes);
 }
 std::string send(Time time, OrderId id, const SendResult& r, bool cancel) {
     Writer w(cancel ? Kind::CancelSend : Kind::Send, time);
@@ -128,7 +133,11 @@ Json decode(const std::string& payload) {
         i["owner"] = r.text(); i["intent_id"] = r.text(); i["signal_id"] = r.text(); i["instrument"] = r.instrument();
         i["side"] = r.enumeration(1); i["type"] = r.enumeration(2); i["price"] = r.signed_value();
         i["quantity"] = r.signed_value(); i["cancel_delay_ns"] = r.signed_value(); i["cancel_clock"] = r.enumeration(1);
-        data["broker_id"] = r.text(); data["time_ns"] = r.signed_value(); data["cancel"] = r.boolean(); break;
+        data["broker_id"] = r.text(); data["time_ns"] = r.signed_value(); data["cancel"] = r.boolean();
+        if (!r.done()) {
+            i["external_quantity"] = r.signed_value(); i["external_delta"] = r.signed_value();
+        }
+        break;
     }
     case Kind::Send: case Kind::CancelSend:
         type = kind == Kind::Send ? "send" : "cancel-send";
@@ -162,7 +171,7 @@ std::string format(const std::string& payload) {
     for (const char* key : {"id", "broker_id", "disposition", "state", "cumulative", "trade_id", "trade_quantity"})
         if (data.count(key) && data.at(key) != "") brief[key] = data.at(key);
     const Json& order = data.count("intent") && data.at("intent").is_object() ? data.at("intent") : data;
-    for (const char* key : {"instrument", "side", "price", "quantity"})
+    for (const char* key : {"instrument", "side", "price", "quantity", "external_quantity", "external_delta"})
         if (order.count(key)) brief[key] = order.at(key);
     if (row.at("type") == "intent") {
         brief["owner"] = order.at("owner"); brief["intent_id"] = order.at("intent_id");

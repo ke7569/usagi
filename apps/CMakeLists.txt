@@ -4,7 +4,7 @@ target_link_libraries(t0_md_stream PRIVATE deepwin_market_data_runtime)
 if(T0_BUILD_SSE_STREAM_PROCESSOR)
   add_executable(sse_udp_observer
     ${USAGI_ROOT}/tools/sse/sse_udp_observer.cpp)
-  target_link_libraries(sse_udp_observer PRIVATE deepwin_market_data_runtime)
+  target_link_libraries(sse_udp_observer PRIVATE deepwin_market_data_runtime sse_runtime_support)
   
   add_executable(sse_model_sequence_probe
     ${USAGI_ROOT}/tools/model/sse_model_sequence_probe.cpp)

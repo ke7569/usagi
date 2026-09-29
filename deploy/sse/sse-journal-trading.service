@@ -1,0 +1,25 @@
+[Unit]
+Description=SSE journal prediction, strategy and ATP TD
+After=sse-journal-capture.service
+Requisite=sse-journal-capture.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/zane/usagi-sse-dev
+Environment=TZ=Asia/Shanghai
+Environment=OMP_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=SSE_SHM_READER_CPU=129
+CPUAffinity=129 136 137 40 144 145 152 153 160 161 168 169 176 177 184 185 192 193 200 201 208 209 216 217 224 225 232 233 240 241 248 249
+Environment=SSE_ENABLE_LIVE_ORDER=NO
+ExecStart=/usr/bin/python2 /home/zane/usagi-sse-dev/tools/sse/run_journal_trading.py --live-config /home/zane/usagi-runtime/journal_trading.live.json
+Restart=on-failure
+RestartSec=30
+StartLimitInterval=300
+StartLimitBurst=3
+RestartPreventExitStatus=65
+TimeoutStopSec=60
+KillSignal=SIGTERM
+KillMode=control-group
+UMask=0077

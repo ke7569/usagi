@@ -5,6 +5,8 @@
 
 #include <cstdint>
 #include <map>
+#include <boost/container/flat_map.hpp>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -75,7 +77,37 @@ public:
     bool snapshot(Level* bids, Level* asks, std::size_t depth) const;
     bool full_depth(char side, std::uint64_t now_micros,
                     std::vector<Level>* levels) const;
+    // Visits every live price level in the same best-to-worst order as
+    // full_depth(), without materializing a temporary vector. The visitor is
+    // called synchronously and may retain no reference to the level argument.
+    template <typename Visitor>
+    bool for_each_full_depth(char side, std::uint64_t now_micros,
+                             Visitor visitor) const {
+        if (side != 'B' && side != 'S') return false;
+        refresh_young(now_micros);
+        const LevelMap& side_levels = levels(side);
+        std::size_t index = 0;
+        if (side == 'B') {
+            for (LevelMap::const_reverse_iterator it = side_levels.rbegin();
+                 it != side_levels.rend(); ++it, ++index) {
+                visitor(Level{static_cast<std::int64_t>(it->first),
+                              it->second.quantity, it->second.order_count,
+                              it->second.add_time_sum_micros,
+                              it->second.young_quantity}, index);
+            }
+        } else {
+            for (LevelMap::const_iterator it = side_levels.begin();
+                 it != side_levels.end(); ++it, ++index) {
+                visitor(Level{static_cast<std::int64_t>(it->first),
+                              it->second.quantity, it->second.order_count,
+                              it->second.add_time_sum_micros,
+                              it->second.young_quantity}, index);
+            }
+        }
+        return true;
+    }
     FlowStats take_flow_window();
+    void take_flow_window(FlowStats& out);
     const std::string& security_id() const { return security_id_; }
     const FlowStats& flow() const { return flow_; }
     std::uint64_t last_tick_index() const { return last_tick_index_; }
@@ -86,8 +118,30 @@ public:
     double last_trade_price() const { return last_trade_price_; }
 
 private:
-    typedef std::map<std::uint32_t, std::uint64_t> QuantityMap;
-    typedef std::map<std::uint32_t, std::uint64_t> CountMap;
+    struct LevelAggregate {
+        std::uint64_t quantity;
+        std::uint64_t order_count;
+        std::uint64_t add_time_sum_micros;
+        mutable std::uint64_t young_quantity;
+        LevelAggregate()
+            : quantity(0), order_count(0), add_time_sum_micros(0),
+              young_quantity(0) {}
+    };
+    typedef boost::container::flat_map<std::uint32_t, LevelAggregate> LevelMap;
+
+    struct LiveOrderKey {
+        std::uint64_t add_time_micros;
+        std::uint64_t order_no;
+    };
+    struct LiveOrderKeyLess {
+        bool operator()(const LiveOrderKey& left,
+                        const LiveOrderKey& right) const {
+            if (left.add_time_micros != right.add_time_micros)
+                return left.add_time_micros < right.add_time_micros;
+            return left.order_no < right.order_no;
+        }
+    };
+    typedef std::set<LiveOrderKey, LiveOrderKeyLess> LiveOrderSet;
 
     bool add_order(std::uint64_t order_no, std::uint32_t price_raw,
                    std::uint64_t quantity, char side, std::uint64_t tick,
@@ -96,19 +150,27 @@ private:
                       std::uint32_t event_price_raw);
     bool trade_order(std::uint64_t order_no, std::uint64_t quantity,
                      std::uint64_t* applied);
-    void add_level(std::uint32_t price, std::uint64_t quantity, char side);
-    void remove_level(std::uint32_t price, std::uint64_t quantity, char side);
-    QuantityMap& quantities(char side);
-    const QuantityMap& quantities(char side) const;
-    CountMap& counts(char side);
-    const CountMap& counts(char side) const;
+    void remove_order_quantity(const Order& order, std::uint64_t quantity,
+                               bool remove_order);
+    LevelMap& levels(char side);
+    const LevelMap& levels(char side) const;
+    void refresh_young(std::uint64_t now_micros) const;
+    void rebuild_young(std::uint64_t now_micros) const;
+    static bool is_young(std::uint64_t now_micros,
+                         std::uint64_t add_time_micros);
+    static bool is_expired(std::uint64_t now_micros,
+                           std::uint64_t add_time_micros);
 
     std::string security_id_;
     std::unordered_map<std::uint64_t, Order> orders_;
-    QuantityMap bid_qty_;
-    QuantityMap ask_qty_;
-    CountMap bid_count_;
-    CountMap ask_count_;
+    LevelMap bid_levels_;
+    LevelMap ask_levels_;
+    // Unlike a lazy priority queue, this index removes a key when its order
+    // is canceled or filled, so stale entries cannot grow without a bound.
+    LiveOrderSet live_order_times_;
+    mutable LiveOrderSet young_orders_;
+    mutable bool young_cache_initialized_;
+    mutable std::uint64_t young_cache_time_micros_;
     FlowStats flow_;
     std::uint64_t last_tick_index_;
     bool has_tick_index_;

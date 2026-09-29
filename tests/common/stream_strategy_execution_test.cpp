@@ -134,6 +134,40 @@ void test_invalid_route_and_paper_no_fills() {
     f.engine->advance_to(1001000000LL);
     require(f.commands.size() == command_count, "duplicate advance no cancel");
 }
+
+void test_signal_identity_belongs_to_each_order() {
+    Fixture f;
+    std::shared_ptr<strategy_runtime::OmsStrategyExecution> backend(
+        new strategy_runtime::OmsStrategyExecution(f.engine, "stream"));
+    strategy_runtime::ProtectedExecution protection(backend, []() { return true; },
+        190, "SSE", {"600000"});
+    protection.set_ready(true, true, true);
+
+    std::string first = "600000:first", second = "600000:second";
+    const int first_id = protection.submit_managed(190, "600000", "SSE", 10.25, 100, '0', '0',
+        oms::OrderType::Limit, 0, std::function<bool()>(), first);
+    const int second_id = protection.submit_managed(190, "600000", "SSE", 10.25, 100, '0', '0',
+        oms::OrderType::Limit, 0, std::function<bool()>(), second);
+    first.clear(); second.clear();
+    const int without_signal = protection.submit_limit(190, "600000", "SSE", 10.25, 100, '0', '0');
+    require(first_id > 0 && second_id > first_id && without_signal > second_id,
+            "independent signal orders accepted");
+    require(f.commands.size() == 3 &&
+            f.commands[0].intent.signal_id == "600000:first" &&
+            f.commands[1].intent.signal_id == "600000:second" &&
+            f.commands[2].intent.signal_id.empty(),
+            "orders own their signal identity; absent identity never inherits the previous order");
+    oms::OrderView stored;
+    require(f.engine->order(first_id, &stored) && stored.command.intent.signal_id == "600000:first",
+            "OMS retains signal identity after caller storage changes");
+
+    bool rejected = false;
+    try {
+        protection.submit_managed(190, "600000", "SSE", 10.25, 100, '0', '0',
+            oms::OrderType::Limit, 0, std::function<bool()>(), std::string(129, 'x'));
+    } catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected && f.commands.size() == 3, "oversized signal identity never reaches backend");
+}
 }
 int main() {
     try {
@@ -141,6 +175,7 @@ int main() {
         test_real_readiness_route_and_owned_id();
         test_health_stop_and_clocked_cancel();
         test_invalid_route_and_paper_no_fills();
+        test_signal_identity_belongs_to_each_order();
         std::cout << "stream_strategy_execution_test: PASS\n";
         return 0;
     } catch (const std::exception& error) {

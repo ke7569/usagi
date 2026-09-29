@@ -132,6 +132,13 @@ struct Config {
     std::string lock_directory;
     bool single_host_account = true;
     bool enabled = false;
+    // When true, a fresh start/recovery that restores working orders first
+    // cancels every restored open order and keeps the account not ready until
+    // those cancels are terminal (restart-cancel-then-trade, OMS-3).
+    bool restart_cancel_open_orders = false;
+    // False: reserve order IDs durably at startup, reconcile on restart,
+    // and enqueue individual order records without waiting for disk sync.
+    bool durable_order_intents = true;
     std::map<Instrument, InstrumentRules> instruments;
     Limits limits;
 };
@@ -145,6 +152,9 @@ struct Intent {
     OrderType type = OrderType::Limit;
     Money price = 0;
     Quantity quantity = 0;
+    // Fills first satisfy quantity - external_quantity (T0), then execution.
+    Quantity external_quantity = 0;
+    Quantity external_delta = 0;
     Time cancel_delay_ns = 0;
     CancelClock cancel_clock = CancelClock::Submission;
 };
@@ -193,6 +203,11 @@ struct Position {
     Quantity working_sell = 0;
     Quantity bought = 0;
     Quantity sold = 0;
+    Quantity external_bought = 0;
+    Quantity external_sold = 0;
+    Quantity external_working_buy = 0;
+    Quantity external_working_sell = 0;
+    Quantity external_target = 0;
 };
 
 struct OrderView {
@@ -206,6 +221,9 @@ struct OrderView {
     Quantity priced_quantity = 0;
     Money known_amount = 0;
     Money known_fees = 0;
+    Quantity t0_priced_quantity = 0;
+    Money t0_known_amount = 0;
+    Money t0_known_fees = 0;
     Money cash_reserved = 0;
     bool quantity_complete = true;
     bool amount_complete = false;

@@ -12,23 +12,29 @@ class OmsStrategyExecution : public StrategyExecution {
 public:
     OmsStrategyExecution(const std::shared_ptr<oms::Engine>& engine, const std::string& owner);
     bool managed() const override { return true; }
-    void signal_context(const std::string& signal_id) override;
     bool permits_new_orders() const override;
     long long now_ns() const override;
     bool owns_request(short source, int id, const std::string& instrument) const override;
     bool read_position(short, const std::string&, const std::string&, oms::Position*) const override;
+    bool read_order(short, int, oms::OrderView*) const override;
+    bool read_day_fills(short, const std::string&, const std::string&, oms::Quantity*, oms::Money*) const override;
+    bool read_t0_day_fills(short, const std::string&, const std::string&, oms::Quantity*, oms::Money*) const override;
+    bool read_execution_orders(short, const std::string&, const std::string&, std::vector<oms::OrderView>*) const override;
+    bool has_working_order(const std::string& instrument) const override;
     int submit_limit(short, const std::string&, const std::string&, double, int, char, char) override;
     int submit_managed(short, const std::string&, const std::string&, double, int, char, char,
-                       oms::OrderType, long long, const std::function<bool()>&) override;
+                       oms::OrderType, long long, const std::function<bool()>&,
+                       const std::string& signal_id = std::string()) override;
     int cancel(short source, int id) override;
+    int submit_allocated(short, const std::string&, const std::string&, double, int, char, char,
+        oms::OrderType, long long, const std::function<bool()>&, const std::string&, int, int) override;
     bool schedule_cancel(short source, int id, int delay_ms) override;
     std::shared_ptr<oms::Engine> engine() const { return engine_; }
 private:
     std::shared_ptr<oms::Engine> engine_;
     std::string owner_;
+    const short source_; // Account source is immutable across connection epochs.
     std::atomic<std::uint64_t> sequence_;
-    mutable std::mutex signal_mutex_;
-    std::string signal_id_;
 };
 
 }  // namespace strategy_runtime

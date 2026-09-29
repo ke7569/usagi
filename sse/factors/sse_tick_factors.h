@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <vector>
+#include <memory>
 
 namespace sse_tick {
 
@@ -36,6 +37,8 @@ const char* tick_factor_name(std::size_t index);
 class FactorState {
 public:
     FactorState();
+    void prepare_book(OrderBook&,std::uint64_t);
+    void set_v06(bool enabled) { v06_ = enabled; }
     void reset();
     void set_free_share(double value);
     void set_static_metadata(const DailyStaticMetadata& metadata);
@@ -63,8 +66,16 @@ public:
                     double snapshot_last_price = 0.0,
                     double snapshot_volume = -1.0,
                     double snapshot_turnover = -1.0);
+    // Use the same immutable ten-level cut already taken by the sample gate.
+    FactorRow build(OrderBook& book, std::uint64_t now_micros,
+                    const Level (&bids)[10], const Level (&asks)[10],
+                    double snapshot_last_price = 0.0,
+                    double snapshot_volume = -1.0,
+                    double snapshot_turnover = -1.0);
 
 private:
+    struct Prepared;std::shared_ptr<Prepared> prepared_;
+    bool v06_;
     struct BookPoint {
         double mid;
         double spread;
@@ -84,10 +95,9 @@ private:
     bool have_free_share_;
     DailyStaticMetadata static_metadata_;
     bool have_static_metadata_;
-    // Reused between samples to avoid allocating two full-depth vectors on
-    // every batch-end factor build.
-    std::vector<Level> full_bids_;
-    std::vector<Level> full_asks_;
+    // Reused between samples so consuming a flow window does not allocate a
+    // fresh event vector at every batch end.
+    FlowStats flow_window_;
 };
 
 }  // namespace sse_tick

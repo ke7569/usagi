@@ -2,9 +2,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace sse_tick {
 namespace {
+
+static const std::uint64_t kYoungWindowMicros = 30000000ULL;
 
 char sse_side_for_order(const sse_live::TickEvent& event) {
     // EFH tick_merge m_side_flag: 0=buy, 1=sell for A/D. T uses both
@@ -34,44 +37,108 @@ ApplyResult::ApplyResult()
       sequence_healthy(true), reason("uninitialized") {}
 
 OrderBook::OrderBook(const std::string& security_id)
-    : security_id_(security_id), orders_(), bid_qty_(), ask_qty_(), bid_count_(),
-      ask_count_(), flow_(), last_tick_index_(0), has_tick_index_(false),
-      total_trade_qty_(0), total_trade_turnover_(0.0), last_trade_price_(0.0) {
+    : security_id_(security_id), orders_(), bid_levels_(), ask_levels_(),
+      live_order_times_(), young_orders_(), young_cache_initialized_(false),
+      young_cache_time_micros_(0), flow_(), last_tick_index_(0),
+      has_tick_index_(false), total_trade_qty_(0), total_trade_turnover_(0.0),
+      last_trade_price_(0.0) {
     flow_.events.reserve(256);
 }
 
-OrderBook::QuantityMap& OrderBook::quantities(char side) {
-    return side == 'B' ? bid_qty_ : ask_qty_;
+OrderBook::LevelMap& OrderBook::levels(char side) {
+    return side == 'B' ? bid_levels_ : ask_levels_;
 }
 
-const OrderBook::QuantityMap& OrderBook::quantities(char side) const {
-    return side == 'B' ? bid_qty_ : ask_qty_;
+const OrderBook::LevelMap& OrderBook::levels(char side) const {
+    return side == 'B' ? bid_levels_ : ask_levels_;
 }
 
-OrderBook::CountMap& OrderBook::counts(char side) {
-    return side == 'B' ? bid_count_ : ask_count_;
+bool OrderBook::is_young(std::uint64_t now_micros,
+                         std::uint64_t add_time_micros) {
+    return now_micros >= add_time_micros &&
+           now_micros - add_time_micros <= kYoungWindowMicros;
 }
 
-const OrderBook::CountMap& OrderBook::counts(char side) const {
-    return side == 'B' ? bid_count_ : ask_count_;
+bool OrderBook::is_expired(std::uint64_t now_micros,
+                           std::uint64_t add_time_micros) {
+    // The 30-second boundary remains young. An order expires only once its
+    // age is strictly greater than the configured window.
+    return now_micros > kYoungWindowMicros &&
+           add_time_micros < now_micros - kYoungWindowMicros;
 }
 
-void OrderBook::add_level(std::uint32_t price, std::uint64_t quantity,
-                          char side) {
-    quantities(side)[price] += quantity;
-    counts(side)[price] += 1;
-}
-
-void OrderBook::remove_level(std::uint32_t price, std::uint64_t quantity,
-                             char side) {
-    QuantityMap& q = quantities(side);
-    QuantityMap::iterator qi = q.find(price);
-    if (qi != q.end()) {
-        qi->second = qi->second > quantity ? qi->second - quantity : 0;
-        if (qi->second == 0) q.erase(qi);
+void OrderBook::refresh_young(std::uint64_t now_micros) const {
+    if (!young_cache_initialized_) {
+        rebuild_young(now_micros);
+        return;
     }
-    // The caller removes the order from orders_ separately. Count is adjusted
-    // there, so partial fills/cancels do not accidentally drop a level count.
+    if (now_micros < young_cache_time_micros_) {
+        // A replay/query clock can move backwards. Rebuild from the exact live
+        // order-time index so the now >= add_time half of the contract remains
+        // true without walking the unordered order table.
+        rebuild_young(now_micros);
+        return;
+    }
+    if (now_micros == young_cache_time_micros_) return;
+
+    LiveOrderSet::const_iterator it = live_order_times_.upper_bound(
+        LiveOrderKey{young_cache_time_micros_,
+                     std::numeric_limits<std::uint64_t>::max()});
+    for (; it != live_order_times_.end(); ++it) {
+        if (it->add_time_micros > now_micros) break;
+        if (!is_young(now_micros, it->add_time_micros)) continue;
+        const std::unordered_map<std::uint64_t, Order>::const_iterator oi =
+            orders_.find(it->order_no);
+        if (oi == orders_.end()) continue;
+        const LevelMap& side_levels = levels(oi->second.side);
+        LevelMap::const_iterator li = side_levels.find(oi->second.price_raw);
+        if (li == side_levels.end()) continue;
+        li->second.young_quantity += oi->second.remaining_qty;
+        young_orders_.insert(*it);
+    }
+
+    while (!young_orders_.empty() &&
+           is_expired(now_micros, young_orders_.begin()->add_time_micros)) {
+        const LiveOrderKey key = *young_orders_.begin();
+        const std::unordered_map<std::uint64_t, Order>::const_iterator oi =
+            orders_.find(key.order_no);
+        if (oi != orders_.end()) {
+            const LevelMap& side_levels = levels(oi->second.side);
+            LevelMap::const_iterator li = side_levels.find(oi->second.price_raw);
+            if (li != side_levels.end()) {
+                li->second.young_quantity =
+                    li->second.young_quantity > oi->second.remaining_qty
+                        ? li->second.young_quantity - oi->second.remaining_qty
+                        : 0ULL;
+            }
+        }
+        young_orders_.erase(young_orders_.begin());
+    }
+    young_cache_time_micros_ = now_micros;
+}
+
+void OrderBook::rebuild_young(std::uint64_t now_micros) const {
+    for (LevelMap::const_iterator it = bid_levels_.begin();
+         it != bid_levels_.end(); ++it)
+        it->second.young_quantity = 0;
+    for (LevelMap::const_iterator it = ask_levels_.begin();
+         it != ask_levels_.end(); ++it)
+        it->second.young_quantity = 0;
+    young_orders_.clear();
+    for (LiveOrderSet::const_iterator it = live_order_times_.begin();
+         it != live_order_times_.end(); ++it) {
+        if (!is_young(now_micros, it->add_time_micros)) continue;
+        const std::unordered_map<std::uint64_t, Order>::const_iterator oi =
+            orders_.find(it->order_no);
+        if (oi == orders_.end()) continue;
+        const LevelMap& side_levels = levels(oi->second.side);
+        LevelMap::const_iterator li = side_levels.find(oi->second.price_raw);
+        if (li == side_levels.end()) continue;
+        li->second.young_quantity += oi->second.remaining_qty;
+        young_orders_.insert(*it);
+    }
+    young_cache_time_micros_ = now_micros;
+    young_cache_initialized_ = true;
 }
 
 bool OrderBook::add_order(std::uint64_t order_no, std::uint32_t price,
@@ -81,7 +148,20 @@ bool OrderBook::add_order(std::uint64_t order_no, std::uint32_t price,
     if (orders_.find(order_no) != orders_.end()) return false;
     Order order = {order_no, price, quantity, side, tick, time_micros};
     orders_[order_no] = order;
-    add_level(price, quantity, side);
+    LevelAggregate& level = levels(side)[price];
+    level.quantity += quantity;
+    level.order_count += 1;
+    level.add_time_sum_micros += time_micros;
+    const LiveOrderKey key = {time_micros, order_no};
+    live_order_times_.insert(key);
+    if (!young_cache_initialized_) {
+        young_cache_initialized_ = true;
+        young_cache_time_micros_ = time_micros;
+    }
+    if (is_young(young_cache_time_micros_, time_micros)) {
+        level.young_quantity += quantity;
+        young_orders_.insert(key);
+    }
     if (side == 'B') flow_.buy_add_qty += quantity;
     else flow_.sell_add_qty += quantity;
     flow_.events.push_back(FlowEvent{'A', side, order_no, 0, price, quantity});
@@ -96,19 +176,19 @@ bool OrderBook::delete_order(std::uint64_t order_no,
     const Order order = it->second;
     const std::uint64_t quantity = quantity_hint == 0 ? order.remaining_qty
                                   : std::min(quantity_hint, order.remaining_qty);
-    remove_level(order.price_raw, quantity, order.side);
+    const bool remove_order = quantity >= order.remaining_qty;
+    remove_order_quantity(order, quantity, remove_order);
     if (order.side == 'B') flow_.buy_cancel_qty += quantity;
     else flow_.sell_cancel_qty += quantity;
     flow_.events.push_back(FlowEvent{'D', order.side, order_no, 0,
                                      order.price_raw ? order.price_raw : event_price_raw,
                                      quantity});
-    if (quantity >= order.remaining_qty) {
-        CountMap& c = counts(order.side);
-        CountMap::iterator ci = c.find(order.price_raw);
-        if (ci != c.end()) {
-            if (ci->second > 1) --ci->second;
-            else c.erase(ci);
-        }
+    if (remove_order) {
+        const LiveOrderKey key = {order.add_time_micros, order.order_no};
+        live_order_times_.erase(key);
+        if (young_cache_initialized_ &&
+            is_young(young_cache_time_micros_, order.add_time_micros))
+            young_orders_.erase(key);
         orders_.erase(it);
     } else {
         it->second.remaining_qty -= quantity;
@@ -122,17 +202,17 @@ bool OrderBook::trade_order(std::uint64_t order_no, std::uint64_t quantity,
     if (it == orders_.end()) return false;
     const Order order = it->second;
     const std::uint64_t used = std::min(quantity, order.remaining_qty);
-    remove_level(order.price_raw, used, order.side);
+    const bool remove_order = used >= order.remaining_qty;
+    remove_order_quantity(order, used, remove_order);
     if (order.side == 'B') flow_.buy_trade_qty += used;
     else flow_.sell_trade_qty += used;
     if (applied) *applied = used;
-    if (used >= order.remaining_qty) {
-        CountMap& c = counts(order.side);
-        CountMap::iterator ci = c.find(order.price_raw);
-        if (ci != c.end()) {
-            if (ci->second > 1) --ci->second;
-            else c.erase(ci);
-        }
+    if (remove_order) {
+        const LiveOrderKey key = {order.add_time_micros, order.order_no};
+        live_order_times_.erase(key);
+        if (young_cache_initialized_ &&
+            is_young(young_cache_time_micros_, order.add_time_micros))
+            young_orders_.erase(key);
         orders_.erase(it);
     } else {
         it->second.remaining_qty -= used;
@@ -140,8 +220,47 @@ bool OrderBook::trade_order(std::uint64_t order_no, std::uint64_t quantity,
     return used != 0;
 }
 
+void OrderBook::remove_order_quantity(const Order& order,
+                                      std::uint64_t quantity,
+                                      bool remove_order) {
+    LevelMap& side_levels = levels(order.side);
+    LevelMap::iterator li = side_levels.find(order.price_raw);
+    if (li != side_levels.end()) {
+        LevelAggregate& level = li->second;
+        level.quantity = level.quantity > quantity ? level.quantity - quantity : 0ULL;
+        // The active-young set is maintained as the exact live-order predicate
+        // at young_cache_time_micros_. Avoid a tree lookup on every fill/cancel.
+        const bool young = young_cache_initialized_ &&
+                           is_young(young_cache_time_micros_, order.add_time_micros);
+        if (young) {
+            level.young_quantity = level.young_quantity > quantity
+                ? level.young_quantity - quantity : 0ULL;
+        }
+        if (remove_order) {
+            if (level.order_count > 0) --level.order_count;
+            level.add_time_sum_micros =
+                level.add_time_sum_micros > order.add_time_micros
+                    ? level.add_time_sum_micros - order.add_time_micros : 0ULL;
+            if (level.order_count == 0 || level.quantity == 0)
+                side_levels.erase(li);
+        }
+    }
+}
+
 FlowStats OrderBook::take_flow_window() {
     FlowStats out;
+    take_flow_window(out);
+    // Keep the legacy return-by-value caller's bounded warm buffer. The
+    // reusable-output overload below owns the high-water recycling path.
+    flow_.events.reserve(256);
+    return out;
+}
+
+void OrderBook::take_flow_window(FlowStats& out) {
+    // Recycle the caller's previous output vector before swapping. This keeps
+    // the capacity on the OrderBook side for the next sampling window while
+    // preserving the event order and ownership boundary of the old API.
+    out.clear_window();
     out.buy_add_qty = flow_.buy_add_qty;
     out.sell_add_qty = flow_.sell_add_qty;
     out.buy_cancel_qty = flow_.buy_cancel_qty;
@@ -154,8 +273,6 @@ FlowStats OrderBook::take_flow_window() {
     out.trade_turnover = flow_.trade_turnover;
     out.events.swap(flow_.events);
     flow_.clear_window();
-    flow_.events.reserve(256);
-    return out;
 }
 
 ApplyResult OrderBook::apply(const sse_live::TickEvent& event) {
@@ -231,18 +348,16 @@ bool OrderBook::snapshot(Level* bids, Level* asks, std::size_t depth) const {
         asks[i] = Level{0, 0, 0, 0, 0};
     }
     std::size_t bi = 0;
-    for (QuantityMap::const_reverse_iterator it = bid_qty_.rbegin();
-         it != bid_qty_.rend() && bi < depth; ++it, ++bi) {
-        const CountMap::const_iterator ci = bid_count_.find(it->first);
-        bids[bi] = Level{static_cast<std::int64_t>(it->first), it->second,
-                         ci == bid_count_.end() ? 0 : ci->second, 0, 0};
+    for (LevelMap::const_reverse_iterator it = bid_levels_.rbegin();
+         it != bid_levels_.rend() && bi < depth; ++it, ++bi) {
+        bids[bi] = Level{static_cast<std::int64_t>(it->first),
+                         it->second.quantity, it->second.order_count, 0, 0};
     }
     std::size_t ai = 0;
-    for (QuantityMap::const_iterator it = ask_qty_.begin();
-         it != ask_qty_.end() && ai < depth; ++it, ++ai) {
-        const CountMap::const_iterator ci = ask_count_.find(it->first);
-        asks[ai] = Level{static_cast<std::int64_t>(it->first), it->second,
-                         ci == ask_count_.end() ? 0 : ci->second, 0, 0};
+    for (LevelMap::const_iterator it = ask_levels_.begin();
+         it != ask_levels_.end() && ai < depth; ++it, ++ai) {
+        asks[ai] = Level{static_cast<std::int64_t>(it->first),
+                         it->second.quantity, it->second.order_count, 0, 0};
     }
     return true;
 }
@@ -250,43 +365,27 @@ bool OrderBook::snapshot(Level* bids, Level* asks, std::size_t depth) const {
 bool OrderBook::full_depth(char side, std::uint64_t now_micros,
                            std::vector<Level>* levels) const {
     if (!levels || (side != 'B' && side != 'S')) return false;
+    refresh_young(now_micros);
     levels->clear();
-    const QuantityMap& q = quantities(side);
-    const CountMap& c = counts(side);
-    levels->reserve(q.size());
+    const LevelMap& side_levels = this->levels(side);
+    levels->reserve(side_levels.size());
     const bool buy = side == 'B';
-    std::map<std::uint32_t, std::size_t> level_index;
     if (buy) {
-        for (QuantityMap::const_reverse_iterator it = q.rbegin(); it != q.rend(); ++it) {
-            const CountMap::const_iterator ci = c.find(it->first);
-            Level value{static_cast<std::int64_t>(it->first), it->second,
-                        ci == c.end() ? 0 : ci->second, 0, 0};
-            level_index[it->first] = levels->size();
-            levels->push_back(value);
+        for (LevelMap::const_reverse_iterator it = side_levels.rbegin();
+             it != side_levels.rend(); ++it) {
+            levels->push_back(Level{
+                static_cast<std::int64_t>(it->first), it->second.quantity,
+                it->second.order_count, it->second.add_time_sum_micros,
+                it->second.young_quantity});
         }
     } else {
-        for (QuantityMap::const_iterator it = q.begin(); it != q.end(); ++it) {
-            const CountMap::const_iterator ci = c.find(it->first);
-            Level value{static_cast<std::int64_t>(it->first), it->second,
-                        ci == c.end() ? 0 : ci->second, 0, 0};
-            level_index[it->first] = levels->size();
-            levels->push_back(value);
+        for (LevelMap::const_iterator it = side_levels.begin();
+             it != side_levels.end(); ++it) {
+            levels->push_back(Level{
+                static_cast<std::int64_t>(it->first), it->second.quantity,
+                it->second.order_count, it->second.add_time_sum_micros,
+                it->second.young_quantity});
         }
-    }
-    // Aggregate order ages once per order. The old implementation nested this
-    // walk under every price level, which made a full-day replay quadratic in
-    // the number of resting levels and orders.
-    for (std::unordered_map<std::uint64_t, Order>::const_iterator oi = orders_.begin();
-         oi != orders_.end(); ++oi) {
-        if (oi->second.side != side) continue;
-        std::map<std::uint32_t, std::size_t>::const_iterator li =
-            level_index.find(oi->second.price_raw);
-        if (li == level_index.end()) continue;
-        Level& level = (*levels)[li->second];
-        level.add_time_sum_micros += oi->second.add_time_micros;
-        if (now_micros >= oi->second.add_time_micros &&
-            now_micros - oi->second.add_time_micros <= 30000000ULL)
-            level.young_quantity += oi->second.remaining_qty;
     }
     return true;
 }

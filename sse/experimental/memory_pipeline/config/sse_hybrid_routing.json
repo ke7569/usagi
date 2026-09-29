@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "policy_id": "sse-opening-snapshot-to-tick-v1",
+  "status": "candidate_requires_independent_validation",
+  "production_approval": false,
+  "exchange": "sse",
+  "timezone": "Asia/Shanghai",
+  "clock": "exchange_time_of_day_micros",
+  "snapshot_selected_window": "[09:30:00.000000,09:35:00.000000)",
+  "tick_selected_window": "[09:35:00.000000,24:00:00.000000)",
+  "snapshot_and_tick_generation": "both_model_families_are_generated_on_their_own_accepted_event_streams",
+  "switch_time": "09:35:00.000000",
+  "models": {
+    "snapshot": {
+      "profile": "hermespro-sse-opening-gru-auction59-ensemble-v1-20260817",
+      "input_contract": "snapshot36 plus auction59-v1.1.0",
+      "selected_window": "[09:30:00,09:35:00)"
+    },
+    "tick": {
+      "profile": "v04-legacy-midmix-sse",
+      "input_contract": "v0.4-sse-cob-batch-end-100us",
+      "selected_window": "[09:35:00,24:00:00)"
+    }
+  },
+  "failure_policy": {
+    "selected_model_invalid": "reject_output",
+    "non_selected_model_invalid": "record_generation_failure_without_fallback",
+    "unknown_exchange": "hard_error",
+    "outside_selected_windows": "reject_output",
+    "silent_fallback": false
+  }
+}

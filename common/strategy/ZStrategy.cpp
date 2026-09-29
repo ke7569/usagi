@@ -287,7 +287,7 @@ void ZStrategy::on_order_reject(int request_id, const RT_Order& order) {
     }
 }
 
-int ZStrategy::insertOrder(RT_Order order) {
+int ZStrategy::insertOrder(RT_Order order, const std::string& signal_id) {
     if (!routing_enabled_) {
         Z_LOG_ERROR("[SZEOrderBlocked] InstrumentID=" << mTradeInstrument
             << ", reason=routing_disabled");
@@ -346,7 +346,7 @@ int ZStrategy::insertOrder(RT_Order order) {
             return -1;
         }
         request_id = execution_->submit_limit_then_cancel(td_source_, mTradeInstrument,
-            ExchangeID, order.Price, static_cast<int>(order.Volume), direction, offsetFlag, 1001);
+            ExchangeID, order.Price, static_cast<int>(order.Volume), direction, offsetFlag, 1001, signal_id);
         refresh_position();
         if (request_id < 0) {
             on_order_reject(request_id, order);
@@ -356,7 +356,7 @@ int ZStrategy::insertOrder(RT_Order order) {
     return request_id;
 }
 
-void ZStrategy::maybe_send_test_order() {
+void ZStrategy::maybe_send_test_order(const std::string& signal_id) {
     if (!test_order_.enabled || test_order_sent_ || virtual_routing_ ||
         !routing_enabled_ || context.curr_ob == nullptr) {
         return;
@@ -382,7 +382,7 @@ void ZStrategy::maybe_send_test_order() {
     order.Volume = volume;
     order.Direction = test_order_.direction;
     order.Type = FAK;
-    const int request_id = insertOrder(order);
+    const int request_id = insertOrder(order, signal_id);
     Z_LOG_INFO("[SZTestOrder] submitted instrument=" << mTradeInstrument
         << " side=" << (order.Direction == BUY ? "buy" : "sell")
         << " price=" << order.Price << " volume=" << order.Volume
@@ -503,20 +503,20 @@ void ZStrategy::calcTheo(double prediction) {
 }
 
 
-void ZStrategy::handleT0() {
+void ZStrategy::handleT0(const std::string& signal_id) {
     cancelBuy();
     cancelSell();
     const long long now = execution_ ? execution_->now_ns() : 0;
     if (context.CanBuy() && can_send_order(BUY, now)) {
-        hitBuy();
+        hitBuy(signal_id);
     }
 
     if (context.CanSell() && can_send_order(SELL, now)) {
-        hitSell();
+        hitSell(signal_id);
     }
 }
 
-void ZStrategy::hitBuy() {
+void ZStrategy::hitBuy(const std::string& signal_id) {
     int32_t hit_buy_qty = 0;
     auto cur_ob = &(context.last_ob);
     (void)cur_ob;
@@ -542,7 +542,7 @@ void ZStrategy::hitBuy() {
         order.Price = context.curr_ob->AskPrice1;
         order.Direction = BUY;
         order.Type=FAK;
-        int request_id = insertOrder(order);
+        int request_id = insertOrder(order, signal_id);
         double cur_position = getCurPosition();
         Z_LOG_INFO("[HitBuy] InstrumentID: " << mTradeInstrument
             << ", Prediction: " << current_prediction_
@@ -567,7 +567,7 @@ void ZStrategy::hitBuy() {
 }
 
 
-void ZStrategy::hitSell() {
+void ZStrategy::hitSell(const std::string& signal_id) {
     std::int32_t hit_sell_qty = 0;
     auto cur_ob = &(context.last_ob);
     (void)cur_ob;
@@ -594,7 +594,7 @@ void ZStrategy::hitSell() {
         order.Direction = SELL;
         order.Type=FAK;
 
-        int request_id = insertOrder(order);
+        int request_id = insertOrder(order, signal_id);
         double cur_position = getCurPosition();
         Z_LOG_INFO("[HitSell] InstrumentID: " << mTradeInstrument
             << ", Prediction: " << current_prediction_
@@ -663,8 +663,8 @@ void ZStrategy::on_signal(const MSMarketDataField * market_data, double signal, 
 
     context.curr_ob = market_data;
     ++startup_signal_count_;
-    if (execution_) execution_->signal_context(mTradeInstrument + ":" +
-        std::to_string(startup_signal_count_) + ":" + std::to_string(rcv_time));
+    const std::string signal_id = mTradeInstrument + ":" +
+        std::to_string(startup_signal_count_) + ":" + std::to_string(rcv_time);
     const bool startup_warmup_active = sze_position_risk::StartupWarmupActive(
         startup_signal_count_, startup_warmup_signal_count_);
     if (startup_warmup_active) {
@@ -679,16 +679,16 @@ void ZStrategy::on_signal(const MSMarketDataField * market_data, double signal, 
     }
     if (test_order_.enabled &&
         startup_signal_count_ >= startup_warmup_signal_count_ + test_order_.trigger_after_signals) {
-        maybe_send_test_order();
+        maybe_send_test_order(signal_id);
     }
     calcTheo(signal);
-    handleT0();
+    handleT0(signal_id);
     context.last_ob = market_data;
 }
 
 bool ZStrategy::refresh_position() {
     oms::Position position;
-    if (!execution_ || !execution_->read_position(td_source_, mTradeInstrument, ExchangeID, &position)) return false;
+    if (!execution_ || !execution_->read_t0_position(td_source_, mTradeInstrument, ExchangeID, &position)) return false;
     const long long maximum = std::numeric_limits<int32_t>::max();
     if (position.total < 0 || position.total > maximum || position.sellable < 0 || position.sellable > maximum ||
         position.working_buy < 0 || position.working_buy > maximum || position.working_sell < 0 ||

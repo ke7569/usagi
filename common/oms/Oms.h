@@ -30,8 +30,15 @@ public:
     void drain();
 
     bool owns(const std::string& owner, OrderId id, const Instrument& instrument) const;
+    bool has_working_order(const Instrument& instrument) const;
     bool position(const Instrument& instrument, Position* output) const;
     bool order(OrderId id, OrderView* output) const;
+    bool day_fills(const Instrument&, Quantity* quantity, Money* net_amount) const;
+    bool t0_day_fills(const Instrument&, Quantity*, Money*) const;
+    std::vector<OrderView> execution_orders(const std::string& owner, const Instrument&) const;
+    // Hot-path queries avoid constructing the diagnostic account snapshot.
+    bool ready() const;
+    Time now_ns() const;
     AccountView account() const;
     std::vector<AuditEvent> audit_events() const;
 

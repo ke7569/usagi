@@ -1,0 +1,17 @@
+{
+  "market": "SH",
+  "trading_day": 20260907,
+  "shard_count": 8,
+  "journal_directory": "/home/zane/data/sse_events_20260907",
+  "journal_segment_bytes": 1073741824,
+  "journal_min_free_bytes": 85899345920,
+  "ingress_capacity": 8192,
+  "shard_capacity": 65536,
+  "journal_capacity": 65536,
+  "pending_snapshot_capacity": 262144,
+  "duration_ms": 0,
+  "channels": [
+    {"name": "huarun_fpga20", "group": "238.127.1.1", "port": 12020, "interface_ip": "11.11.11.11"},
+    {"name": "kayuan_fpga20", "group": "238.125.1.1", "port": 12002, "interface_ip": "12.12.12.12"}
+  ]
+}

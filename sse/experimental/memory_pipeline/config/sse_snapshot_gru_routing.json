@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "policy_id": "sse-opening-gru-auction59-ensemble-v1",
+  "status": "candidate_requires_independent_validation",
+  "production_approval": false,
+  "exchange": "sse",
+  "timezone": "Asia/Shanghai",
+  "clock": "exchange_time_of_day_micros",
+  "valid_start_inclusive": "09:30:00.000000",
+  "valid_end_exclusive": "09:35:00.000000",
+  "prediction_unit": "permille",
+  "formula": "ensemble_pred = baseline_weight * baseline_pred + auction59_weight * auction59_pred",
+  "arithmetic": {
+    "input_dtype": "float32",
+    "accumulator_dtype": "float64",
+    "output_dtype": "float32",
+    "rounding": "IEEE-754 round-to-nearest when casting the final value to float32"
+  },
+  "routes": [
+    {"start_inclusive": "09:30:00.000000", "end_exclusive": "09:31:00.000000", "baseline_weight": 0.25, "auction59_weight": 0.75},
+    {"start_inclusive": "09:31:00.000000", "end_exclusive": "09:34:00.000000", "baseline_weight": 0.50, "auction59_weight": 0.50},
+    {"start_inclusive": "09:34:00.000000", "end_exclusive": "09:35:00.000000", "baseline_weight": 0.75, "auction59_weight": 0.25}
+  ],
+  "failure_policy": {
+    "missing_model_prediction": "reject_output",
+    "invalid_model_prediction": "reject_output",
+    "key_mismatch": "hard_error",
+    "outside_valid_time_window": "reject_output",
+    "unknown_exchange": "hard_error",
+    "silent_single_model_fallback": false
+  }
+}

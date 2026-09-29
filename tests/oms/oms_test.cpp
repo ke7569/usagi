@@ -1,4 +1,5 @@
 #include "common/oms/Oms.h"
+#include "common/oms/OrderLatency.h"
 
 #include <atomic>
 #include <chrono>
@@ -89,6 +90,11 @@ struct Fixture {
         sse_position.total = 10000;
         sse_position.free_sellable = 10000;
         snapshot.positions.push_back(sse_position);
+        for (const auto& entry : config.instruments) {
+            if (entry.first == kSse || entry.first == kSze) continue;
+            SnapshotPosition extra; extra.instrument = entry.first;
+            snapshot.positions.push_back(extra);
+        }
         backend->publish(snapshot);
         require(engine->account().ready, "account ready");
     }
@@ -563,10 +569,77 @@ void test_durable_intent_override_waits_for_wal() {
             "durable watermark never exceeds accepted journal records");
 }
 
+void test_star_quantity_boundary() {
+    const Instrument star={"SSE","688327"};
+    const auto configure=[&](Config& c) { c.instruments[star]=Fixture::rules(); };
+    for(Quantity quantity : {100,199,200,201,250,100000,100001}) {
+        Fixture f(configure);
+        const auto result=f.submit(f.intent("star","buy",star,Side::Buy,quantity));
+        require(result.accepted==(quantity>=200 && quantity<=100000),"STAR buy minimum, single share increment, maximum");
+    }
+    for(Quantity sellable : {100,199,200,201}) {
+        for(Quantity quantity : {99,100,199,200,201}) {
+            Fixture f(configure);
+            require(f.engine->begin_reconcile(2,false),"STAR reconcile");
+            Snapshot snap;snap.scope=f.engine->scope();snap.token=2;snap.free_cash=1000000000000LL;
+            snap.account_success=snap.positions_success=snap.orders_success=snap.trades_success=true;
+            snap.all_day_orders=snap.all_day_trades=true;
+            SnapshotPosition p;p.instrument=star;p.total=p.free_sellable=sellable;snap.positions.push_back(p);
+            for(const auto& instrument : {kSse,kSze}) {
+                SnapshotPosition empty;empty.instrument=instrument;snap.positions.push_back(empty);
+            }
+            f.backend->publish(snap);
+            const auto result=f.submit(f.intent("star","sell",star,Side::Sell,quantity));
+            require(result.accepted==(quantity<=sellable && (quantity>=200 || quantity==sellable)),"STAR full odd remainder only");
+        }
+    }
+}
+
+void test_signal_send_latency() {
+    for(int outcome=0;outcome<3;++outcome) {
+        Fixture f;
+        f.backend->submit_hook=[outcome](const Command&) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            if(outcome==2)throw std::runtime_error("test unknown send");
+            SendResult r;r.disposition=outcome==0?SendDisposition::Submitted:SendDisposition::NotSent;return r;
+        };
+        const auto now=order_latency::now_ns();
+        order_latency::Timing timing;timing.receive=now-3000000;timing.signal=now-2000000;timing.strategy=now-1000000;
+        Intent intent=f.intent("latency-test","latency",kSse,Side::Buy,200);
+        intent.signal_id=order_latency::identity(kSse.code,outcome+1,timing);
+        order_latency::Timing parsed;
+        require(intent.signal_id.size()<=128 && order_latency::parse(intent.signal_id,&parsed),"timing identity fits and roundtrips");
+        require(parsed.receive==timing.receive && parsed.signal==timing.signal && parsed.strategy==timing.strategy,"exact timing transport");
+        const auto result=f.submit(intent);
+        require(result.accepted==(outcome!=1),"latency logging preserves submitted, not-sent and unknown outcomes");
+    }
+}
+
+void test_day_fill_recovery_totals() {
+    Fixture f;f.backend->submit_hook=[](const Command&){SendResult r;r.disposition=SendDisposition::Submitted;return r;};
+    Quantity q=0;Money amount=0;
+    require(f.engine->day_fills(kSse,&q,&amount)&&q==0&&amount==0,"empty recovery fills");
+    auto buy=f.submit(f.intent("owner","recover-buy",kSse,Side::Buy,100));require(buy.accepted,"recovery buy admitted");
+    require(f.engine->report(f.order_report(buy.id,kSse,Side::Buy,OrderState::Filled,100,0)),"recovery cumulative");
+    require(!f.engine->day_fills(kSse,&q,&amount),"unpriced recovery must stay closed");
+    auto bt=f.trade_report(buy.id,kSse,Side::Buy,"recover-trade-buy",100,100);
+    require(f.engine->report(bt),"recovery priced buy");
+    require(f.engine->day_fills(kSse,&q,&amount)&&q==100&&amount==10000000,"buy recovery totals");
+    f.engine->report(bt);
+    require(f.engine->day_fills(kSse,&q,&amount)&&q==100&&amount==10000000,"recovery trade dedup");
+    auto sell=f.submit(f.intent("owner","recover-sell",kSse,Side::Sell,100));require(sell.accepted,"recovery sell admitted");
+    require(f.engine->report(f.trade_report(sell.id,kSse,Side::Sell,"recover-trade-sell",100,100)),"recovery sell fill");
+    require(f.engine->day_fills(kSse,&q,&amount)&&q==200&&amount==0,"signed recovery totals");
+    require(!f.engine->day_fills(Instrument{"SSE","999999"},&q,&amount),"unknown recovery instrument");
+}
+
 }  // namespace
 
 int main() {
     try {
+        test_day_fill_recovery_totals();
+        test_star_quantity_boundary();
+        test_signal_send_latency();
         test_shared_budget_and_two_clients();
         test_duplicate_owner_and_intent();
         test_cumulative_regression();

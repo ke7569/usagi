@@ -18,7 +18,11 @@ set(GUOXIN_API_DIR "${CMAKE_CURRENT_SOURCE_DIR}/api" CACHE PATH "ATP SDK root co
 include_directories(${USAGI_ROOT} ${DEEPWIN_INCLUDE_DIR} ${DEEPWIN_BOOST_INCLUDE_DIR} ${DEEPWIN_PYTHON_INCLUDE_DIR} ${GUOXIN_API_DIR}/include)
 link_directories(${DEEPWIN_WC_LIB_DIR} ${DEEPWIN_YJJ_LIB_DIR} ${DEEPWIN_BOOST_LIB_DIR} ${GUOXIN_API_DIR}/lib)
 
-SET(GUOXIN_TD_SOURCE_FILES TDEngineGXBSE.cpp TDEngineGXBSE.h ${USAGI_ROOT}/common/oms/Types.cpp)
+SET(GUOXIN_TD_SOURCE_FILES TDEngineGXBSE.cpp TDEngineGXBSEOms.cpp TDEngineGXBSE.h
+    ${USAGI_ROOT}/common/oms/Types.cpp
+    ${USAGI_ROOT}/common/oms/Journal.cpp ${USAGI_ROOT}/common/oms/Records.cpp
+    ${USAGI_ROOT}/common/oms/AsyncJournal.cpp ${USAGI_ROOT}/common/oms/Backend.cpp
+    ${USAGI_ROOT}/common/oms/Oms.cpp ${USAGI_ROOT}/common/execution/AccountReconciliation.cpp)
 
 function(add_guoxin_td_engine target output_name source_id engine_key default_market_id)
     ADD_LIBRARY(${target} SHARED ${GUOXIN_TD_SOURCE_FILES})

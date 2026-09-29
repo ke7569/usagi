@@ -8,11 +8,13 @@
 #include "sse/market_data/sse_tick_order_book.h"
 #include "sse/factors/snapshot36.h"
 #include "sse/model/sse_hybrid_model.h"
+#include "sse/auction/auction59_session.h"
 #include "common/stream/MarketDataStream.h"
 
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -70,17 +72,29 @@ struct SnapshotOutput {
     SnapshotOutput();
 };
 
-enum OutputKind { kTickOutput = 1, kSnapshotOutput = 2 };
+struct BatchEndOutput {
+    std::uint64_t batch_id;
+    std::uint64_t last_hardware_ns;
+    std::uint64_t emitted_monotonic_ns;
+    std::uint32_t packet_count;
+    std::uint32_t candidate_count;
+    std::uint32_t prediction_count;
+
+    BatchEndOutput();
+};
+
+enum OutputKind { kTickOutput = 1, kSnapshotOutput = 2, kBatchEndOutput = 3 };
 
 struct Output {
     OutputKind kind;
     TickOutput tick;
     SnapshotOutput snapshot;
+    BatchEndOutput batch_end;
 
     Output();
 };
 
-typedef std::function<void(const Output&)> OutputCallback;
+typedef std::function<void(Output&&)> OutputCallback;
 typedef std::function<bool(const std::string&, std::uint64_t,
                            std::vector<float>*, std::string*)> Auction59Provider;
 
@@ -92,7 +106,10 @@ public:
                        const sse_hybrid_model::Model* model,
                        bool factors_only,
                        const OutputCallback& callback,
-                       const Auction59Provider& auction59_provider = Auction59Provider());
+                       const Auction59Provider& auction59_provider = Auction59Provider(),
+                       const sse_auction59::StaticMetadataMap& auction_metadata =
+                           sse_auction59::StaticMetadataMap(),
+                       bool auction_enabled = true);
 
     // Processes one live or replay event. Invalid input is sticky: this method
     // throws std::runtime_error and every subsequent call throws the same error.
@@ -100,11 +117,27 @@ public:
 
     bool invalid() const { return invalid_; }
     const std::string& invalid_reason() const { return invalid_reason_; }
+    // Recheck at strategy dispatch too: a previously selected batch output
+    // can predate a later snapshot that invalidates the same stock's daily.
+    bool instrument_static_valid(const std::string& code) const;
 
 private:
+    // The owner dispatcher alone validates channel sequence and determines
+    // batch boundaries; workers use the same book/sampling/model methods.
+    friend class SseParallelProcessor;
+    bool delegated_sequence_;
+    bool defer_model_=false;
+    std::function<void(const sse_live::TickEvent&, const deepwin_market_data::StreamEvent&, std::size_t)> route_tick_;
+    std::function<void(const sse_live::RawTickEvent&, const deepwin_market_data::StreamEvent&, std::size_t, std::uint64_t)> route_raw_tick_;
+    std::function<void(const deepwin_market_data::StreamEvent&, std::uint64_t)> route_packet_;
+    std::function<void(const unsigned char*, const deepwin_market_data::StreamEvent&, std::size_t)> route_raw_snapshot_;
+    std::function<void(const sse_live::Snapshot&, const deepwin_market_data::StreamEvent&, std::size_t)> route_snapshot_;
+    std::function<void(std::uint32_t, const sse_live_sampling::BatchEnd&)> route_close_;
     struct InstrumentState {
         InstrumentState(const std::string& code,
-                        const sse_tick::DailyStaticMetadata& metadata);
+                        const sse_tick::DailyStaticMetadata& metadata,
+                        const sse_auction59::StaticMetadata& auction_metadata,
+                        bool ipo_known);
         sse_tick::OrderBook book;
         sse_tick::FactorState factors;
         sse_live_sampling::TickSampleGate sample_gate;
@@ -115,16 +148,39 @@ private:
         sse_live::TickEvent pending_tick;
         Provenance pending_provenance;
         bool have_pending_tick;
+        std::shared_ptr<sse_auction59::Session> auction;
+        bool auction_decided;
+        bool snapshot_model_enabled;
+        bool auction_failure_logged;
+        bool static_failure_logged;
     };
 
     struct ChannelSequence {
         std::uint64_t last_tick;
+        std::uint64_t last_provider;
+        deepwin_market_data::StreamEvent last_event;
+        std::size_t last_offset;
         bool have_tick;
         ChannelSequence() : last_tick(0ULL), have_tick(false) {}
     };
 
+    struct HardwareBatchState {
+        bool open;
+        bool have_hardware_timestamp;
+        std::uint64_t batch_id;
+        std::uint64_t last_hardware_ns;
+        std::uint64_t last_hardware_monotonic_ns;
+        std::uint32_t packet_count;
+        std::map<std::string, sse_live_sampling::Candidate> candidates;
+        HardwareBatchState()
+            : open(false), have_hardware_timestamp(false), batch_id(0ULL),
+              last_hardware_ns(0ULL),
+              last_hardware_monotonic_ns(0ULL), packet_count(0U), candidates() {}
+    };
+
     typedef std::map<std::string, InstrumentState> StateMap;
     typedef std::map<std::uint32_t, ChannelSequence> SequenceMap;
+    typedef std::map<std::uint32_t, HardwareBatchState> HardwareBatchMap;
 
     void fail(const std::string& reason);
     void on_datagram(const deepwin_market_data::StreamEvent& event);
@@ -136,26 +192,48 @@ private:
                           const deepwin_market_data::StreamEvent& event,
                           std::size_t record_offset);
     void process_closed_batch(const sse_live_sampling::BatchEnd& batch);
+    void advance_hardware_batch(const deepwin_market_data::StreamEvent& event);
+    void close_hardware_batch(std::uint32_t channel_id,
+                              std::uint64_t emitted_monotonic_ns,
+                              sse_live_sampling::BatchCloseReason reason);
+    void commit_hardware_candidate(std::uint32_t channel_id,
+                                   const sse_live_sampling::Candidate& candidate);
     sse_live_sampling::TickCut book_cut(const InstrumentState& state,
                                       const sse_live::TickEvent& tick) const;
+    sse_live_sampling::TickCut book_cut(const InstrumentState& state,
+                                      const sse_live::TickEvent& tick,
+                                      const sse_tick::Level* bid,
+                                      const sse_tick::Level* ask) const;
     void initialize_window(InstrumentState& state, const sse_live::TickEvent& tick);
     Provenance provenance(const deepwin_market_data::StreamEvent& event,
                           std::uint32_t wire_channel,
                           std::uint64_t wire_sequence,
                           std::size_t record_offset) const;
     InstrumentState* state_for(const std::string& code);
-    bool valid_tick_sequence(const sse_live::TickEvent& tick);
+    bool valid_tick_sequence(const sse_live::TickEvent& tick,
+                             const deepwin_market_data::StreamEvent& event,
+                             std::size_t record_offset);
+    bool valid_tick_sequence(std::uint32_t channel, std::uint64_t wire,
+                             std::uint64_t provider,
+                             const deepwin_market_data::StreamEvent& event,
+                             std::size_t record_offset);
+    void select_snapshot_mode(const std::string& code, InstrumentState& state);
+    void report_auction_state(const std::string& code, InstrumentState& state);
     static bool valid_auction59(const std::vector<float>& factors);
 
     StateMap states_;
     SequenceMap channel_sequences_;
     sse_live_sampling::BatchEndSampler batch_sampler_;
     std::vector<sse_live_sampling::BatchEnd> closed_batches_;
+    bool hardware_batch_mode_;
+    std::uint64_t next_hardware_batch_id_;
+    HardwareBatchMap hardware_batches_;
     const sse_hybrid_model::Model* model_;
     bool factors_only_;
     OutputCallback callback_;
     Auction59Provider auction59_provider_;
     std::map<std::string, std::vector<float> > auction59_inputs_;
+    std::uint64_t auction_arrival_index_;
     bool invalid_;
     std::string invalid_reason_;
 };

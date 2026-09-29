@@ -1,10 +1,23 @@
-# SSE Per-Instrument Sampling
+# SSE Sampling
 
-The current stream contract is `sse-per-instrument-v2`, implementing the
-user-confirmed sampling rules of 2026-09-06 in `sse_batch_end_sampler.*` and
-`sse_stream_processor.*`. Each configured stock owns its quiet deadline and
-sampling window. The model's `v0.4-sse-cob-batch-end-100us` factor ABI label
-remains unchanged; it does not select a legacy sampling implementation.
+## Shanghai Hardware Batch Mode
+
+When the Shanghai stream carries NIC hardware receive timestamps, the live
+processor uses a global packet batch boundary: adjacent UDP packets remain in
+one batch while their PHC timestamps differ by less than 5,000 ns. A difference
+greater than or equal to 5,000 ns closes the previous batch. The processor
+updates all books first, builds the eligible factors and predictions at that
+boundary, then emits a `kBatchEndOutput` marker. The Shanghai strategy buffers
+timestamped outputs and submits signals only when that marker arrives. This is
+the low-latency production path; it avoids treating `recvmmsg()` syscall
+boundaries as market batch boundaries. Old software-only/replay streams retain
+the compatibility sampler described below because they do not contain PHC
+timestamps.
+
+The Shanghai production path is the hardware-gap batch mode described above.
+The existing `BatchEndSampler` rules below remain as the software-only
+compatibility path for old v1/replay inputs without PHC timestamps. The model's
+`v0.4-sse-cob-batch-end-100us` factor ABI label remains unchanged.
 
 ## Serialized Event Processing
 

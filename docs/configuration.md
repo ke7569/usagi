@@ -30,6 +30,26 @@ OMS 意图模式要求显式的统一配置 `trading.oms`，legacy 对应顶层 
 
 以上仅为测试预算示例，不是实盘资金。两字段使用人民币，非负且精确到万分之一元；不接受未知键、布尔值、非有限值或超过 `1e12` 元。缺少预算时生成器拒绝 `--strategy-intents`，不推断无限资金。旧三字段 `strategy_runtime` profile 需要重新生成，新 profile 还携带 `oms`。账户所有权、资金口径和 ATP 限制见 [OMS 契约](contracts/oms.md)。
 
+## 当日调仓
+
+沪深共用 `common/execution/ExternalExecutionController`。legacy 每股 `ins_params` 可增加
+`external_delta`，统一配置对应 `account.positions.<symbol>.external_delta`；省略字段保持原行为。
+正数为买入股数，负数为卖出股数，`static_position` 必须已经是调仓后的目标底仓：
+
+```json
+{
+  "000001.SZ": {"static_position": 100, "last_position": 0, "external_delta": 100},
+  "000002.SZ": {"static_position": 100, "last_position": 0, "external_delta": -100}
+}
+```
+
+上述配置对应调仓前持仓 0、200 股。`last_position` 仍表示 T0 的隔夜偏移；Paper 初始持仓为
+`static_position + last_position - external_delta`，实盘持仓以账户查询为准。
+字段必须为整数，买卖数量和部分成交后的余量由 OMS 按所属板块的报单规则校验。
+同一交易日的调仓目标不可变；重启须保留同一配置和账户 journal。
+
+执行规则、成交分配及分钟检查见[策略执行契约](contracts/strategy-execution.md#当日调仓执行)。
+
 ## 市场差异
 
 深市继续使用既有 daily/system 生成流程，恢复输入和十档映射保持原语义。沪市保留 Snapshot/Tick 选择、同 ExTime 去重及市场路由规则。共享配置结构不抹平这些差异；模型架构、权重和 feature contract 也必须分别锁定。

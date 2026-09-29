@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "package_id": "hermespro-sse-opening-gru-auction59-ensemble-v1-20260817",
+  "status": "candidate_requires_independent_validation",
+  "production_approval": false,
+  "exchange": "sse",
+  "architecture": "legacy-residual-gru",
+  "snapshot_contract_id": "snapshot36",
+  "auction_contract_id": "auction59-v1.1.0",
+  "target_horizon": "15s",
+  "target_unit": "permille",
+  "valid_window": "[09:30:00,09:35:00)",
+  "models": {
+    "baseline": {"feature_count": 36, "artifact": "baseline.ssegru", "scaler": "baseline.json"},
+    "auction59": {"feature_count": 95, "artifact": "auction59.ssegru", "scaler": "auction59.json"}
+  },
+  "baseline_feature_names": [
+    "Hermes", "HermesRtn", "MidRtn", "AtpReverse", "AskVolumeCR", "BidVolumeCR",
+    "SqrtPositive", "PricePrLv1", "PricePrLv2", "VolumePrLv1", "VolumePrLv2",
+    "WgtAskSkew", "WgtBidSkew", "AskOrderMove", "BidOrderMove", "PercentSpread",
+    "PercentWeightedRtn1", "PercentWeightedRtn2", "PercentWeightedRtn3",
+    "PercentWeightedRtn4", "PercentWeightedRtn5", "PercentWeightedAsk",
+    "PercentWeightedBid", "PercentWeightedAskRtn", "PercentWeightedBidRtn",
+    "WeightedVolumeDifferenceRatio", "VolumeDifferenceRatio", "PercentTurnover",
+    "PercentLiquidityAsk", "PercentLiquidityBid", "AskVolumeShiftLv1",
+    "AskVolumeShiftLv2", "AskVolumeShiftLv3", "BidVolumeShiftLv1",
+    "BidVolumeShiftLv2", "BidVolumeShiftLv3"
+  ],
+  "auction_factor_names": [
+    "FNL_GAP", "PRC_RET_LATE", "PRC_RET_LAST60", "PRC_SLOPE_LATE", "PRC_SLOPE_LAST60",
+    "PRC_R2_LATE", "PRC_EFF_LATE", "PRC_RANGE_FULL", "PRC_RV_LATE", "PRC_MDD_FULL",
+    "PRC_END_POSITION_FULL", "CNV_MAE_LATE", "CNV_WITHIN_1_LATE", "CNV_SETTLE_1",
+    "CNV_CROSS_COUNT", "FNL_MATCH_AMT", "FNL_IMB", "FNL_ACTIVE_MATCH_RATE",
+    "MAT_GROWTH_LATE", "MAT_LAST60_CHANGE", "ANK_IMB_MEAN_LATE", "ANK_IMB_SLOPE_LATE",
+    "ANK_IMB_SHOCK60", "ORD_Q_IMB_FULL", "ORD_Q_IMB_LATE", "ORD_Q_IMB_LAST60",
+    "ORD_NET_ACCEL", "AGR_MARKETABLE_IMB_LATE", "AGR_MARKETABLE_IMB_LAST60",
+    "AGR_MEAN_BUY_LATE", "AGR_MEAN_SELL_LATE", "TIM_BUY_SELL_GAP_LATE",
+    "FLW_SLOPE_LATE", "FLW_PERSIST_LATE", "CXL_RATE_BUY", "CXL_RATE_SELL",
+    "CXL_NET_PRESSURE", "CXL_EXEC_PRESSURE", "AGE_FLEETING_BUY", "AGE_FLEETING_SELL",
+    "FAD_NET", "LIF_FILL_RATE_BUY_LATE", "LIF_FILL_RATE_SELL_LATE",
+    "LIF_LATE_FILL_ADV_BUY", "LIF_LATE_FILL_ADV_SELL", "BOK_PRE_IMB_K3",
+    "BOK_PRE_IMB_K10", "RES_IMB_K1", "RES_IMB_K5", "RES_SPREAD", "RES_MID_OFFSET",
+    "RES_AT_OPEN_IMB", "CRV_LOSS_UP_K1", "CRV_LOSS_DOWN_K1", "CRV_LOSS_ASYM_K1",
+    "CRV_WIDTH_99", "IMP_Q_UP1", "IMP_Q_DOWN1", "IMP_FRAGILITY_ASYM"
+  ],
+  "feature_order_rule": "auction59 input = baseline 36 values followed by auction_<factor_name> in contract order",
+  "missing_value_rule": "NaN is imputed with the training mean before z-score; normalized missing values are zero; infinity is invalid"
+}

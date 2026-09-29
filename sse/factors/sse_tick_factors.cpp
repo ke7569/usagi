@@ -152,18 +152,20 @@ Band make_top_band(const std::vector<Level>& levels, std::size_t max_levels) {
 }
 
 // Aggregate all distance bands and top-N statistics in one ordered pass. The
-// old implementation rescanned each side six times and then rescanned it for
-// maximum/young-order/hermes terms; keeping these accumulators together makes
-// the common full-depth path linear with a small constant.
-SideBands aggregate_side(const std::vector<Level>& levels, bool ask,
-                         double mid) {
+// order book supplies levels directly in price order, so this also avoids
+// copying the full depth into a temporary vector at every sample.
+SideBands aggregate_side(const OrderBook& book, char side,
+                         std::uint64_t now_micros, double mid,
+                         bool v06 = false) {
     SideBands result;
     if (mid <= 0.0) return result;
+    const bool ask = side == 'S';
     const double max01 = mid * 0.01;
     const double max05 = mid * 0.05;
     const double max10 = mid * 0.10;
-    for (std::size_t i = 0; i < levels.size(); ++i) {
-        const Level& level = levels[i];
+    book.for_each_full_depth(side, now_micros,
+        [&result, ask, v06, max01, max05, max10, mid]
+        (const Level& level, std::size_t i) {
         const double p = price(level);
         const double q = static_cast<double>(level.quantity);
         if (i == 0U) add_level_to_band(level, &result.top1.volume,
@@ -172,7 +174,7 @@ SideBands aggregate_side(const std::vector<Level>& levels, bool ask,
         if (i < 5U) add_level_to_band(level, &result.top5.volume,
                                       &result.top5.count, &result.top5.time_sum,
                                       &result.top5.amount, &result.top5.young_volume);
-        if (q > result.max_volume) {
+        if (q > result.max_volume || (v06 && q == result.max_volume)) {
             result.max_volume = q;
             result.max_price = p;
         }
@@ -199,11 +201,11 @@ SideBands aggregate_side(const std::vector<Level>& levels, bool ask,
                 result.fix_weight += w;
             }
         }
-        if (d < max10)
+        if (v06 ? (ask ? double(level.price_raw) < mid*1000.0*(1.0+0.1) : double(level.price_raw) > mid*1000.0*(1.0-0.1)) : d < max10)
             add_level_to_band(level, &result.dist10.volume, &result.dist10.count,
                               &result.dist10.time_sum, &result.dist10.amount,
                               &result.dist10.young_volume);
-    }
+    });
     return result;
 }
 
@@ -321,6 +323,16 @@ double weighted_return_pair(const Level* pb, const Level* pa, const Level* cb,
 
 }  // namespace
 
+struct FactorState::Prepared {const OrderBook* book=nullptr;std::uint64_t tick=0,time=0;double mid=0;bool v06=false;SideBands bid,ask;};
+void FactorState::prepare_book(OrderBook& book,std::uint64_t now) {
+    if(prepared_ && prepared_->book==&book && prepared_->tick==book.last_tick_index() && prepared_->time==now && prepared_->v06==v06_)return;
+    Level bid[1]={},ask[1]={};book.snapshot(bid,ask,1);
+    if(!bid[0].price_raw||!ask[0].price_raw||!bid[0].quantity||!ask[0].quantity)return;
+    if(!prepared_)prepared_.reset(new Prepared);
+    auto& c=*prepared_;c.book=&book;c.tick=book.last_tick_index();c.time=now;c.v06=v06_;
+    c.mid=mid_price(bid,ask,book.last_trade_price());c.bid=aggregate_side(book,'B',now,c.mid,v06_);c.ask=aggregate_side(book,'S',now,c.mid,v06_);
+}
+
 FactorValidity::FactorValidity()
     : has_two_sided_book(false), has_previous_book(false), has_flow(false),
       has_free_share(false), has_static_metadata(false),
@@ -334,22 +346,23 @@ const char* tick_factor_name(std::size_t index) {
     return index < kTickFactorCount ? kNames[index] : "";
 }
 
-FactorState::FactorState() : have_previous_(false), previous_(), free_share_(0.0),
+FactorState::FactorState() : v06_(false), have_previous_(false), previous_(), free_share_(0.0),
                              have_free_share_(false), static_metadata_(),
-                             have_static_metadata_(false), full_bids_(), full_asks_() {
+                             have_static_metadata_(false), flow_window_() {
+    flow_window_.events.reserve(256);
     std::fill(previous_.bids, previous_.bids + 10, Level{0, 0, 0, 0, 0});
     std::fill(previous_.asks, previous_.asks + 10, Level{0, 0, 0, 0, 0});
 }
 
 void FactorState::reset() {
+    prepared_.reset();
     have_previous_ = false;
     have_free_share_ = false;
     free_share_ = 0.0;
     static_metadata_ = DailyStaticMetadata();
     have_static_metadata_ = false;
     previous_ = BookPoint();
-    full_bids_.clear();
-    full_asks_.clear();
+    flow_window_.clear_window();
     std::fill(previous_.bids, previous_.bids + 10, Level{0, 0, 0, 0, 0});
     std::fill(previous_.asks, previous_.asks + 10, Level{0, 0, 0, 0, 0});
 }
@@ -388,12 +401,18 @@ FactorRow FactorState::build(OrderBook& book, std::uint64_t now_micros,
                              double snapshot_last_price,
                              double snapshot_volume,
                              double snapshot_turnover) {
-    FactorRow row;
     Level bids[10] = {}, asks[10] = {};
     book.snapshot(bids, asks, 10U);
-    for (std::size_t i = 0; i < 10; ++i) {
-        row.values[0] += 0.0f;  // keeps compilers from treating zero init as dead state
-    }
+    return build(book, now_micros, bids, asks, snapshot_last_price,
+                 snapshot_volume, snapshot_turnover);
+}
+
+FactorRow FactorState::build(OrderBook& book, std::uint64_t now_micros,
+                             const Level (&bids)[10], const Level (&asks)[10],
+                             double snapshot_last_price,
+                             double snapshot_volume,
+                             double snapshot_turnover) {
+    FactorRow row;
     const bool two_sided = bids[0].quantity > 0 && asks[0].quantity > 0 &&
                            bids[0].price_raw > 0 && asks[0].price_raw > 0;
     const double bp = price(bids[0]);
@@ -407,7 +426,8 @@ FactorRow FactorState::build(OrderBook& book, std::uint64_t now_micros,
     const double spread = two_sided ? ap - bp : 0.0;
     const double bq = static_cast<double>(bids[0].quantity);
     const double aq = static_cast<double>(asks[0].quantity);
-    const FlowStats flow = book.take_flow_window();
+    book.take_flow_window(flow_window_);
+    const FlowStats& flow = flow_window_;
     row.mid_price = mid;
     row.tick_index = book.last_tick_index();
     row.validity.has_two_sided_book = two_sided;
@@ -476,7 +496,7 @@ FactorRow FactorState::build(OrderBook& book, std::uint64_t now_micros,
                                                               : book.total_trade_turnover();
     const double previous_turnover = have_previous_ ? previous_.turnover : current_turnover;
     row.values[18] = static_cast<float>(safe_div(
-        current_turnover - previous_turnover, top5_turnover_base));
+        current_turnover - previous_turnover, v06_ ? top5_turnover_base/1000.0 : top5_turnover_base));
 
     // Reconstruct the window flow using the start-of-window L1 prices, as in
     // the C++/C# reference implementation. SSE T carries both order ids and
@@ -498,7 +518,7 @@ FactorRow FactorState::build(OrderBook& book, std::uint64_t now_micros,
         const double prior_spread = price(previous_.asks[0]) - price(previous_.bids[0]);
         if (volume_delta > 0.0 && prior_spread > 0.0) {
             const double atp = (current_turnover - previous_.turnover) /
-                               volume_delta_raw;
+                               (v06_ ? volume_delta : volume_delta_raw);
             double r = (atp - previous_.mid) / prior_spread;
             r = std::max(-0.5, std::min(0.5, r));
             row.values[1] = static_cast<float>(
@@ -560,13 +580,15 @@ FactorRow FactorState::build(OrderBook& book, std::uint64_t now_micros,
         row.values[31] = static_cast<float>(safe_div(buy_cfr - sell_cfr, buy_cfr + sell_cfr + 1.0));
     }
 
-    book.full_depth('B', now_micros, &full_bids_);
-    book.full_depth('S', now_micros, &full_asks_);
-    const bool full_valid = two_sided && !full_bids_.empty() && !full_asks_.empty();
+    // A valid two-sided top-of-book guarantees that both full-depth maps have
+    // a level. Aggregate directly from their ordered iterators; no temporary
+    // full-depth vectors are needed.
+    const bool full_valid = two_sided;
     if (full_valid) {
-        const double full_mid = (price(full_bids_[0]) + price(full_asks_[0])) * 0.5;
-        const SideBands bid = aggregate_side(full_bids_, false, full_mid);
-        const SideBands ask = aggregate_side(full_asks_, true, full_mid);
+        const double full_mid = mid;
+        const bool cached=prepared_ && prepared_->book==&book && prepared_->tick==book.last_tick_index() && prepared_->time==now_micros && prepared_->mid==full_mid && prepared_->v06==v06_;
+        const SideBands bid = cached?prepared_->bid:aggregate_side(book, 'B', now_micros, full_mid, v06_);
+        const SideBands ask = cached?prepared_->ask:aggregate_side(book, 'S', now_micros, full_mid, v06_);
         const Band& bid01 = bid.dist01;
         const Band& ask01 = ask.dist01;
         const Band& bid05 = bid.dist05;
@@ -597,9 +619,9 @@ FactorRow FactorState::build(OrderBook& book, std::uint64_t now_micros,
         row.values[48] = static_cast<float>(safe_div(ask.young_weighted -
             bid.young_weighted, ask.young_weighted + bid.young_weighted));
         const double effective_bid = bid.fix_weight > 0.0 ? bid.fix_dot / bid.fix_weight
-                                                           : price(full_bids_[0]);
+                                                           : price(bids[0]);
         const double effective_ask = ask.fix_weight > 0.0 ? ask.fix_dot / ask.fix_weight
-                                                           : price(full_asks_[0]);
+                                                           : price(asks[0]);
         const double hermes = (effective_bid + effective_ask) * 0.5;
         row.values[49] = static_cast<float>(hermes > 0.0
             ? std::max(-5.0, std::min(5.0, (hermes / full_mid - 1.0) * 1000.0)) : 0.0);

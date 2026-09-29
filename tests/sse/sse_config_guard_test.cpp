@@ -21,12 +21,12 @@ nlohmann::json valid_config() {
     config["production_approval"] = false;
     config["td_source_index"] = nlohmann::json::array();
     config["sse_live_sampling"] = {
-        {"mode", "trailing-edge-one-shot"},
-        {"threshold_ns", 100000},
-        {"comparison", "strict-greater-than"},
-        {"clock", "CLOCK_MONOTONIC"},
+        {"mode", "hardware-gap-batch"},
+        {"threshold_ns", 5000},
+        {"comparison", "greater-or-equal"},
+        {"clock", "NIC_PHC"},
         {"candidate_event", "CompleteOrderBookSH Level2"},
-        {"activity_scope", "per-instrument-sse-book-update"},
+        {"activity_scope", "per-subscription-sse-datagram-gap"},
         {"same_exchange_time_policy", "at-most-one-sample"},
         {"initial_window", "first-valid-book-at-or-after-open"},
         {"sequence_gap_policy", "fail-closed"},
@@ -84,9 +84,9 @@ int main(int argc, char** argv) {
         return 5;
     }
     config = valid_config();
-    config["sse_live_sampling"]["threshold_ns"] = 99999;
+    config["sse_live_sampling"]["threshold_ns"] = 4999;
     if (sse_strategy_library::validate_config(config, &error) ||
-        error.find("threshold_ns=100000") == std::string::npos) {
+        error.find("threshold_ns=5000") == std::string::npos) {
         std::cerr << "wrong SSE batch threshold accepted: " << error << std::endl;
         return 6;
     }
@@ -115,7 +115,7 @@ int main(int argc, char** argv) {
         "activity_scope", "same_exchange_time_policy", "initial_window"
     };
     const char* rejected_values[] = {
-        "normalized-sse-book-update", "allow-repeated-samples", "09:25:00"
+        "per-instrument-sse-book-update", "allow-repeated-samples", "09:25:00"
     };
     for (unsigned i = 0; i < 3; ++i) {
         config = valid_config();

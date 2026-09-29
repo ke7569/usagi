@@ -1,0 +1,10 @@
+{
+  "output": "/var/log/sse/experimental/memory_pipeline/udp-observer.jsonl",
+  "site": "dongguan",
+  "channels": [
+    {"name": "snapshot_dongguan", "group": "239.57.80.5", "port": 37105},
+    {"name": "tick_dongguan", "group": "239.57.80.9", "port": 37109},
+    {"name": "index_dongguan", "group": "239.57.80.2", "port": 37102},
+    {"name": "lv1_dongguan", "group": "239.57.80.10", "port": 37110}
+  ]
+}

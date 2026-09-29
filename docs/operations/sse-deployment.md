@@ -1,5 +1,10 @@
 # SSE live capture package
 
+> Historical observer/package instructions. Since 2026-09-09, Shanghai raw
+> recording uses `sse-journal-capture.service` and `t0_sse_journal_capture`.
+> Follow [the current journal capture guide](sse-journal-capture-live.md) for
+> deployment and daily operations. The JSON observer below is not the recorder.
+
 This package is for tomorrow's first live connection only. It receives raw SSE
 FPGA UDP datagrams from the snapshot and tick channels, records local arrival
 timestamps, and does not start a strategy or connect TD.

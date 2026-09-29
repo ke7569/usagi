@@ -37,12 +37,12 @@ _RECOVERY_TRAILER_BYTES = 16
 _RECOVERY_PAGE_BYTES = 4096
 # Match the existing config_sse_hybrid_prediction_20260818.json contract.
 _SSE_SAMPLING = {
-    "mode": "trailing-edge-one-shot",
-    "threshold_ns": 100000,
-    "comparison": "strict-greater-than",
-    "clock": "CLOCK_MONOTONIC",
+    "mode": "hardware-gap-batch",
+    "threshold_ns": 5000,
+    "comparison": "greater-or-equal",
+    "clock": "NIC_PHC",
     "candidate_event": "CompleteOrderBookSH Level2",
-    "activity_scope": "per-instrument-sse-book-update",
+    "activity_scope": "per-subscription-sse-datagram-gap",
     "same_exchange_time_policy": "at-most-one-sample",
     "initial_window": "first-valid-book-at-or-after-open",
     "sequence_gap_policy": "fail-closed",
@@ -193,8 +193,6 @@ def make_profile(config, factors_only=False, strategy_intents=False,
             if field in prediction:
                 _require_contract_subset(prediction[field], expected, "prediction." + field)
     required_paths = ("model_path",) + (_SNAPSHOT_PATHS if market == "SH" else ())
-    if market == "SH" and not factors_only:
-        required_paths += ("snapshot_auction59_factors_path",)
     for name in required_paths:
         if not isinstance(prediction.get(name), str) or not prediction[name].strip():
             raise ConfigError("stream processing requires prediction." + name)
@@ -216,6 +214,10 @@ def make_profile(config, factors_only=False, strategy_intents=False,
             "lower_limit": values["HpLowerPrice"],
             "history_volatility_20d": values["HistoryVolatility20d"],
         })
+        if market == "SH":
+            for field in ("listing_date", "is_ipo_first_day"):
+                if field in values:
+                    instruments[-1][field] = values[field]
     profile = {
         "schema_version": 1,
         "market": market,

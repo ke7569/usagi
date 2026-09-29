@@ -72,7 +72,11 @@ Local coverage includes a 1000-datagram burst plus full snapshot, segment rotati
 
 The SZE contract is `sze-mix153060-v04`. It uses the latest reviewed opening boundary, wire feed sequence tracking, the existing mix153060 runtime, and recorded realtime for the existing normalization contract. Idle/EOF never flush pending state. Sequence gaps and book errors remain sticky; it does not reconnect, infer missing events, import SHM state or perform journal-to-live recovery. Existing SZE recovery remains a separate compatibility path pending integration.
 
-The SSE contract is `sse-per-instrument-v2`, implementing the user-confirmed rules of 2026-09-06. Quiet must be strictly greater than 100000 ns for the individual stock. The indexed sampler holds at most one deadline per configured instrument and updates that entry in place. `BatchEndSampler` is constructed with the configured IDs; `advance_to_event` and `on_timer` return `vector<BatchEnd>`, and `commit_applied_event(id, candidate, sequence_healthy)` updates only that stock. There is no active `MonotonicOneShotTimer` implementation alongside the recorded-clock path.
+The Shanghai production path uses NIC PHC timestamps and a global 5,000 ns
+packet-gap boundary. It emits all eligible outputs for the closed packet group,
+then a `kBatchEndOutput` marker; the strategy submits buffered signals only at
+that marker. Old software-only/replay inputs without PHC timestamps retain the
+indexed per-instrument `BatchEndSampler` compatibility path.
 
 The first book-changing tick at or after exchange time 09:30:00 that creates valid bid and ask prices and quantities initializes the stock's window immediately, with no sample. Initialization does not wait for a quiet cut and does not use a 09:25 seed. Subsequent quiet cuts accept when turnover increase is `>= HistoryAmount/8000` in currency units, exchange-time increase is `>= 100000000` microseconds (100 seconds), OR absolute mid-price change is `> 1e-6` currency units AND traded volume increase is `>= 100` shares. At most one sample is accepted per stock at a given exchange timestamp; same-time and other rejected cuts do not clear flow or reset the window. The tick volume gate uses shares while factor state retains wire volume units.
 
@@ -88,6 +92,14 @@ python3 -B tools/config/prepare_stream_processing.py \
 ./t0_sze_stream replay /path/to/recording-directory /path/to/processing-replay.json
 ```
 
-Use `t0_sse_stream` with SH profiles. SSE requires 100000 ns transport idle metadata in capture and replay, checked before processor callbacks; individual stocks still own their sampling deadlines. Profiles carry `sse-per-instrument-v2` and reject the old `sse-batch-end-v1` label. Sampling declarations use `activity_scope=per-instrument-sse-book-update`, `same_exchange_time_policy=at-most-one-sample`, and `initial_window=first-valid-book-at-or-after-open`; conflicting values are rejected. Profiles are generated from the validated unified config, preserve its fingerprint, and always require `execution=disabled`. Network/queue settings remain a separate transport profile. Both modes share the same processor; `--factors-only` is an explicit no-model validation mode and does not relax the input configuration schema. Without that flag, models must load before receive starts. CLI summaries contain sample/prediction counts and a diagnostic factor CRC, not a substitute for full output comparison.
+Use `t0_sse_stream` with SH profiles. SSE still requires 100000 ns transport idle
+metadata for end-of-stream flushing, while live PHC packet grouping uses the
+5,000 ns hardware gap. Profiles are generated from the validated unified
+config, preserve its fingerprint, and always require `execution=disabled`.
+Network/queue settings remain a separate transport profile. Both modes share the
+same processor; `--factors-only` is an explicit no-model validation mode and
+does not relax the input configuration schema. Without that flag, models must
+load before receive starts. CLI summaries contain sample/prediction counts and
+a diagnostic factor CRC, not a substitute for full output comparison.
 
 Artifact/run locks must still be explicitly verified with `unified_config.py`; these CLIs do not automatically verify model SHA-256 locks or the profile fingerprint against its original unified JSON. The fingerprint is a provenance label, not a runtime verification claim. Complete application parity (strategy decisions, risk budget, TD, scheduler and recovery) is not asserted by these standalone tools.

@@ -120,11 +120,29 @@ void test_startup_position_sync_is_forwarded() {
     session.sync_startup_positions(positions);
 }
 
+void test_execution_runs_without_prediction() {
+    auto runtime = config();
+    runtime["ins_params"]["000001.SZ"]["static_position"] = 1300;
+    runtime["ins_params"]["000001.SZ"]["external_delta"] = 300;
+    oms_test::ManagedFixture managed(config(), "SZ", 88, "sze-external");
+    sze_strategy::Session session(runtime, 88, managed.execution, []() { return true; });
+    session.set_ready(true, true, true);
+    std::int64_t exchange = 0;
+    assert(mix153060::parse_exchange_time_us("09:30:00.000", 20260904, &exchange));
+    auto value = output(sample(exchange, exchange, 1)); value.prediction_valid = false;
+    session.on_output(value);
+    oms::OrderView order;
+    assert(managed.engine->order(1, &order) && order.command.intent.quantity == 300 &&
+        order.command.intent.external_quantity == 300 && order.command.intent.price == 101200);
+    assert(session.signals() == 0);
+}
+
 }  // namespace
 
 int main() {
     test_view_mapping_and_no_sse_dedup();
     test_invalid_prediction_or_book_is_filtered();
     test_startup_position_sync_is_forwarded();
+    test_execution_runs_without_prediction();
     return 0;
 }

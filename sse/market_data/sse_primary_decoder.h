@@ -47,6 +47,22 @@ struct TickEvent {
     char side;
 };
 
+struct RawTickEvent {
+    std::uint32_t security_number;
+    std::uint32_t channel_no;
+    std::uint32_t provider_sequence;
+    std::uint64_t tick_index;
+    std::uint64_t app_seq_num;
+    std::uint64_t time_of_day_micros;
+    char event_type;
+    std::uint64_t buy_order_no;
+    std::uint64_t sell_order_no;
+    std::uint32_t price_raw;
+    std::uint64_t quantity_raw;
+    std::uint64_t amount_raw;
+    char side;
+};
+
 struct Snapshot {
     std::string security_id;
     // sse_hpf_lev2 has no exchange ChannelNo.
@@ -69,12 +85,17 @@ struct Snapshot {
     std::int64_t ask_volumes[5];
 };
 
+bool decode_primary_raw_tick(const unsigned char*, std::size_t, RawTickEvent*, std::string* = 0, bool = true);
+void materialize_tick(const RawTickEvent&, TickEvent*);
 bool is_sse_stock(const std::string& security_id);
 // Full-channel consumers decode non-target securities to preserve channel
 // continuity, then filter their configured universe before book mutation.
 bool decode_primary_tick(const unsigned char* payload, std::size_t length,
                          TickEvent* event, std::string* error = 0,
                          bool equities_only = true);
+// Recognizes the provisioned feed's duplicated 16-byte heartbeat frames.
+// It carries no exchange ChannelNo and must not advance channel tick sequence.
+bool is_primary_heartbeat(const unsigned char* payload, std::size_t length);
 bool decode_primary_snapshot(const unsigned char* payload, std::size_t length,
                              Snapshot* snapshot, std::string* error = 0,
                              bool equities_only = true);

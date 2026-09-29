@@ -2,6 +2,14 @@
 
 本页只描述当前可操作边界，不替代详细契约，也不重复执行日志。构建和验证应在 `build/<variant>` 中进行，避免覆盖外部部署产物。
 
+## 上海当前生产入口
+
+上海自 2026-09-09 使用 `sse-journal-capture.service`，程序为
+`/home/zane/usagi-bin/t0_sse_journal_capture`，同时保存逐笔和快照原始包。
+启动、检查和保留规则见[上海 journal 采集](operations/sse-journal-capture-live.md)。
+这是当前正式入口；下文旧 observer、Deepwin main、parallel16 的说明不用于启动
+这条采集。模型和 daily 配置缺失不影响原始行情保存。
+
 ## 构建与离线运行
 
 从源码根目录构建两市可移植运行时，不链接券商 SDK：

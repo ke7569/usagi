@@ -349,6 +349,76 @@ void test_unknown_send_is_not_replayed() {
     require(!second->account().ready, "unknown send keeps account closed");
 }
 
+void test_combined_execution_allocation_recovery() {
+    TempDir temp; Config settings = config(temp);
+    // Execution attribution must survive even when ordinary T0 intents are async.
+    settings.durable_order_intents = false;
+    auto first_backend = std::make_shared<ScriptedBackend>(capabilities());
+    first_backend->submit_hook = [](const Command&) {
+        SendResult r; r.disposition = SendDisposition::Submitted; r.broker_id = "mixed"; return r;
+    };
+    auto first = create(settings, first_backend, 1);
+    reconcile(first, first_backend, 1);
+    Intent intent = buy("owner", "mixed", 400); intent.external_quantity = 300; intent.external_delta = 300;
+    const auto sent = first->submit(intent);
+    require(sent.accepted, "combined order accepted");
+    Report trade = order_report(first, sent.id, kSze, Side::Buy, OrderState::Partial, 200, 200, "mixed");
+    trade.kind = ReportKind::Trade; trade.trade_id = "mixed-first"; trade.trade_quantity = 200;
+    trade.cumulative_after = 200; trade.trade_price = 100000;
+    require(first->report(trade), "mixed fill applied");
+    first.reset();
+    auto backend = std::make_shared<ScriptedBackend>(capabilities());
+    auto recovered = create(settings, backend, 2);
+    OrderView order;
+    require(recovered->order(sent.id, &order) && order.command.intent.external_quantity == 300 &&
+        order.command.intent.external_delta == 300, "allocation restored from journal");
+    require(recovered->begin_reconcile(2, false), "mixed reconciliation starts");
+    Snapshot snapshot = snapshot_for(recovered, 2); snapshot.positions[0].total += 200;
+    snapshot.orders.push_back(snapshot_order(sent.id, "owner", "mixed", kSze, Side::Buy,
+        400, 200, 200, OrderState::Partial));
+    trade.scope = snapshot.scope; snapshot.trades.push_back(trade);
+    require(recovered->complete_snapshot(snapshot), "mixed snapshot installed");
+    Position p;
+    require(recovered->position(kSze, &p) && p.external_bought == 100 && p.external_working_buy == 200 &&
+        p.bought == 200 && p.total == 10200, "reconciliation restores external fills and reservation once");
+    Quantity qty; Money amount;
+    require(recovered->t0_day_fills(kSze, &qty, &amount) && qty == 100 && amount == 10000000,
+        "recovered T0 turnover excludes external fills");
+}
+
+void test_query_tokens_restart_in_new_epoch() {
+    TempDir temp;
+    const Config settings = config(temp);
+    Snapshot previous;
+    for (std::uint64_t epoch = 1; epoch <= 3; ++epoch) {
+        std::shared_ptr<ScriptedBackend> backend(new ScriptedBackend(capabilities()));
+        auto engine = create(settings, backend, epoch);
+        // The live entry point begins at token 1 on each process start.
+        require(engine->begin_reconcile(1, false), "new epoch permits first query token after journal replay");
+        if (epoch > 1) {
+            require(!engine->complete_snapshot(previous), "old epoch cannot satisfy the reused query token");
+            require(!engine->account().ready, "old epoch leaves reconciliation closed");
+        }
+        previous = snapshot_for(engine, 1);
+        require(engine->complete_snapshot(previous), "new epoch query completes");
+        require(engine->account().ready, "new epoch reconciles after restart");
+        require(!engine->begin_reconcile(1, false), "same epoch rejects repeated query token");
+        reconcile(engine, backend, 2);
+        require(!engine->begin_reconcile(1, false), "same epoch rejects regressed query token");
+    }
+    // Also retain the reset if a process stops after starting a new epoch,
+    // before it has persisted that epoch's first query.
+    {
+        std::shared_ptr<ScriptedBackend> backend(new ScriptedBackend(capabilities()));
+        auto engine = create(settings, backend, 4);
+    }
+    std::shared_ptr<ScriptedBackend> backend(new ScriptedBackend(capabilities()));
+    auto recovered = Engine::create(settings, backend);
+    require(recovered->scope().epoch == 4, "journal restored latest epoch");
+    require(recovered->set_connected(recovered->scope(), true), "restore test connection");
+    require(recovered->begin_reconcile(1, false), "journal epoch resets earlier query tokens");
+}
+
 void test_external_order_is_read_only_and_self_crosses() {
     TempDir temp;
     Config value = config(temp);
@@ -493,16 +563,56 @@ void test_live_journal_failure_blocks_new_risk_but_allows_owned_cancel() {
             "journal partial-write failure remains fail-closed with owned cancels");
 }
 
+void test_async_intent_loss_reconciles_and_never_reuses_id() {
+    TempDir temp;Config settings=config(temp);settings.durable_order_intents=false;
+    off_t durable_prefix=0;OrderId sent_id=0;
+    {
+        auto backend=std::make_shared<ScriptedBackend>(capabilities());
+        auto engine=Engine::create(settings,backend);
+        struct stat st;require(::stat(temp.journal.c_str(),&st)==0,"journal stat");durable_prefix=st.st_size;
+        require(engine->start_epoch(1),"async epoch");
+        require(!engine->submit(buy("owner","before-reconcile")).accepted,"no submit before account reconciliation");
+        reconcile(engine,backend,1);require(engine->account().ready,"async ready");
+        require(!engine->submit(buy("owner","historical-signal"),[](){return false;}).accepted,"replay gate blocks new orders");
+        auto result=engine->submit(buy("owner","sent-but-tail-lost",100));
+        require(result.accepted,"async submit accepted");sent_id=result.id;
+    }
+    // Simulate loss of every record after startup's durable ID reservation,
+    // including the intent of an order already accepted by the broker.
+    require(::truncate(temp.journal.c_str(),durable_prefix)==0,"simulate undurable tail loss");
+    auto backend=std::make_shared<ScriptedBackend>(capabilities());
+    auto engine=create(settings,backend,2);
+    require(!engine->account().ready,"restarted account remains gated");
+    require(engine->begin_reconcile(1,false),"snapshot start");
+    Snapshot working=snapshot_for(engine,1);
+    working.orders.push_back(snapshot_order(sent_id,"owner","broker-tail",kSze,Side::Buy,100,0,100,OrderState::Accepted));
+    require(!engine->complete_snapshot(working),"unknown broker working order blocks restart");
+    require(!engine->submit(buy("owner","blocked-new")).accepted,"cannot trade through unknown working order");
+    require(engine->begin_reconcile(2,false),"terminal snapshot start");
+    Snapshot final=snapshot_for(engine,2);final.positions[0].total+=100;
+    final.orders.push_back(snapshot_order(sent_id,"owner","broker-tail",kSze,Side::Buy,100,100,0,OrderState::Filled));
+    Report trade;trade.scope=final.scope;trade.broker_id="broker-tail";trade.instrument=kSze;trade.side=Side::Buy;
+    trade.kind=ReportKind::Trade;trade.trade_id="tail-fill";trade.trade_quantity=100;trade.trade_price=100000;trade.cumulative_after=100;
+    final.trades.push_back(trade);
+    require(engine->complete_snapshot(final),"complete authoritative terminal snapshot");
+    Quantity qty=0;Money amount=0;require(engine->day_fills(kSze,&qty,&amount)&&qty==100&&amount==10000000,"lost intent fill restored from broker");
+    auto fresh=engine->submit(buy("owner","fresh",100));
+    require(fresh.accepted && fresh.id>sent_id && fresh.id>=1+settings.limits.max_orders,"reserved ID block skipped after loss");
+}
+
 }  // namespace
 
 int main() {
     try {
+        test_async_intent_loss_reconciles_and_never_reuses_id();
         test_durable_active_order_recovery();
         test_broker_id_recovers_without_oms_snapshot_id();
         test_automatic_query_retry_and_reconnect();
         test_query_activity_retries_automatically();
         test_query_token_epoch_and_day_boundaries();
+        test_combined_execution_allocation_recovery();
         test_unknown_send_is_not_replayed();
+        test_query_tokens_restart_in_new_epoch();
         test_external_order_is_read_only_and_self_crosses();
         test_incomplete_query_and_overlapping_report_close_gate();
         test_journal_failure_and_corrupt_tail_close_gate();

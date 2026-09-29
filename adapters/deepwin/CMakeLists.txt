@@ -1,3 +1,12 @@
+# The deployed ATP query bundle keeps the same runtime libraries in one lib/
+# directory. Accept that existing layout without manufacturing symlink trees.
+if(EXISTS "${RUNTIME}/lib/libwingchuntd.so")
+  set(WC_LIB "${RUNTIME}/lib")
+  set(YJJ_LIB "${RUNTIME}/lib")
+  set(TPWC_LIB "${RUNTIME}/lib")
+  set(BOOST_LIB "${RUNTIME}/lib")
+endif()
+
 set(SZE_COMMON_SOURCES
   ${USAGI_ROOT}/common/strategy/common.cpp
   ${USAGI_ROOT}/common/market_data/legacy/snap_generator.cpp
@@ -137,7 +146,8 @@ if(SZE_BUILD_TD)
     message(FATAL_ERROR "SZE_BUILD_TD requires vendor ${SZE_TD_API_DIR}/lib/libatpquantapi.so")
   endif()
   add_library(sze_td SHARED
-    ${USAGI_ROOT}/adapters/td/atp/TDEngineGXBSE.cpp)
+    ${USAGI_ROOT}/adapters/td/atp/TDEngineGXBSE.cpp
+    ${USAGI_ROOT}/adapters/td/atp/TDEngineGXBSEOms.cpp)
   target_compile_definitions(sze_td PRIVATE
     GXBSE_TD_BUILD_VERSION="sze-dev"
     T0_TD_PLUGIN_LABEL="sze_td"
@@ -183,7 +193,8 @@ if(SSE_BUILD_TD)
     message(FATAL_ERROR "SSE_BUILD_TD requires ${SZE_TD_API_DIR}/lib/libatpquantapi.so")
   endif()
   add_library(sse_td SHARED
-    ${USAGI_ROOT}/adapters/td/atp/TDEngineGXBSE.cpp)
+    ${USAGI_ROOT}/adapters/td/atp/TDEngineGXBSE.cpp
+    ${USAGI_ROOT}/adapters/td/atp/TDEngineGXBSEOms.cpp)
   target_compile_definitions(sse_td PRIVATE
     GXBSE_TD_BUILD_VERSION="sse-dev"
     SSE_TD_BUILD=1
@@ -216,5 +227,21 @@ if(SSE_BUILD_TD)
   set_target_properties(sse_td PROPERTIES
     OUTPUT_NAME sse_td
     BUILD_WITH_INSTALL_RPATH TRUE
-    INSTALL_RPATH "\$ORIGIN;/opt/deepwin/master/lib/wingchun;/opt/deepwin/master/lib/yijinjing;/opt/deepwin/toolchain/boost-1.62.0/lib")
+    INSTALL_RPATH "\$ORIGIN;${SZE_TD_API_DIR}/lib;${WC_LIB};${YJJ_LIB};${TPWC_LIB};${BOOST_LIB}")
+endif()
+
+# Exercise real SDK request encoding and the complete TD adapter without any
+# network connection. Only atp_send_path_test interposes the gateway send calls.
+if(TARGET sse_td)
+  add_executable(atp_request_reuse_test ${USAGI_ROOT}/tests/oms/atp_request_reuse_test.cpp)
+  target_include_directories(atp_request_reuse_test PRIVATE ${SZE_TD_API_DIR}/include)
+  target_link_libraries(atp_request_reuse_test PRIVATE ${SZE_TD_API_DIR}/lib/libatpquantapi.so)
+  add_test(NAME atp_request_reuse_test COMMAND atp_request_reuse_test)
+  get_target_property(atp_test_includes sse_td INCLUDE_DIRECTORIES)
+  get_target_property(atp_test_libraries sse_td LINK_LIBRARIES)
+  add_executable(atp_send_path_test ${USAGI_ROOT}/tests/oms/atp_send_path_test.cpp)
+  target_include_directories(atp_send_path_test PRIVATE ${atp_test_includes})
+  target_link_libraries(atp_send_path_test PRIVATE sse_td ${atp_test_libraries} ${TPWC_LIB}/libpython3.6m.so.1.0)
+  add_test(NAME atp_send_path_test COMMAND atp_send_path_test)
+  set_tests_properties(atp_request_reuse_test atp_send_path_test PROPERTIES TIMEOUT 30)
 endif()
