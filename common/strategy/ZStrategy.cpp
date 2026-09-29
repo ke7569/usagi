@@ -688,7 +688,7 @@ void ZStrategy::on_signal(const MSMarketDataField * market_data, double signal, 
 
 bool ZStrategy::refresh_position() {
     oms::Position position;
-    if (!execution_ || !execution_->read_position(td_source_, mTradeInstrument, ExchangeID, &position)) return false;
+    if (!execution_ || !execution_->read_t0_position(td_source_, mTradeInstrument, ExchangeID, &position)) return false;
     const long long maximum = std::numeric_limits<int32_t>::max();
     if (position.total < 0 || position.total > maximum || position.sellable < 0 || position.sellable > maximum ||
         position.working_buy < 0 || position.working_buy > maximum || position.working_sell < 0 ||

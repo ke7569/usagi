@@ -33,7 +33,7 @@ ins_params
 
 `static_data_hash` is SHA256 over canonical compact JSON for `ins_params`
 (`sort_keys=True`, separators `,` and `:`, ASCII encoding). A symbol is in the
-trade universe exactly when its `static_position` is nonzero. There is no
+trade universe when its `static_position` or `external_delta` is nonzero. There is no
 separate daily trade-symbol list. Daily `ins_params` must not contain `cpu` or
 `last_position`: CPU ownership is fixed and broker position is queried by TD;
 the generated compatibility strategy config initializes `last_position` to

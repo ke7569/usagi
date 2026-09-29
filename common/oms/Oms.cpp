@@ -91,6 +91,8 @@ Intent decode_intent(const Json& value) {
     result.instrument = decode_instrument(value.at("instrument")); result.side = static_cast<Side>(value.at("side").get<int>());
     result.type = static_cast<OrderType>(value.at("type").get<int>()); result.price = value.at("price").get<Money>();
     result.quantity = value.at("quantity").get<Quantity>(); result.cancel_delay_ns = value.at("cancel_delay_ns").get<Time>();
+    result.external_quantity = value.value("external_quantity", Quantity(0));
+    result.external_delta = value.value("external_delta", Quantity(0));
     result.cancel_clock = static_cast<CancelClock>(value.at("cancel_clock").get<int>()); return result;
 }
 Command decode_command(const Json& value) {
@@ -138,6 +140,7 @@ SnapshotOrder decode_snapshot_order(const Json& value) {
 struct Engine::Impl {
     struct TradeFact {
         Quantity quantity = 0, cumulative_after = -1;
+        Quantity allocation_after = -1;
         Money price = 0, fee = -1;
         bool after_snapshot = true, fee_final = false;
     };
@@ -270,9 +273,19 @@ struct Engine::Impl {
         Quantity fee_quantity = 0;
         bool final_fee = false;
         order.new_priced_quantity = 0; order.new_amount = 0; order.new_fees = 0;
+        view.t0_priced_quantity = 0; view.t0_known_amount = 0; view.t0_known_fees = 0;
+        const Quantity t0_quantity = view.command.intent.quantity - view.command.intent.external_quantity;
         for (const auto& item : order.trades) {
             const TradeFact& fact = item.second;
+            const Quantity after = fact.cumulative_after >= 0 ? fact.cumulative_after : fact.allocation_after;
+            const Quantity t0 = !view.command.intent.external_quantity ? fact.quantity :
+                after < fact.quantity ? 0 : std::max<Quantity>(0,
+                    std::min(after, t0_quantity) - std::min(after - fact.quantity, t0_quantity));
             if (fact.price > 0) {
+                if (view.command.intent.external_quantity) {
+                    view.t0_priced_quantity = sum(view.t0_priced_quantity, t0);
+                    view.t0_known_amount = sum(view.t0_known_amount, product(fact.price, t0));
+                }
                 view.priced_quantity = sum(view.priced_quantity, fact.quantity);
                 view.known_amount = sum(view.known_amount, product(fact.price, fact.quantity));
                 if (fact.after_snapshot) {
@@ -281,11 +294,18 @@ struct Engine::Impl {
                 }
             }
             if (fact.fee >= 0) {
+                if (view.command.intent.external_quantity)
+                    view.t0_known_fees = sum(view.t0_known_fees,
+                        static_cast<Money>((static_cast<long double>(fact.fee) * t0) / fact.quantity));
                 fee_quantity = sum(fee_quantity, fact.quantity);
                 view.known_fees = sum(view.known_fees, fact.fee);
                 if (fact.after_snapshot) order.new_fees = sum(order.new_fees, fact.fee);
             }
             final_fee = final_fee || fact.fee_final;
+        }
+        if (!view.command.intent.external_quantity) {
+            view.t0_priced_quantity = view.priced_quantity; view.t0_known_amount = view.known_amount;
+            view.t0_known_fees = view.known_fees;
         }
         view.amount_complete = view.priced_quantity == view.filled;
         view.fees_complete = (view.terminal && final_fee && fee_quantity == view.filled) ||
@@ -304,11 +324,24 @@ struct Engine::Impl {
         derive_money(order);
         OrderView& view = order.view;
         Position position = positions[view.command.intent.instrument];
+        if (view.command.intent.external_quantity) position.external_target = view.command.intent.external_delta;
         const Quantity fill_delta = view.filled - old.filled;
         if (fill_delta < 0) throw std::logic_error("OMS filled quantity regressed");
         Quantity& working = view.command.intent.side == Side::Buy ? position.working_buy : position.working_sell;
         working = sum(working, view.working - old.working);
         if (working < 0) throw std::logic_error("OMS working reservation underflow");
+        const Quantity t0_quantity = view.command.intent.quantity - view.command.intent.external_quantity;
+        const auto external_filled = [t0_quantity](const OrderView& v) {
+            return std::max<Quantity>(0, v.filled - t0_quantity);
+        };
+        const auto external_working = [t0_quantity](const OrderView& v) {
+            return v.working - std::min(v.working, std::max<Quantity>(0, t0_quantity - v.filled));
+        };
+        Quantity& e_working = view.command.intent.side == Side::Buy
+            ? position.external_working_buy : position.external_working_sell;
+        Quantity& e_filled = view.command.intent.side == Side::Buy ? position.external_bought : position.external_sold;
+        e_working = sum(e_working, external_working(view) - external_working(old));
+        e_filled = sum(e_filled, external_filled(view) - external_filled(old));
         if (view.command.intent.side == Side::Buy) {
             position.total = sum(position.total, fill_delta); position.bought = sum(position.bought, fill_delta);
         } else {
@@ -532,6 +565,10 @@ SubmitResult Engine::submit(const Intent& intent, const std::function<bool()>& g
         };
         if (!text_ok(intent.owner) || !text_ok(intent.intent_id) || intent.signal_id.size() > 128 ||
             (intent.side != Side::Buy && intent.side != Side::Sell) || intent.price <= 0 || intent.quantity <= 0 ||
+            intent.external_quantity < 0 || intent.external_quantity > intent.quantity ||
+            intent.external_delta < -2147483647LL || intent.external_delta > 2147483647LL ||
+            (intent.external_quantity && (intent.external_delta == 0 ||
+                (intent.side == Side::Buy ? intent.external_delta < 0 : intent.external_delta > 0))) ||
             intent.cancel_delay_ns < 0 || (intent.type != OrderType::Limit && intent.type != OrderType::NativeFak &&
             intent.type != OrderType::LimitThenCancel) || (intent.cancel_clock != CancelClock::Submission &&
             intent.cancel_clock != CancelClock::Acceptance)) {
@@ -549,6 +586,18 @@ SubmitResult Engine::submit(const Intent& intent, const std::function<bool()>& g
         const InstrumentRules& r = rules->second;
         const Position& position = s.positions[intent.instrument];
         try {
+            if (intent.external_quantity) {
+                if (position.external_target && position.external_target != intent.external_delta) {
+                    reject(ErrorCategory::Invalid, "external execution target changed within trading day"); return result;
+                }
+                const Quantity target = intent.external_delta > 0 ? intent.external_delta : -intent.external_delta;
+                const Quantity used = intent.side == Side::Buy
+                    ? sum(position.external_bought, position.external_working_buy)
+                    : sum(position.external_sold, position.external_working_sell);
+                if (intent.external_quantity > target - used) {
+                    reject(ErrorCategory::Limit, "external execution exceeds unreserved target"); return result;
+                }
+            }
             const Money notional = product(intent.price, intent.quantity);
             const Money required = sum(intent.side == Side::Buy ? notional : 0, s.config.limits.fee_reserve_per_order);
             const bool odd_sale = intent.side == Side::Sell && r.allow_odd_lot_liquidation &&
@@ -588,8 +637,9 @@ SubmitResult Engine::submit(const Intent& intent, const std::function<bool()>& g
             OMS_PROFILE_STOP(profile_construct);
             OMS_PROFILE_SCOPE(profile_intent, IntentAudit);
             send_stages.intent_begin=order_latency::now_ns();
-            send_stages.intent_durable_wait=s.config.durable_order_intents;
-            if (!s.save_bytes(s.journal.recording() ? records::intent(s.now, order.view.command) : std::string(), s.config.durable_order_intents)) {
+            const bool durable_intent = s.config.durable_order_intents || intent.external_quantity > 0;
+            send_stages.intent_durable_wait=durable_intent;
+            if (!s.save_bytes(s.journal.recording() ? records::intent(s.now, order.view.command) : std::string(), durable_intent)) {
                 reject(ErrorCategory::Persistence, "pre-send journal registration failed"); return result;
             }
             OMS_PROFILE_STOP(profile_intent);
@@ -802,6 +852,7 @@ bool Engine::Impl::apply_report(const Report& report, bool quarantine) {
         if (trade == o.trades.end()) {
             if (trade_ids >= config.limits.max_trade_ids) { freeze("trade identity capacity exhausted", found->first); return false; }
             TradeFact fact; fact.quantity = report.trade_quantity; fact.cumulative_after = report.cumulative_after;
+            fact.allocation_after = report.cumulative_after >= 0 ? report.cumulative_after : sum(o.trade_quantity, fact.quantity);
             fact.price = report.trade_price; fact.fee = report.trade_fee; fact.fee_final = report.fee_is_final;
             if (o.has_snapshot_baseline) {
                 if (report.cumulative_after < 0) {
@@ -1173,6 +1224,7 @@ bool Engine::Impl::install_snapshot(const Snapshot& snapshot, bool persisted) {
         } else o.fee_cap = 0;
     }
     if (new_orders.size() > config.limits.max_orders) return reject("restored orders exceed OMS capacity");
+    std::map<OrderId, Quantity> snapshot_trade_prefix;
     for (const auto& row : snapshot.trades) {
         if (!(row.scope == snapshot.scope) || row.kind != ReportKind::Trade || !text_ok(row.trade_id) ||
             row.trade_quantity <= 0 || row.trade_price < 0 || row.trade_fee < -1)
@@ -1191,6 +1243,9 @@ bool Engine::Impl::install_snapshot(const Snapshot& snapshot, bool persisted) {
             (old->second.cumulative_after >= 0 && row.cumulative_after >= 0 && old->second.cumulative_after != row.cumulative_after)))
             return reject("snapshot trade contradicts durable history");
         TradeFact& fact = o.trades[row.trade_id]; fact.quantity = row.trade_quantity;
+        snapshot_trade_prefix[o.view.command.id] = sum(snapshot_trade_prefix[o.view.command.id], row.trade_quantity);
+        if (fact.allocation_after < 0) fact.allocation_after = row.cumulative_after >= 0
+            ? row.cumulative_after : snapshot_trade_prefix[o.view.command.id];
         if (row.trade_price) fact.price = row.trade_price;
         if (row.trade_fee >= 0) fact.fee = row.trade_fee;
         if (row.cumulative_after >= 0) fact.cumulative_after = row.cumulative_after;
@@ -1208,10 +1263,20 @@ bool Engine::Impl::install_snapshot(const Snapshot& snapshot, bool persisted) {
         derive_money(o); new_reserved = sum(new_reserved, o.view.cash_reserved);
         new_trade_ids += o.trades.size();
         Position& p = new_positions[o.view.command.intent.instrument];
+        if (o.view.command.intent.external_quantity) {
+            if (p.external_target && p.external_target != o.view.command.intent.external_delta)
+                return reject("snapshot execution targets disagree");
+            p.external_target = o.view.command.intent.external_delta;
+        }
         // Broker positions already contain fills; restore only the daily
         // counters here, not total/sellable a second time.
         if(o.view.command.intent.side==Side::Buy)p.bought=sum(p.bought,o.view.filled);
         else p.sold=sum(p.sold,o.view.filled);
+        const Quantity t0 = o.view.command.intent.quantity - o.view.command.intent.external_quantity;
+        Quantity& ef = o.view.command.intent.side == Side::Buy ? p.external_bought : p.external_sold;
+        Quantity& ew = o.view.command.intent.side == Side::Buy ? p.external_working_buy : p.external_working_sell;
+        ef = sum(ef, std::max<Quantity>(0, o.view.filled - t0));
+        ew = sum(ew, o.view.working - std::min(o.view.working, std::max<Quantity>(0, t0 - o.view.filled)));
         if (o.view.command.intent.side == Side::Buy) p.working_buy = sum(p.working_buy, o.view.working);
         else p.working_sell = sum(p.working_sell, o.view.working);
         if (o.view.working) {
@@ -1374,6 +1439,35 @@ bool Engine::day_fills(const Instrument& instrument, Quantity* quantity, Money* 
         if(bought!=p->second.bought || sold!=p->second.sold)return false;
         *quantity=sum(bought,sold);*net_amount=amount;return true;
     }catch(...){return false;}
+}
+
+bool Engine::t0_day_fills(const Instrument& instrument, Quantity* quantity, Money* net_amount) const {
+    if (!quantity || !net_amount) return false;
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+    if (!impl_->positions.count(instrument)) return false;
+    try {
+        Quantity filled = 0; Money amount = 0;
+        for (const auto& item : impl_->orders) {
+            const OrderView& v = item.second.view;
+            if (!(v.command.intent.instrument == instrument)) continue;
+            const Quantity t0 = std::min(v.filled, v.command.intent.quantity - v.command.intent.external_quantity);
+            if (v.t0_priced_quantity != t0) return false;
+            filled = sum(filled, t0);
+            amount = sum(amount, v.command.intent.side == Side::Buy ? v.t0_known_amount : -v.t0_known_amount);
+        }
+        *quantity = filled; *net_amount = amount; return true;
+    } catch (...) { return false; }
+}
+
+std::vector<OrderView> Engine::execution_orders(const std::string& owner, const Instrument& instrument) const {
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+    std::vector<OrderView> result;
+    for (const auto& item : impl_->orders) {
+        const OrderView& v = item.second.view;
+        if (v.owned && v.command.intent.owner == owner && v.command.intent.instrument == instrument &&
+            v.command.intent.external_quantity) result.push_back(v);
+    }
+    return result;
 }
 
 }  // namespace oms

@@ -90,12 +90,14 @@ MSMarketDataField Session::make_view(const std::string& code,
 
 void Session::on_output(const sze_stream::ProcessedSample& output) {
     try {
-        if (!output.prediction_valid || !std::isfinite(output.prediction)) return;
+        const bool prediction_valid = output.prediction_valid && std::isfinite(output.prediction);
+        if (!prediction_valid && !core_.has_external_execution()) return;
         const std::string code = normalize_code(output.sample.instrument);
         if (!valid_sample_view(output.sample)) return;
         const MSMarketDataField view = make_view(code, output.sample);
-        core_.on_signal(code, view, output.prediction,
-                        static_cast<long>(output.sample.local_time_us));
+        if (prediction_valid)
+            core_.on_signal(code, view, output.prediction, static_cast<long>(output.sample.local_time_us));
+        else core_.on_decision(code, view, std::function<void()>());
     } catch (...) {
         begin_stop();
         throw;

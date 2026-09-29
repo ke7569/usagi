@@ -19,6 +19,10 @@ public:
     virtual bool managed() const { return false; }
     virtual bool owns_request(short, int, const std::string&) const { return false; }
     virtual bool read_position(short, const std::string&, const std::string&, oms::Position*) const { return false; }
+    virtual bool read_t0_position(short source, const std::string& code, const std::string& market,
+                                  oms::Position* output) const {
+        return read_position(source, code, market, output);
+    }
     // Single-flight query: whether an order for the instrument is still working.
     // Defaults to false so legacy/unmanaged executors never gate on it.
     virtual bool has_working_order(const std::string& instrument) const { return false; }
@@ -38,6 +42,20 @@ public:
     // Internal strategy interface; rebuild its callers and implementations together.
     virtual bool read_order(short, int, oms::OrderView*) const { return false; }
     virtual bool read_day_fills(short, const std::string&, const std::string&, oms::Quantity*, oms::Money*) const { return false; }
+    virtual bool read_t0_day_fills(short source, const std::string& code, const std::string& market,
+                                  oms::Quantity* quantity, oms::Money* amount) const {
+        return read_day_fills(source, code, market, quantity, amount);
+    }
+    virtual bool read_execution_orders(short, const std::string&, const std::string&,
+                                       std::vector<oms::OrderView>*) const { return false; }
+    virtual int submit_allocated(short source, const std::string& code, const std::string& market,
+        double price, int quantity, char direction, char offset, oms::OrderType type, long long delay,
+        const std::function<bool()>& gate, const std::string& signal_id,
+        int external_quantity, int external_delta) {
+        (void)external_delta;
+        return external_quantity == 0 ? submit_managed(source, code, market, price, quantity,
+            direction, offset, type, delay, gate, signal_id) : -1;
+    }
 };
 
 #endif

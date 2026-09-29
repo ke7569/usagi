@@ -61,6 +61,11 @@ bool ProtectedExecution::read_position(short source, const std::string& instrume
 bool ProtectedExecution::read_day_fills(short source,const std::string& code,const std::string& market,oms::Quantity* q,oms::Money* amount)const {
     return source==source_ && market==exchange_ && instruments_.count(code) && backend_->read_day_fills(source,code,market,q,amount);
 }
+bool ProtectedExecution::read_t0_position(short source, const std::string& code,
+                                         const std::string& market, oms::Position* out) const {
+    return source == source_ && market == exchange_ && instruments_.count(code) &&
+        backend_->read_t0_position(source, code, market, out);
+}
 bool ProtectedExecution::has_working_order(const std::string& instrument) const {
     return instruments_.count(instrument) && backend_->has_working_order(instrument);
 }

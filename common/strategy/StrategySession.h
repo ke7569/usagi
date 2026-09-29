@@ -3,6 +3,7 @@
 
 #include "common/contracts/InsParams.h"
 #include "common/execution/StreamStrategyExecution.h"
+#include "common/execution/ExternalExecutionController.h"
 #include "common/strategy/ZStrategy.h"
 
 #include <functional>
@@ -24,6 +25,11 @@ public:
     void begin_stop();
     void on_signal(const std::string& code, const MSMarketDataField& view,
                    double prediction, long received_time);
+    void on_decision(const std::string& code, const MSMarketDataField& view,
+                     const std::function<void()>& t0);
+    bool has_external_execution() const { return static_cast<bool>(external_); }
+    void on_timer(std::uint64_t exchange_time_us,
+                  const std::function<bool(const std::string&)>& instrument_gate = {});
     bool on_order(const LFRtnOrderField& order, int request_id,
                   short source, long received_ns);
     bool on_trade(const LFRtnTradeField& trade, int request_id,
@@ -48,9 +54,11 @@ private:
 
     Instruments instruments_;
     std::shared_ptr<ProtectedExecution> execution_;
+    std::shared_ptr<ExternalExecutionController> external_;
     short source_;
     std::string market_;
     std::uint64_t signals_;
+    std::uint64_t last_timer_second_ = 86400;
 };
 
 }  // namespace strategy_runtime

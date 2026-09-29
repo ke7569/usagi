@@ -21,6 +21,7 @@ public:
         instrument_gate_ = gate;
     }
     void begin_stop();
+    void on_timer(std::uint64_t exchange_time_us) { core_->on_timer(exchange_time_us, instrument_gate_); }
     void enable_live_latency(bool enabled){latency_enabled_=enabled;latency_count_=latency_sum_=latency_max_=latency_over_ms_=0;latency_bins_.fill(0);last_latency_count_=last_latency_sum_=last_latency_over_ms_=interval_latency_max_=0;last_latency_bins_.fill(0);}
     nlohmann::json live_latency()const;
 

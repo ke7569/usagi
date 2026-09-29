@@ -68,7 +68,7 @@ void Strategy::synchronize(std::uint64_t time) {
     double base=0,net=0;bool ready=true;unsigned missing=0;
     for(auto& item:stocks_) {
         Stock& stock=item.second;refresh(stock);oms::Position p;
-        if(!execution_->read_position(source_,item.first,"SSE",&p)){ready=false;continue;}
+        if(!execution_->read_t0_position(source_,item.first,"SSE",&p)){ready=false;continue;}
         if(!stock.fills_seeded) {
             if(!p.bought && !p.sold)stock.fills_seeded=true;
             else if(stock.pending.empty() && stock.completed_fills==0) {
@@ -106,7 +106,7 @@ void Strategy::on_signal(const std::string& code,const MSMarketDataField& view,c
     order_latency::Timing timing;timing.receive=receive_ns;timing.signal=signal_ns;timing.strategy=order_latency::now_ns();
     ++signals_;auto found=stocks_.find(code);if(found==stocks_.end())throw std::runtime_error("v06 unknown stock");
     Stock& stock=found->second;refresh(stock);synchronize(time);
-    oms::Position p;if(!execution_->read_position(source_,code,"SSE",&p))return;
+    oms::Position p;if(!execution_->read_t0_position(source_,code,"SSE",&p))return;
     const long long relative=p.total-stock.bottom;
     const int consensus=agreement(heads);
     const int permission=time<34380000000ULL||!global_ready_||!stock.tradable?0:consensus;

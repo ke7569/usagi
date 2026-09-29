@@ -18,6 +18,7 @@ add_library(t0_strategy_core STATIC
   ${USAGI_ROOT}/common/strategy/ZStrategy.cpp ${USAGI_ROOT}/common/execution/StreamStrategyExecution.cpp
   ${USAGI_ROOT}/common/strategy/StrategySession.cpp ${USAGI_ROOT}/common/execution/OmsStrategyExecution.cpp)
 target_sources(t0_strategy_core PRIVATE ${USAGI_ROOT}/common/execution/LiveTd.cpp)
+target_sources(t0_strategy_core PRIVATE ${USAGI_ROOT}/common/execution/ExternalExecutionController.cpp)
 target_include_directories(t0_strategy_core PUBLIC ${USAGI_ROOT} ${USAGI_ROOT}/common/strategy)
 target_link_libraries(t0_strategy_core PUBLIC t0_oms_core pthread dl)
 

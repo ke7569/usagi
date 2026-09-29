@@ -375,6 +375,42 @@ void test_completed_batch_static_gate_and_snapshot_reference() {
     assert(session.signals()==1 && managed.engine->account().admissions==1);
 }
 
+void test_v06_external_merge_and_no_prediction_execution() {
+    auto runtime = session_config(); runtime["model_version"] = "v0.6";
+    for (auto it = runtime["ins_params"].begin(); it != runtime["ins_params"].end(); ++it)
+        it.value()["Open"] = 10.0;
+    runtime["ins_params"]["600000.SH"]["static_position"] = 1300;
+    runtime["ins_params"]["600000.SH"]["external_delta"] = 300;
+    oms_test::ManagedFixture managed(session_config(), "SH", 88, "sse-external");
+    sse_strategy::Session session(runtime, 88, managed.execution, []() { return true; });
+    session.set_ready(true, true, true);
+    auto output = tick_output("600000", 34500000000ULL, 100.0, 10000, 10100, 1);
+    output.tick.prediction.multi_head = true; output.tick.prediction.heads = {{100, 1, 2, 3}};
+    session.on_output(output);
+    oms::OrderView order;
+    assert(managed.engine->order(1, &order) && order.command.intent.quantity == 400 &&
+        order.command.intent.external_quantity == 300 && order.command.intent.price == 101000);
+    // A physical 200-share fill gives v06 100 shares and execution 100 shares.
+    oms::Report trade;
+    trade.scope = managed.engine->scope(); trade.id = 1; trade.broker_id = "B1";
+    trade.instrument = order.command.intent.instrument; trade.side = oms::Side::Buy;
+    trade.kind = oms::ReportKind::Trade; trade.trade_id = "v06-mixed";
+    trade.trade_quantity = trade.cumulative_after = 200; trade.trade_price = 101000;
+    assert(managed.engine->report(trade));
+    output.tick.event.time_of_day_micros += 10000000ULL;
+    session.on_output(output); // GlobalSkew must accept only T0's attributed fills.
+    oms::Position p;
+    assert(session.execution()->read_t0_position(88, "600000", "SSE", &p) && p.bought == 100);
+
+    oms_test::ManagedFixture standalone(session_config(), "SH", 88, "sse-no-prediction");
+    sse_strategy::Session no_prediction(runtime, 88, standalone.execution, []() { return true; });
+    no_prediction.set_ready(true, true, true);
+    output.tick.prediction_valid = false;
+    no_prediction.on_output(output);
+    assert(standalone.engine->order(1, &order) && order.command.intent.external_quantity == 300 &&
+        order.command.intent.quantity == 300 && no_prediction.signals() == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -387,6 +423,7 @@ int main() {
     test_completed_batch_preserves_orders_and_cancel_deadlines();
     test_completed_batch_preserves_orders_and_cancel_deadlines(true);
     test_completed_batch_static_gate_and_snapshot_reference();
+    test_v06_external_merge_and_no_prediction_execution();
     std::cout << "sse_strategy_session_test: PASS" << std::endl;
     return 0;
 }

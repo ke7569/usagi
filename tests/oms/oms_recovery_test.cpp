@@ -221,6 +221,43 @@ void test_unknown_send_is_not_replayed() {
     require(!second->account().ready, "unknown send keeps account closed");
 }
 
+void test_combined_execution_allocation_recovery() {
+    TempDir temp; Config settings = config(temp);
+    // Execution attribution must survive even when ordinary T0 intents are async.
+    settings.durable_order_intents = false;
+    auto first_backend = std::make_shared<ScriptedBackend>(capabilities());
+    first_backend->submit_hook = [](const Command&) {
+        SendResult r; r.disposition = SendDisposition::Submitted; r.broker_id = "mixed"; return r;
+    };
+    auto first = create(settings, first_backend, 1);
+    reconcile(first, first_backend, 1);
+    Intent intent = buy("owner", "mixed", 400); intent.external_quantity = 300; intent.external_delta = 300;
+    const auto sent = first->submit(intent);
+    require(sent.accepted, "combined order accepted");
+    Report trade = order_report(first, sent.id, kSze, Side::Buy, OrderState::Partial, 200, 200, "mixed");
+    trade.kind = ReportKind::Trade; trade.trade_id = "mixed-first"; trade.trade_quantity = 200;
+    trade.cumulative_after = 200; trade.trade_price = 100000;
+    require(first->report(trade), "mixed fill applied");
+    first.reset();
+    auto backend = std::make_shared<ScriptedBackend>(capabilities());
+    auto recovered = create(settings, backend, 2);
+    OrderView order;
+    require(recovered->order(sent.id, &order) && order.command.intent.external_quantity == 300 &&
+        order.command.intent.external_delta == 300, "allocation restored from journal");
+    require(recovered->begin_reconcile(2, false), "mixed reconciliation starts");
+    Snapshot snapshot = snapshot_for(recovered, 2); snapshot.positions[0].total += 200;
+    snapshot.orders.push_back(snapshot_order(sent.id, "owner", "mixed", kSze, Side::Buy,
+        400, 200, 200, OrderState::Partial));
+    trade.scope = snapshot.scope; snapshot.trades.push_back(trade);
+    require(recovered->complete_snapshot(snapshot), "mixed snapshot installed");
+    Position p;
+    require(recovered->position(kSze, &p) && p.external_bought == 100 && p.external_working_buy == 200 &&
+        p.bought == 200 && p.total == 10200, "reconciliation restores external fills and reservation once");
+    Quantity qty; Money amount;
+    require(recovered->t0_day_fills(kSze, &qty, &amount) && qty == 100 && amount == 10000000,
+        "recovered T0 turnover excludes external fills");
+}
+
 void test_query_tokens_restart_in_new_epoch() {
     TempDir temp;
     const Config settings = config(temp);
@@ -441,6 +478,7 @@ int main() {
     try {
         test_async_intent_loss_reconciles_and_never_reuses_id();
         test_durable_active_order_recovery();
+        test_combined_execution_allocation_recovery();
         test_unknown_send_is_not_replayed();
         test_query_tokens_restart_in_new_epoch();
         test_external_order_is_read_only_and_self_crosses();

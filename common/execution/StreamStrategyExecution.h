@@ -24,6 +24,7 @@ public:
     bool owns_request(short source, int request_id, const std::string& instrument) const override;
     bool managed() const override { return backend_->managed(); }
     bool read_position(short, const std::string&, const std::string&, oms::Position*) const override;
+    bool read_t0_position(short, const std::string&, const std::string&, oms::Position*) const override;
     bool read_order(short, int, oms::OrderView*) const override;
     bool read_day_fills(short, const std::string&, const std::string&, oms::Quantity*, oms::Money*) const override;
     bool has_working_order(const std::string& instrument) const override;

@@ -304,7 +304,7 @@ public:
 #ifndef T0_STREAM_SZE
         if ((live_ || monitor_) && processor_->strategy_consumer_enabled()) {
             processor_->set_strategy_poll([this]() {
-                if (!stopped_.load(std::memory_order_acquire)) advance_clock(0);
+                if (!stopped_.load(std::memory_order_acquire)) advance_clock(0, true);
             });
         }
 #endif
@@ -361,9 +361,9 @@ public:
         if ((!live_ && !monitor_) || stopped_.load()) return;
         try {
 #ifdef T0_STREAM_SZE
-            advance_clock(0);
+            advance_clock(0, true);
 #else
-            if (!processor_->strategy_consumer_enabled()) advance_clock(0);
+            if (!processor_->strategy_consumer_enabled()) advance_clock(0, true);
 #endif
         }
         catch (...) { begin_stop(); throw; }
@@ -617,7 +617,7 @@ private:
         processor_->wait_strategy();
 #endif
     }
-    void advance_clock(std::uint64_t ns) {
+    void advance_clock(std::uint64_t ns, bool execution_tick = false) {
         if (!oms_) return;
         if (live_ || monitor_) {
             timespec now = {};
@@ -627,6 +627,16 @@ private:
         if (ns > static_cast<std::uint64_t>(std::numeric_limits<long long>::max()))
             throw std::runtime_error("strategy stream time out of range");
         oms_->advance_to(static_cast<long long>(ns));
+        if (execution_tick && strategy_ && (live_ || monitor_) && !stopped_.load()) {
+            timespec wall = {}; tm local = {};
+            if (::clock_gettime(CLOCK_REALTIME, &wall) || !::localtime_r(&wall.tv_sec, &local))
+                throw std::runtime_error("cannot read execution market clock");
+            const unsigned day = (local.tm_year + 1900) * 10000 + (local.tm_mon + 1) * 100 + local.tm_mday;
+            if (day == static_cast<unsigned>(number(profile_, "trading_day"))) {
+                strategy_->on_timer((local.tm_hour * 3600ULL + local.tm_min * 60ULL + local.tm_sec) *
+                    1000000ULL + wall.tv_nsec / 1000);
+            }
+        }
     }
     void initialize_strategy(const std::function<bool()>& healthy) {
         if (!profile_.count("strategy_runtime")) return;
@@ -684,7 +694,9 @@ private:
                 throw std::runtime_error("OMS order notional is not representable");
             const oms::Instrument instrument = {exchange, code}; config.instruments[instrument] = rules;
             oms::SnapshotPosition position; position.instrument = instrument;
-            position.total = parameters.at("static_position").get<long long>() + parameters.at("last_position").get<long long>();
+            position.total = parameters.at("static_position").get<long long>() + parameters.at("last_position").get<long long>() -
+                parameters.value("external_delta", 0LL);
+            if (position.total < 0) throw std::runtime_error("negative pre-execution paper position");
             position.free_sellable = position.total; snapshot.positions.push_back(position);
         }
         std::shared_ptr<oms::Backend> backend(new oms::PaperBackend([this](const oms::Command& command) {

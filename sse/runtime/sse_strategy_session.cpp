@@ -108,7 +108,8 @@ void Session::process_output(const sse_stream::Output& output) {
         v06_->reference(output.snapshot.snapshot.security_id, output.snapshot.snapshot.open_price);
         // v0.6 uses snapshots as opening-price references, not predictions.
         // An unselected snapshot has no work left at the commit boundary.
-        if (!output.snapshot.prediction_valid || !output.snapshot.prediction.selected) return;
+        if ((!output.snapshot.prediction_valid || !output.snapshot.prediction.selected) &&
+            !core_->has_external_execution()) return;
     }
     if (output.kind == sse_stream::kBatchEndOutput) {
         batch_end_mode_ = true;
@@ -141,21 +142,25 @@ void Session::process_prediction_output(const sse_stream::Output& output) {
     const bool tick = output.kind == sse_stream::kTickOutput;
     if (!tick && output.kind != sse_stream::kSnapshotOutput) throw std::runtime_error("unknown strategy output kind");
     const sse_hybrid_model::Prediction& prediction = tick ? output.tick.prediction : output.snapshot.prediction;
-    if (!(tick ? output.tick.prediction_valid : output.snapshot.prediction_valid) || !prediction.selected) return;
+    const bool selected = (tick ? output.tick.prediction_valid : output.snapshot.prediction_valid) && prediction.selected;
+    if (!selected && !core_->has_external_execution()) return;
     const std::uint64_t exchange_us = tick ? output.tick.event.time_of_day_micros : output.snapshot.snapshot.time_of_day_micros;
     const std::string& code = tick ? output.tick.event.security_id : output.snapshot.snapshot.security_id;
     // A later snapshot in the same hardware batch may invalidate daily
     // prices after this prediction was queued. Check again at dispatch.
     if (instrument_gate_ && !instrument_gate_(code)) return;
     const bool tick_window = prediction.multi_head || exchange_us >= 34500000000ULL;
-    if (exchange_us < 34200000000ULL || exchange_us >= 86400000000ULL || tick != tick_window ||
+    if (exchange_us >= 86400000000ULL) throw std::runtime_error("invalid strategy market time");
+    if (selected && (exchange_us < 34200000000ULL || tick != tick_window ||
         prediction.selected_source != (tick ? sse_hybrid_model::kTickSource : sse_hybrid_model::kSnapshotSource) ||
-        !std::isfinite(prediction.selected_pred)) throw std::runtime_error("invalid selected strategy signal");
+        !std::isfinite(prediction.selected_pred))) throw std::runtime_error("invalid selected strategy signal");
     const std::map<std::string, std::uint64_t>::const_iterator previous =
         last_exchange_us_.find(code);
-    if (previous != last_exchange_us_.end() && exchange_us < previous->second)
-        throw std::runtime_error("strategy exchange time moved backwards");
-    if (!prediction.multi_head && previous != last_exchange_us_.end() && exchange_us == previous->second) return;
+    if (previous != last_exchange_us_.end() && exchange_us < previous->second) {
+        if (selected) throw std::runtime_error("strategy exchange time moved backwards");
+        return; // A delayed reference snapshot must not replace the execution book.
+    }
+    if (selected && !prediction.multi_head && previous != last_exchange_us_.end() && exchange_us == previous->second) return;
     // Signals run serially on the strategy owner; clear and reuse its view.
     MSMarketDataField& fresh = signal_view_;
     double* values = fresh.ms_market_data.ms_market_data.data();
@@ -194,7 +199,10 @@ void Session::process_prediction_output(const sse_stream::Output& output) {
         values[BidVolume1Index] <= 0 || values[AskVolume1Index] <= 0) return;
     values[MidPriceIndex] = (values[BidPrice1Index] + values[AskPrice1Index]) * 0.5;
     if (values[LastPriceIndex] <= 0) values[LastPriceIndex] = values[MidPriceIndex];
-    last_exchange_us_[code] = exchange_us;
+    if (selected) last_exchange_us_[code] = exchange_us;
+    if (!selected) {
+        core_->on_decision(code, fresh, std::function<void()>()); return;
+    }
     if (v06_) {
         if (!prediction.multi_head) throw std::runtime_error("v06 strategy requires four model heads");
 #ifdef SSE_REPLAY_PROBE
@@ -207,12 +215,16 @@ void Session::process_prediction_output(const sse_stream::Output& output) {
             interval_latency_max_=std::max(interval_latency_max_,delta);latency_over_ms_+=delta>=1000000;
             ++latency_bins_[std::min<std::uint64_t>(delta/1000,10000)];
         }
-        v06_->on_signal(code,fresh,prediction.heads,exchange_us,
-            tick?output.tick.provenance.monotonic_ns:output.snapshot.provenance.monotonic_ns,actual_signal_ns);
+        core_->on_decision(code, fresh, [&]() {
+            v06_->on_signal(code,fresh,prediction.heads,exchange_us,
+                tick?output.tick.provenance.monotonic_ns:output.snapshot.provenance.monotonic_ns,actual_signal_ns);
+        });
         return;
     }
     if (prediction.multi_head) throw std::runtime_error("v06 model requires v06 strategy");
-    if (single_flight_ && !prediction.multi_head && core_->execution()->has_working_order(code)) return;
+    if (single_flight_ && !prediction.multi_head && core_->execution()->has_working_order(code)) {
+        core_->on_decision(code, fresh, std::function<void()>()); return;
+    }
     core_->on_signal(code, fresh, prediction.selected_pred,
                      core_->execution()->now_ns());
 }

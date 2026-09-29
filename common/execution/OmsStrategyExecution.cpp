@@ -24,6 +24,15 @@ bool OmsStrategyExecution::read_position(short source, const std::string& code, 
 bool OmsStrategyExecution::read_day_fills(short source,const std::string& code,const std::string& market,oms::Quantity* q,oms::Money* amount)const {
     return source==source_ && engine_->day_fills(oms::Instrument{market,code},q,amount);
 }
+bool OmsStrategyExecution::read_t0_day_fills(short source, const std::string& code, const std::string& market,
+                                           oms::Quantity* q, oms::Money* amount) const {
+    return source == source_ && engine_->t0_day_fills(oms::Instrument{market, code}, q, amount);
+}
+bool OmsStrategyExecution::read_execution_orders(short source, const std::string& code, const std::string& market,
+                                                std::vector<oms::OrderView>* out) const {
+    if (!out || source != source_) return false;
+    *out = engine_->execution_orders(owner_, oms::Instrument{market, code}); return true;
+}
 bool OmsStrategyExecution::has_working_order(const std::string& instrument) const {
     return engine_->has_working_order(oms::Instrument{"SSE", instrument}) ||
            engine_->has_working_order(oms::Instrument{"SZE", instrument});
@@ -41,6 +50,12 @@ int OmsStrategyExecution::submit_limit(short source, const std::string& code, co
 int OmsStrategyExecution::submit_managed(short source, const std::string& code, const std::string& market,
         double price, int quantity, char direction, char offset, oms::OrderType type, long long delay,
         const std::function<bool()>& gate, const std::string& signal_id) {
+    return submit_allocated(source, code, market, price, quantity, direction, offset, type, delay,
+                            gate, signal_id, 0, 0);
+}
+int OmsStrategyExecution::submit_allocated(short source, const std::string& code, const std::string& market,
+        double price, int quantity, char direction, char offset, oms::OrderType type, long long delay,
+        const std::function<bool()>& gate, const std::string& signal_id, int external_quantity, int external_delta) {
     if (signal_id.size() > 128) throw std::invalid_argument("strategy signal identity too long");
     if (source != source_ || quantity <= 0 ||
         (direction != LF_CHAR_Buy && direction != LF_CHAR_Sell) ||
@@ -52,6 +67,7 @@ int OmsStrategyExecution::submit_managed(short source, const std::string& code, 
     intent.instrument = oms::Instrument{market, code};
     intent.side = direction == LF_CHAR_Buy ? oms::Side::Buy : oms::Side::Sell;
     intent.quantity = quantity; intent.type = type; intent.cancel_delay_ns = delay;
+    intent.external_quantity = external_quantity; intent.external_delta = external_delta;
     const oms::SubmitResult result = engine_->submit(intent, gate);
     if (!result.accepted) {
         const int raw = result.error.raw_code;

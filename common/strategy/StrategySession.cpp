@@ -89,8 +89,22 @@ StrategySession::StrategySession(
         universe.insert(symbol.substr(0, 6));
     }
 
+    std::shared_ptr<StrategyExecution> decisions = execution;
+    for (auto it = inputs.begin(); it != inputs.end(); ++it) {
+        if (it.value().count("external_delta")) {
+            external_.reset(new ExternalExecutionController(execution, source_,
+                market_ == "SH" ? "SSE" : "SZE", inputs));
+            decisions = external_; break;
+        }
+    }
     execution_.reset(new ProtectedExecution(
-        execution, healthy, source_, market_ == "SH" ? "SSE" : "SZE", universe));
+        decisions, healthy, source_, market_ == "SH" ? "SSE" : "SZE", universe));
+    if (external_) {
+        const std::weak_ptr<ProtectedExecution> weak = execution_;
+        external_->set_gate([weak]() {
+            const auto boundary = weak.lock(); return boundary && boundary->permits_new_orders();
+        });
+    }
     Json config = legacy_config;
     config["td_source_index"] = Json::array({execution_source});
     const std::string routing_key = market_ == "SH"
@@ -124,18 +138,58 @@ void StrategySession::begin_stop() { execution_->begin_stop(); }
 void StrategySession::on_signal(const std::string& code,
                                 const MSMarketDataField& view,
                                 double prediction, long received_time) {
+    on_decision(code, view, [&]() {
+        ++signals_;
+        instruments_.at(code)->strategy->on_signal(&instruments_.at(code)->view, prediction, source_, received_time);
+    });
+}
+
+void StrategySession::on_decision(const std::string& code, const MSMarketDataField& view,
+                                  const std::function<void()>& t0) {
     const Instruments::iterator found = instruments_.find(code);
     if (found == instruments_.end())
         throw std::runtime_error("strategy signal outside configured universe");
     Instrument& instrument = *found->second;
     instrument.view = view;
     instrument.have_view = true;
-    ++signals_;
-    instrument.strategy->on_signal(&instrument.view, prediction, source_, received_time);
+    try {
+        if (external_) external_->begin_round(code, instrument.view);
+        if (t0) t0();
+        if (external_) external_->finish_round();
+    } catch (...) {
+        if (external_) external_->abort_round();
+        throw;
+    }
 }
 
 bool StrategySession::on_order(const LFRtnOrderField&, int, short, long) {
     return false; // Legacy reports lack an immutable connection epoch and fill coverage.
+}
+
+void StrategySession::on_timer(std::uint64_t time,
+                              const std::function<bool(const std::string&)>& instrument_gate) {
+    if (!external_ || time >= 86400000000ULL || time / 1000000ULL == last_timer_second_) return;
+    last_timer_second_ = time / 1000000ULL;
+    for (const auto& item : instruments_) {
+        if (!item.second->have_view) continue;
+        const auto& last = item.second->view;
+        if (!std::isfinite(last.MarketTime) || last.MarketTime < 0 || last.MarketTime >= 240000000.0) continue;
+        const std::uint64_t encoded = static_cast<std::uint64_t>(last.MarketTime);
+        const std::uint64_t observed = (encoded / 10000000 * 3600 +
+            encoded / 100000 % 100 * 60 + encoded / 1000 % 100) * 1000000 + encoded % 1000 * 1000;
+        if (observed > time) continue;
+        MSMarketDataField view = last;
+        view.MarketTime = ((time / 3600000000ULL * 10000 + time / 60000000ULL % 60 * 100 +
+            time / 1000000ULL % 60) * 1000 + time / 1000 % 1000);
+        if (time - observed > 5000000ULL || (instrument_gate && !instrument_gate(item.first))) {
+            view.ms_market_data.ms_market_data[BidPrice1Index + 2] = 0;
+            view.ms_market_data.ms_market_data[AskPrice1Index + 2] = 0;
+        }
+        // Keep the stored quote timestamp when a timer uses the last book.
+        try {
+            external_->begin_round(item.first, view); external_->finish_round();
+        } catch (...) { external_->abort_round(); throw; }
+    }
 }
 
 bool StrategySession::on_trade(const LFRtnTradeField&, int, short, long) {

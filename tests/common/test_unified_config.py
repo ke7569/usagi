@@ -90,6 +90,22 @@ class UnifiedConfigTests(unittest.TestCase):
         self.assertEqual(self.sz_runtime["global_params"], config["strategy"]["parameters"])
         self.assertEqual("/fixtures/model.bin", config["prediction"]["model_path"])
 
+    def test_external_delta_roundtrip_and_validation(self):
+        for runtime, symbol in ((self.sz_runtime, "000001.SZ"), (self.sh_runtime, "600000.SH")):
+            for delta in (100, -100, 0):
+                modified = copy.deepcopy(runtime)
+                next(iter(modified["ins_params"].values()))["external_delta"] = delta
+                config = self.migrate(modified)
+                unified_config.validate(config)
+                self.assertEqual(delta, config["account"]["positions"][symbol]["external_delta"])
+                self.assertEqual(modified, unified_config.export_legacy(config))
+            for delta in (1.5, 2147483648, 300):
+                modified = copy.deepcopy(runtime)
+                next(iter(modified["ins_params"].values()))["external_delta"] = delta
+                with self.assertRaises(ConfigError):
+                    config = self.migrate(modified)
+                    unified_config.validate(config)
+
     def test_sh_roundtrip_and_normalized_locations(self):
         config = self.migrate(self.sh_runtime)
         unified_config.validate(config)

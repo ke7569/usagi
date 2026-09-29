@@ -81,6 +81,27 @@ class RuntimeConfigTest(unittest.TestCase):
                     all_text += stream.read()
         self.assertNotIn("SECRET_MUST_NOT_LEAK", all_text)
 
+    def test_execution_only_symbol_remains_in_trade_universe(self):
+        daily = copy.deepcopy(self.daily)
+        daily["ins_params"]["000001.SZ"]["static_position"] = 0
+        daily["ins_params"]["000001.SZ"]["external_delta"] = -200
+        daily["static_data_hash"] = RUNTIME.canonical_hash(daily["ins_params"])
+        daily = RUNTIME.validate_daily(daily, 20260817)
+        output = os.path.join(self.temp, "execution")
+        RUNTIME.strategy_configs(self.system, daily, 20260817, output)
+        manifest = RUNTIME.load_json(os.path.join(output, "manifest.json"))
+        trade = RUNTIME.load_json(os.path.join(output, "trade", "config.json"))
+        self.assertEqual(["000001.SZ"], manifest["trade_symbols"])
+        self.assertEqual(-200, trade["ins_params"]["000001.SZ"]["external_delta"])
+
+    def test_invalid_execution_target_is_rejected(self):
+        for value in (True, 1.5, 2147483648, 2000):
+            daily = copy.deepcopy(self.daily)
+            daily["ins_params"]["000001.SZ"]["external_delta"] = value
+            daily["static_data_hash"] = RUNTIME.canonical_hash(daily["ins_params"])
+            with self.assertRaises(RUNTIME.ConfigError):
+                RUNTIME.validate_daily(daily, 20260817)
+
     def test_stale_day_is_rejected(self):
         with self.assertRaises(RUNTIME.ConfigError):
             RUNTIME.validate_daily(copy.deepcopy(self.daily), 20260818)

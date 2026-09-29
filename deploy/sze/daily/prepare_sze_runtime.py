@@ -66,6 +66,10 @@ def canonical_hash(value):
     return hashlib.sha256(encoded).hexdigest()
 
 
+def needs_trade(item):
+    return int(item.get("static_position", 0)) != 0 or item.get("external_delta", 0) != 0
+
+
 def file_sha256(path):
     digest = hashlib.sha256()
     with open(path, "rb") as stream:
@@ -194,6 +198,12 @@ def validate_daily(daily, day):
             raise ConfigError("ins_params.{}.Date does not match {}".format(symbol, day))
         if int(item["static_position"]) < 0:
             raise ConfigError("negative static_position for {}".format(symbol))
+        if "external_delta" in item:
+            delta = item["external_delta"]
+            if isinstance(delta, bool) or not isinstance(delta, int) or abs(delta) > 2147483647:
+                raise ConfigError("invalid external_delta for {}".format(symbol))
+            if int(item["static_position"]) - delta < 0:
+                raise ConfigError("external_delta exceeds pre-execution holdings for {}".format(symbol))
     actual_hash = canonical_hash(params)
     expected_hash = str(daily["static_data_hash"]).lower()
     if actual_hash != expected_hash:
@@ -338,7 +348,7 @@ def strategy_configs(system, daily, day, output_dir):
                          "strategy_cpu": strategy_cpus[shard],
                          "state_cpu": state_cpus[shard]})
     trade_symbols = sorted(symbol for symbol, item in base["ins_params"].items()
-                           if int(item.get("static_position", 0)) != 0)
+                           if needs_trade(item))
     if system["trade"].get("enabled", False) and trade_symbols:
         trade = strategy_base(system, daily, day, False)
         trade["strategy_name"] = "sze_realtime_trade_{}".format(day)
@@ -453,17 +463,15 @@ def main():
     if args.component == "validate":
         print(json.dumps({"ok": True, "trading_day": args.day,
                           "instruments": len(daily["ins_params"]),
-                          "trade_instruments": sum(
-                              int(item.get("static_position", 0)) != 0
+                          "trade_instruments": sum(needs_trade(item)
                               for item in daily["ins_params"].values())},
                          sort_keys=True, separators=(",", ":")))
         return
     if args.component == "validate-trade":
         validate_credentials(system)
-        trade_count = sum(int(item.get("static_position", 0)) != 0
-                          for item in daily["ins_params"].values())
+        trade_count = sum(needs_trade(item) for item in daily["ins_params"].values())
         if system["trade"].get("enabled", False) and trade_count == 0:
-            raise ConfigError("trade enabled but daily config has no nonzero static_position")
+            raise ConfigError("trade enabled but daily config has no trading position or execution target")
         print(json.dumps({"ok": True, "trading_day": args.day,
                           "trade_instruments": trade_count},
                          sort_keys=True, separators=(",", ":")))

@@ -144,6 +144,9 @@ struct Intent {
     OrderType type = OrderType::Limit;
     Money price = 0;
     Quantity quantity = 0;
+    // Fills first satisfy quantity - external_quantity (T0), then execution.
+    Quantity external_quantity = 0;
+    Quantity external_delta = 0;
     Time cancel_delay_ns = 0;
     CancelClock cancel_clock = CancelClock::Submission;
 };
@@ -192,6 +195,11 @@ struct Position {
     Quantity working_sell = 0;
     Quantity bought = 0;
     Quantity sold = 0;
+    Quantity external_bought = 0;
+    Quantity external_sold = 0;
+    Quantity external_working_buy = 0;
+    Quantity external_working_sell = 0;
+    Quantity external_target = 0;
 };
 
 struct OrderView {
@@ -205,6 +213,9 @@ struct OrderView {
     Quantity priced_quantity = 0;
     Money known_amount = 0;
     Money known_fees = 0;
+    Quantity t0_priced_quantity = 0;
+    Money t0_known_amount = 0;
+    Money t0_known_fees = 0;
     Money cash_reserved = 0;
     bool quantity_complete = true;
     bool amount_complete = false;

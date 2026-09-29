@@ -1,6 +1,11 @@
 add_executable(receive_timestamps_test ${USAGI_ROOT}/tests/common/receive_timestamps_test.cpp)
 add_test(NAME receive_timestamps_test COMMAND receive_timestamps_test)
 
+add_executable(external_execution_test ${USAGI_ROOT}/tests/common/external_execution_test.cpp)
+target_link_libraries(external_execution_test PRIVATE t0_strategy_core)
+target_compile_options(external_execution_test PRIVATE -UNDEBUG)
+add_test(NAME external_execution_test COMMAND external_execution_test)
+
 add_executable(sse_journal_timestamp_test ${USAGI_ROOT}/tests/sse/sse_journal_timestamp_test.cpp)
 target_link_libraries(sse_journal_timestamp_test PRIVATE sse_journal_core deepwin_market_data_runtime)
 add_test(NAME sse_journal_timestamp_test COMMAND sse_journal_timestamp_test)
